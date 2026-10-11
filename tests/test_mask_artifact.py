@@ -27,7 +27,6 @@ from app.workers.grounding import (
     measure_alpha_grounding,
 )
 from app.workers.mask import (
-    BOTTOM_BLEED_WIDTH_FRAC,
     FULL_FRAME_COVERAGE,
     MASK_MIME,
     MASK_PIPELINE_VERSION,
@@ -357,20 +356,10 @@ class TestAssessMaskQuality:
 
     def test_a_base_band_across_the_whole_bottom_edge_is_held(self) -> None:
         """The black-dress failure shape: the backdrop's floor is kept, so the
-        contact band runs edge to edge on the image's last row."""
+        bottom rows are opaque edge to edge on the image's last row."""
         alpha = _golden_alpha()
         alpha[90:100, :] = 255
         g = measure_alpha_grounding(alpha)
-        assert g is not None
-        assert g.contact_band_width_frac >= BOTTOM_BLEED_WIDTH_FRAC
-        assert assess_mask_quality(alpha, g) == ("held", "bottom_edge_bleed")
-
-    def test_a_base_on_the_last_row_exactly_at_the_bleed_width_is_held(self) -> None:
-        alpha = _golden_alpha()
-        alpha[90:100, 2:199] = 255  # (198 - 2) / 200 = 0.98 exactly
-        g = measure_alpha_grounding(alpha)
-        assert g is not None
-        assert g.contact_band_width_frac == BOTTOM_BLEED_WIDTH_FRAC
         assert assess_mask_quality(alpha, g) == ("held", "bottom_edge_bleed")
 
     def test_a_wide_base_that_stops_short_of_the_last_row_is_ok(self) -> None:
@@ -379,13 +368,100 @@ class TestAssessMaskQuality:
         g = measure_alpha_grounding(alpha)
         assert assess_mask_quality(alpha, g) == ("ok", None)
 
-    def test_a_base_on_the_last_row_short_of_the_bleed_width_is_ok(self) -> None:
-        alpha = _golden_alpha()
-        alpha[90:100, 2:198] = 255  # 196/200 = 0.975 wide band
-        g = measure_alpha_grounding(alpha)
-        assert g is not None
-        assert g.contact_band_width_frac < BOTTOM_BLEED_WIDTH_FRAC
-        assert assess_mask_quality(alpha, g) == ("ok", None)
+
+def _standing(h: int, w: int) -> np.ndarray:
+    """A narrow figure in the middle of the frame, clear of every edge."""
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    alpha[h // 10 : h * 7 // 10, w * 2 // 5 : w * 3 // 5] = 255
+    return alpha
+
+
+_ALL = slice(None)
+
+
+def _with_floor(
+    alpha: np.ndarray, *, rows: int, clear_below: int = 0, cols: slice = _ALL
+) -> np.ndarray:
+    out = alpha.copy()
+    h = out.shape[0]
+    out[h - clear_below - rows : h - clear_below, cols] = 255
+    return out
+
+
+def _gate(alpha: np.ndarray) -> tuple[str, str | None]:
+    return assess_mask_quality(alpha, measure_alpha_grounding(alpha))
+
+
+class TestAKeptFloorIsHeld:
+    """A FLOOR is an opaque band along the bottom of the frame. The gate looks
+    at the last 2 % of the image's rows (at least 2) ending at the mask's
+    lowest opaque row; when that row is within 1 % of the height (at least 2
+    rows) of the bottom edge and ANY row of the band is at least 85 % opaque,
+    the floor was kept: held, never published. Measured 2026-10-11: the real
+    July masks that reach the bottom edge (miku-deepsea, ryuuko, spike) are
+    at most 73 % opaque on any row there."""
+
+    def test_floor_rows_with_a_clear_jpeg_edge_below_them_are_held(self) -> None:
+        # h=400: the edge tolerance is 4 rows
+        alpha = _with_floor(_standing(400, 300), rows=30, clear_below=4)
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_a_band_clear_of_the_edge_by_more_than_the_tolerance_is_no_floor(self) -> None:
+        alpha = _with_floor(_standing(400, 300), rows=30, clear_below=5)
+        assert _gate(alpha) == ("ok", None)
+
+    @pytest.mark.parametrize(("start", "stop"), [(0, 170), (15, 185), (5, 195), (3, 197)])
+    def test_a_floor_short_of_the_side_edges_is_held_down_to_85_percent(
+        self, start: int, stop: int
+    ) -> None:
+        alpha = _with_floor(_standing(400, 200), rows=30, cols=slice(start, stop))
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_a_band_under_85_percent_opaque_is_no_floor(self) -> None:
+        alpha = _with_floor(_standing(400, 200), rows=30, cols=slice(0, 169))
+        assert _gate(alpha) == ("ok", None)
+
+    def test_a_thin_full_width_strip_on_the_edge_is_held(self) -> None:
+        alpha = _with_floor(_standing(400, 200), rows=2)
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_a_wide_row_anywhere_in_the_band_is_a_floor(self) -> None:
+        # h=400, band = 8 rows: rows 5..8 from the bottom are 95 % opaque,
+        # the last 4 only 60 %
+        alpha = _with_floor(_standing(400, 200), rows=4, clear_below=4, cols=slice(0, 190))
+        alpha = _with_floor(alpha, rows=4, cols=slice(0, 120))
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_a_wide_row_above_the_band_is_not_weighed(self) -> None:
+        # the lowest 8 rows are 60 % opaque; the 95 % rows sit just above them
+        alpha = _with_floor(_standing(400, 200), rows=4, clear_below=8, cols=slice(0, 190))
+        alpha = _with_floor(alpha, rows=8, cols=slice(0, 120))
+        assert _gate(alpha) == ("ok", None)
+
+    def test_a_tiny_image_with_a_full_width_floor_is_held(self) -> None:
+        alpha = np.zeros((40, 40), dtype=np.uint8)
+        alpha[5:30, 15:25] = 255
+        alpha[36:, :] = 255
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    @pytest.mark.parametrize(("clear_below", "status"), [(2, "held"), (3, "ok")])
+    def test_a_small_image_tolerates_two_clear_rows_at_least(
+        self, clear_below: int, status: str
+    ) -> None:
+        alpha = _with_floor(_standing(40, 40), rows=4, clear_below=clear_below)
+        assert _gate(alpha)[0] == status
+
+    def test_a_small_image_weighs_two_rows_at_least(self) -> None:
+        # h=40: the last row is 60 % opaque, the one above it 95 %
+        alpha = _with_floor(_standing(40, 40), rows=1, clear_below=1, cols=slice(0, 38))
+        alpha = _with_floor(alpha, rows=1, cols=slice(0, 24))
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_a_base_reaching_the_bottom_edge_is_not_a_floor(self) -> None:
+        # the July miku-deepsea shape: its base reaches the last row and is
+        # 73 % of the width at its widest there
+        alpha = _with_floor(_standing(400, 600), rows=8, cols=slice(80, 518))
+        assert _gate(alpha) == ("ok", None)
 
 
 # ---------------------------------------------------------------------------

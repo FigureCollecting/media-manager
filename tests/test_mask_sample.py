@@ -184,6 +184,20 @@ class TestTheBlackDressCase:
         out = build_mask_artifact(_original(self.NAME), backend=_Answer(self._july_failure()))
         assert (out.status, out.reason) == ("held", "bottom_edge_bleed")
 
+    @pytest.mark.parametrize(
+        ("clear_rows", "left", "right"),
+        [(2, 0.0, 1.0), (0, 0.015, 0.985), (0, 0.025, 0.975), (1, 0.05, 0.95)],
+        ids=["last-two-rows-clear", "97-percent-wide", "95-percent-wide", "edge-and-vignette"],
+    )
+    def test_near_variants_of_the_july_failure_are_held(
+        self, clear_rows: int, left: float, right: float
+    ) -> None:
+        alpha = _ref_alpha("madoka")
+        h, w = alpha.shape
+        alpha[int(h * 0.94) : h - clear_rows, int(w * left) : int(round(w * right))] = 255
+        out = build_mask_artifact(_original(self.NAME), backend=_Answer(alpha))
+        assert (out.status, out.reason) == ("held", "bottom_edge_bleed")
+
     def test_a_mask_that_removed_nothing_is_held(self) -> None:
         full = np.full_like(_ref_alpha("madoka"), 255)
         out = build_mask_artifact(_original(self.NAME), backend=_Answer(full))
