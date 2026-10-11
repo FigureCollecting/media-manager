@@ -63,8 +63,17 @@ def _seed(db: Session, store: LocalObjectStore, n: int, *, url: str = ITEM) -> P
     )
 
 
+class _Model(StubMattingBackend):
+    """The stub's arithmetic standing in for a mask MODEL, so an applied batch
+    can run without a GPU. The real stub never publishes."""
+
+    name = "stub-model"
+    publishes_masks = True
+
+
 class _Constant(MattingBackend):
     name = "constant"
+    publishes_masks = True
 
     def __init__(self, value: int) -> None:
         self.value = value
@@ -78,6 +87,7 @@ class _Constant(MattingBackend):
 
 class _Boom(MattingBackend):
     name = "boom"
+    publishes_masks = True
 
     def matte(self, image: Image.Image) -> Image.Image:  # pragma: no cover - unused
         raise AssertionError
@@ -90,7 +100,7 @@ class _Crash(BaseException):
     """Stands in for the worker being killed mid-batch (not an item failure)."""
 
 
-class _CrashOnSecond(StubMattingBackend):
+class _CrashOnSecond(_Model):
     def __init__(self) -> None:
         self.calls = 0
 
@@ -246,11 +256,11 @@ class TestApply:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         obj = _seed(db_session, store, 1)
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.batch_id is not None
         (row,) = _masks(db_session)
         assert (row.source_sha256, row.pipeline_version) == (obj.sha256, MASK_PIPELINE_VERSION)
-        assert (row.status, row.origin_class, row.backend) == ("ok", "item_main", "stub")
+        assert (row.status, row.origin_class, row.backend) == ("ok", "item_main", "stub-model")
         assert row.width == 40 and row.height == 60
         assert row.top_margin_frac == pytest.approx(10 / 60)
         assert row.bottom_margin_frac == pytest.approx(10 / 60)
@@ -273,8 +283,8 @@ class TestApply:
 
     def test_a_second_run_is_a_no_op(self, db_session: Session, store: LocalObjectStore) -> None:
         _seed(db_session, store, 1)
-        run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
-        again = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        again = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert again.items == []
         assert len(_masks(db_session)) == 1
         assert len(_public(db_session, "mask")) == 1
@@ -284,7 +294,7 @@ class TestApply:
     ) -> None:
         _seed(db_session, store, 1)
         _seed(db_session, store, 2)
-        run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         rows = _masks(db_session)
         assert len(rows) == 2
         assert rows[0].mask_sha256 == rows[1].mask_sha256
@@ -294,7 +304,7 @@ class TestApply:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         _seed(db_session, store, 1, url=PICTURE)
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         (row,) = _masks(db_session)
         assert (row.status, row.reason, row.origin_class) == (
             "ineligible",
@@ -341,10 +351,10 @@ class TestApply:
     ) -> None:
         _seed(db_session, store, 1)
         run_mask_batch(db_session, store, backend=_Boom(), dry_run=False)
-        skipped = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        skipped = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert skipped.items == []
         retried = run_mask_batch(
-            db_session, store, backend=StubMattingBackend(), dry_run=False, retry_failed=True
+            db_session, store, backend=_Model(), dry_run=False, retry_failed=True
         )
         assert [i.status for i in retried.items] == ["ok"]
         (row,) = _masks(db_session)
@@ -355,7 +365,7 @@ class TestApply:
     ) -> None:
         obj = _seed(db_session, store, 1)
         store.put(obj.storage_key, b"not the bytes the address names", "image/png")
-        run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         (row,) = _masks(db_session)
         assert (row.status, row.reason) == ("failed", "source_hash_mismatch")
 
@@ -366,7 +376,7 @@ class TestApply:
         original = db_session.execute(select(ImageModel)).scalar_one()
         original.deleted_at = dt.datetime.now(dt.UTC)
         db_session.commit()
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
 
     def test_a_deleted_clean_version_is_skipped(
@@ -381,7 +391,7 @@ class TestApply:
         assert version is not None
         version.deleted_at = dt.datetime.now(dt.UTC)
         db_session.commit()
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
 
     def test_only_clean_copies_get_masks_not_a_matted_fallback(
@@ -390,7 +400,7 @@ class TestApply:
         obj = _seed(db_session, store, 1)
         obj.kind = "matted"
         db_session.commit()
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
 
     def test_a_soft_deleted_gallery_link_is_not_an_origin(
@@ -402,7 +412,7 @@ class TestApply:
         gallery = db_session.execute(select(FigureGallery)).scalar_one()
         gallery.deleted_at = dt.datetime.now(dt.UTC)
         db_session.commit()
-        run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         (row,) = _masks(db_session)
         assert (row.status, row.reason) == ("ineligible", "no_origin")
 
@@ -410,25 +420,90 @@ class TestApply:
         for n in range(3):
             _seed(db_session, store, n)
         report = run_mask_batch(
-            db_session, store, backend=StubMattingBackend(), dry_run=False, limit=2, page_size=1
+            db_session, store, backend=_Model(), dry_run=False, limit=2, page_size=1
         )
         assert len(report.items) == 2
         assert len(_masks(db_session)) == 2
-        rest = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        rest = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert len(rest.items) == 1
 
     def test_a_new_pipeline_version_selects_everything_again(
         self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _seed(db_session, store, 1)
-        run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         monkeypatch.setattr(mask_job, "MASK_PIPELINE_VERSION", "mask-v2")
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert len(report.items) == 1
         assert sorted(r.pipeline_version for r in _masks(db_session)) == [
             MASK_PIPELINE_VERSION,
             "mask-v2",
         ]
+
+
+class TestOnlyAMaskModelPublishes:
+    """The stub is a backdrop-distance heuristic, not a mask model: under it
+    the black-dress case and white-on-white figures pass the quality gate
+    with wrong masks. An APPLIED batch refuses it -- passed or configured
+    (the worker image leaves MATTING_BACKEND unset) -- before it writes
+    anything, so a stub mask can never be published or settle an image."""
+
+    def test_an_applied_batch_refuses_the_stub_and_writes_nothing(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1)
+        keys_before = store.keys()
+        with pytest.raises(ValueError, match="dry run only"):
+            run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        assert _masks(db_session) == []
+        assert _public(db_session, "mask") == []
+        assert db_session.execute(select(MaskBatch)).first() is None
+        assert store.keys() == keys_before
+
+    def test_the_configured_default_is_the_stub_and_is_refused(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1)
+        with pytest.raises(ValueError, match="'stub' .*dry run only"):
+            run_mask_batch(db_session, store, dry_run=False)
+        assert db_session.execute(select(MaskBatch)).first() is None
+        assert _masks(db_session) == []
+
+    def test_resuming_with_the_stub_is_refused_and_the_batch_stays_open(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        for n in range(3):
+            _seed(db_session, store, n)
+        with pytest.raises(_Crash):
+            run_mask_batch(db_session, store, backend=_CrashOnSecond(), dry_run=False)
+        (batch,) = db_session.execute(select(MaskBatch)).scalars()
+        with pytest.raises(ValueError, match="dry run only"):
+            run_mask_batch(
+                db_session,
+                store,
+                backend=StubMattingBackend(),
+                dry_run=False,
+                resume_batch_id=batch.id,
+            )
+        db_session.refresh(batch)
+        assert (batch.status, batch.counts["ok"]) == ("running", 1)
+        assert len(_masks(db_session)) == 1
+
+    def test_a_dry_run_may_still_use_the_stub(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1)
+        report = run_mask_batch(db_session, store)
+        assert [i.status for i in report.items] == ["ok"]
+
+    def test_publishing_is_opt_in_per_backend(self) -> None:
+        from app.workers.basekept import BaseKeptMattingBackend
+        from app.workers.matting import BiRefNetMattingBackend
+
+        assert MattingBackend.publishes_masks is False
+        assert StubMattingBackend.publishes_masks is False
+        assert BiRefNetMattingBackend.publishes_masks is True
+        assert BaseKeptMattingBackend.publishes_masks is True
 
 
 class TestResume:
@@ -447,7 +522,7 @@ class TestResume:
         assert batch.cursor_sha256 == done_sha
 
         resumed = run_mask_batch(
-            db_session, store, backend=StubMattingBackend(), dry_run=False, resume_batch_id=batch.id
+            db_session, store, backend=_Model(), dry_run=False, resume_batch_id=batch.id
         )
         assert resumed.batch_id == batch.id
         assert len(resumed.items) == 2
@@ -465,7 +540,7 @@ class TestResume:
             run_mask_batch(db_session, store, backend=_CrashOnSecond(), dry_run=False, limit=3)
         (batch,) = db_session.execute(select(MaskBatch)).scalars()
         resumed = run_mask_batch(
-            db_session, store, backend=StubMattingBackend(), dry_run=False, resume_batch_id=batch.id
+            db_session, store, backend=_Model(), dry_run=False, resume_batch_id=batch.id
         )
         assert len(resumed.items) == 2
         db_session.refresh(batch)
@@ -476,11 +551,13 @@ class TestResume:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         _seed(db_session, store, 1)
-        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         with pytest.raises(ValueError, match="not resumable"):
-            run_mask_batch(db_session, store, dry_run=False, resume_batch_id=report.batch_id)
+            run_mask_batch(
+                db_session, store, backend=_Model(), dry_run=False, resume_batch_id=report.batch_id
+            )
         with pytest.raises(ValueError, match="not resumable"):
-            run_mask_batch(db_session, store, dry_run=False, resume_batch_id=999)
+            run_mask_batch(db_session, store, backend=_Model(), dry_run=False, resume_batch_id=999)
 
     def test_a_dry_run_cannot_resume(self, db_session: Session, store: LocalObjectStore) -> None:
         with pytest.raises(ValueError, match="dry run"):
@@ -552,6 +629,23 @@ class TestCeleryTask:
         out = tasks.generate_masks()
         assert seen["dry_run"] is True
         assert out["dry_run"] is True
+
+
+class TestCeleryTaskRefusesTheStub:
+    def test_an_applied_task_on_the_default_config_refuses_the_stub(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from contextlib import nullcontext
+
+        from app.workers import tasks
+
+        _seed(db_session, store, 1)
+        monkeypatch.setattr(tasks, "worker_session", lambda: nullcontext(db_session))
+        monkeypatch.setattr(tasks, "S3ObjectStore", lambda: store)
+        with pytest.raises(ValueError, match="dry run only"):
+            tasks.generate_masks(apply=True)
+        assert _masks(db_session) == []
+        assert _public(db_session, "mask") == []
 
 
 class _NullSession:

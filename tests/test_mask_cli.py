@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from app.cli import masks as cli
+from app.workers.matting import StubMattingBackend
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -26,6 +27,19 @@ def sandbox(tmp_path: Path) -> str:
     return str(tmp_path / "sandbox")
 
 
+class _Model(StubMattingBackend):
+    """The stub's arithmetic standing in for a mask model, so the sample can be
+    APPLIED without a GPU. The real stub is dry run only."""
+
+    name = "stub-model"
+    publishes_masks = True
+
+
+@pytest.fixture()
+def model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "make_backend", lambda *a: _Model())
+
+
 def _rows(sandbox: str, model: type) -> list:  # type: ignore[type-arg]
     engine = create_engine(f"sqlite:///{sandbox}/masks.db")
     with Session(engine) as db:
@@ -34,7 +48,7 @@ def _rows(sandbox: str, model: type) -> list:  # type: ignore[type-arg]
 
 class TestSampleRun:
     def test_seed_then_dry_run_then_apply_then_nothing_left(
-        self, sandbox: str, capsys: pytest.CaptureFixture[str]
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None
     ) -> None:
         from app.models import ImageMask, PublicObject
 
@@ -90,7 +104,7 @@ class TestSampleRun:
 
 class TestRefusals:
     def test_resuming_an_unknown_batch_is_an_error(
-        self, sandbox: str, capsys: pytest.CaptureFixture[str]
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None
     ) -> None:
         code = cli.main(["--sandbox", sandbox, "run", "--apply", "--resume", "999"])
         assert code == 2
@@ -103,6 +117,15 @@ class TestRefusals:
         code = cli.main(["--sandbox", sandbox, "run", "--backend", "birefnet"])
         assert code == 2
         assert "--model" in capsys.readouterr().err
+        assert not Path(sandbox).exists()
+
+    @pytest.mark.parametrize("backend", [[], ["--backend", "stub"]])
+    def test_applying_with_the_stub_is_refused_before_any_work(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], backend: list[str]
+    ) -> None:
+        code = cli.main(["--sandbox", sandbox, "run", "--apply", *backend])
+        assert code == 2
+        assert "dry run only" in capsys.readouterr().err
         assert not Path(sandbox).exists()
 
     def test_report_of_an_unknown_batch(
@@ -147,8 +170,6 @@ class TestBackends:
         assert cli.make_backend("birefnet-basekept", None, None, None) is not None
 
     def test_stub_and_default(self) -> None:
-        from app.workers.matting import StubMattingBackend
-
         assert isinstance(cli.make_backend("stub", None, None, None), StubMattingBackend)
         assert cli.make_backend(None, None, None, None) is None
 

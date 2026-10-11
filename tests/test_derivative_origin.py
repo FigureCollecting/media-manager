@@ -47,8 +47,16 @@ def _photo(n: int) -> bytes:
     return buf.getvalue()
 
 
+class _Model(StubMattingBackend):
+    """The stub's arithmetic standing in for a mask model (the real stub never publishes)."""
+
+    name = "stub-model"
+    publishes_masks = True
+
+
 class _Full(MattingBackend):
     name = "full"
+    publishes_masks = True
 
     def matte(self, image: Image.Image) -> Image.Image:  # pragma: no cover - unused
         raise AssertionError
@@ -71,7 +79,7 @@ def seeded(db_session: Session, store: LocalObjectStore) -> dict[str, str]:
         origins=[ImageOrigin(url=ITEM.format(n=1), source="mfc")],
         figure_id="mfc:1",
     )
-    run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+    run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
     mask = db_session.execute(select(ImageMask)).scalar_one()
     held_src = seed_clean_image(
         db_session,
