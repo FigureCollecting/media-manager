@@ -70,8 +70,8 @@ def _studio_photo(fmt: str = "PNG") -> bytes:
     """A near-white backdrop with a dark figure on a narrower base -- the
     stub backend separates it exactly (uniform backdrop)."""
     arr = np.full((100, 80, 3), (250, 250, 248), dtype=np.uint8)
-    arr[20:85, 25:55] = (40, 30, 90)  # body
-    arr[85:90, 30:50] = (40, 30, 90)  # base
+    arr[20:82, 25:55] = (40, 30, 90)  # body
+    arr[82:90, 30:50] = (40, 30, 90)  # base: the 8-row contact band exactly
     return _encode(Image.fromarray(arr, mode="RGB"), fmt)
 
 
@@ -191,7 +191,7 @@ class TestMeasureAlphaGrounding:
         )
 
     def test_rejects_a_non_2d_buffer(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="height, width"):
             measure_alpha_grounding(np.zeros((4, 4, 4), dtype=np.uint8))
 
 
@@ -260,6 +260,11 @@ class TestCompositeWithMask:
         assert arr[0, 0, 3] == 128
         assert arr[0, 1, 3] == 64  # round(128 * 128 / 255)
 
+    def test_rounds_the_product_to_nearest(self) -> None:
+        clean = Image.new("RGBA", (1, 1), (1, 2, 3, 128))
+        arr = np.asarray(composite_with_mask(clean, np.array([[129]], dtype=np.uint8)))
+        assert arr[0, 0, 3] == 65  # 128 * 129 / 255 = 64.75
+
     def test_rejects_a_mask_of_other_dimensions(self) -> None:
         with pytest.raises(ValueError):
             composite_with_mask(Image.new("RGB", (5, 5)), np.zeros((5, 6), dtype=np.uint8))
@@ -278,6 +283,15 @@ class TestPredictAlpha:
         assert alpha.shape == (100, 80)
         assert alpha.dtype == np.uint8
         assert np.array_equal(alpha, np.asarray(backend.matte(img))[..., 3])
+
+    def test_stub_cutout_keeps_transparency_its_mask_ignores(self) -> None:
+        arr = np.full((20, 20, 4), (250, 250, 248, 255), dtype=np.uint8)
+        arr[8:12, 8:12] = (20, 30, 40, 255)
+        arr[10, 10, 3] = 40  # the subject already partly transparent here
+        img = Image.fromarray(arr, mode="RGBA")
+        backend = StubMattingBackend()
+        assert backend.predict_alpha(img)[10, 10] == 255
+        assert np.asarray(backend.matte(img))[10, 10, 3] == 40
 
     def test_birefnet_alpha_is_the_alpha_of_its_cutout(self) -> None:
         img = Image.new("RGBA", (64, 32), (10, 20, 30, 255))
@@ -351,6 +365,14 @@ class TestAssessMaskQuality:
         assert g.contact_band_width_frac >= BOTTOM_BLEED_WIDTH_FRAC
         assert assess_mask_quality(alpha, g) == ("held", "bottom_edge_bleed")
 
+    def test_a_base_on_the_last_row_exactly_at_the_bleed_width_is_held(self) -> None:
+        alpha = _golden_alpha()
+        alpha[90:100, 2:199] = 255  # (198 - 2) / 200 = 0.98 exactly
+        g = measure_alpha_grounding(alpha)
+        assert g is not None
+        assert g.contact_band_width_frac == BOTTOM_BLEED_WIDTH_FRAC
+        assert assess_mask_quality(alpha, g) == ("held", "bottom_edge_bleed")
+
     def test_a_wide_base_that_stops_short_of_the_last_row_is_ok(self) -> None:
         alpha = _golden_alpha()
         alpha[85:95, :] = 255  # edge to edge, but five clear rows below it
@@ -389,7 +411,10 @@ class TestBuildMaskArtifact:
         assert g is not None
         assert g.top_margin_frac == pytest.approx(20 / 100)
         assert g.bottom_margin_frac == pytest.approx((100 - 1 - 89) / 100)
-        assert (g.box_left_frac, g.box_right_frac) == (pytest.approx(25 / 80), pytest.approx(55 / 80))
+        assert (g.box_left_frac, g.box_right_frac) == (
+            pytest.approx(25 / 80),
+            pytest.approx(55 / 80),
+        )
         assert g.contact_band_center_x_frac == pytest.approx((30 + 49) / 2 / 80)
         assert g.contact_band_width_frac == pytest.approx((49 - 30) / 80)
 
@@ -418,7 +443,9 @@ class TestBuildMaskArtifact:
         rgba = np.zeros((20, 10, 4), dtype=np.uint8)
         rgba[5:15, 2:8] = (200, 10, 10, 255)
         clean = _encode(Image.fromarray(rgba, mode="RGBA"), "PNG")
-        out = build_mask_artifact(clean, backend=_ConstantAlphaBackend(np.full((20, 10), 255, np.uint8)))
+        out = build_mask_artifact(
+            clean, backend=_ConstantAlphaBackend(np.full((20, 10), 255, np.uint8))
+        )
         assert out.own_alpha_grounding is not None
         assert out.own_alpha_grounding.top_margin_frac == pytest.approx(5 / 20)
 
@@ -460,3 +487,16 @@ class TestBuildMaskArtifact:
             buf.getvalue(), backend=_ConstantAlphaBackend(np.full((30, 10), 255, np.uint8))
         )
         assert (out.width, out.height) == (10, 30)
+
+    def test_a_backend_answer_of_the_wrong_size_is_refused(self) -> None:
+        class _WrongSize(MattingBackend):
+            name = "wrong"
+
+            def matte(self, image: Image.Image) -> Image.Image:  # pragma: no cover - unused
+                raise AssertionError
+
+            def predict_alpha(self, image: Image.Image) -> np.ndarray:
+                return np.zeros((image.height + 1, image.width), dtype=np.uint8)
+
+        with pytest.raises(ValueError, match="wrong"):
+            build_mask_artifact(_studio_photo("PNG"), backend=_WrongSize())

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 from PIL import Image
@@ -39,11 +39,26 @@ if TYPE_CHECKING:
 class MattingBackend(ABC):
     """Interface for producing an RGBA cutout from a source image."""
 
+    #: Recorded beside every mask as its provenance (which backend made it).
+    name: ClassVar[str] = "custom"
+
     @abstractmethod
     def matte(self, image: Image.Image) -> Image.Image:
         """Given an RGBA PIL Image, return a new RGBA Image with the alpha
         channel replaced (or refined) to cut out the background."""
         raise NotImplementedError
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        """The backend's foreground answer alone, as a ``(height, width)``
+        uint8 alpha -- the separate mask MASK-1 stores (Ross 2026-09-26: the
+        clean copy is never cut out; the client composites this over it).
+
+        This default reads the alpha of ``matte()`` for backends that only
+        implement the cut-out; the shipped backends override it so the mask
+        is the model's answer without the image's own alpha folded in.
+        """
+        cutout = self.matte(image.convert("RGBA"))
+        return np.asarray(cutout.convert("RGBA"))[..., 3].copy()
 
 
 class StubMattingBackend(MattingBackend):
@@ -62,9 +77,10 @@ class StubMattingBackend(MattingBackend):
     #: Corner patch size (pixels) used to sample the backdrop color.
     CORNER_SAMPLE = 5
 
-    def matte(self, image: Image.Image) -> Image.Image:
-        rgba = image.convert("RGBA")
-        arr = np.asarray(rgba)
+    name: ClassVar[str] = "stub"
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        arr = np.asarray(image.convert("RGBA"))
         h, w = arr.shape[0], arr.shape[1]
         rgb = arr[..., :3].astype(np.float32)
 
@@ -80,7 +96,12 @@ class StubMattingBackend(MattingBackend):
         backdrop = np.median(corners, axis=0)
 
         dist = np.sqrt(((rgb - backdrop) ** 2).sum(axis=-1))
-        computed_alpha = np.where(dist < self.BACKDROP_DISTANCE_THRESHOLD, 0, 255).astype(np.uint8)
+        return np.where(dist < self.BACKDROP_DISTANCE_THRESHOLD, 0, 255).astype(np.uint8)
+
+    def matte(self, image: Image.Image) -> Image.Image:
+        rgba = image.convert("RGBA")
+        arr = np.asarray(rgba)
+        computed_alpha = self.predict_alpha(rgba)
 
         # Never make an already-transparent pixel opaque -- only ever cut
         # further into the existing alpha channel.
@@ -126,6 +147,8 @@ class BiRefNetMattingBackend(MattingBackend):
 
     #: BiRefNet's fixed square input resolution.
     INPUT_SIZE = 1024
+
+    name: ClassVar[str] = "birefnet"
     #: ImageNet normalization stats used by the model's own preprocessor.
     MEAN = (0.485, 0.456, 0.406)
     STD = (0.229, 0.224, 0.225)
@@ -239,14 +262,15 @@ class BiRefNetMattingBackend(MattingBackend):
         mask_img = Image.fromarray(mask_u8, mode="L").resize(size, Image.BILINEAR)
         return np.asarray(mask_img)
 
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        raw_output = self._run(self._preprocess(rgba))
+        return self._postprocess(raw_output, (rgba.width, rgba.height))
+
     def matte(self, image: Image.Image) -> Image.Image:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
         arr = np.asarray(rgba)
-        width, height = rgba.width, rgba.height
-
-        input_array = self._preprocess(rgba)
-        raw_output = self._run(input_array)
-        computed_alpha = self._postprocess(raw_output, (width, height))
+        computed_alpha = self.predict_alpha(rgba)
 
         # Never make an already-transparent pixel opaque -- only ever cut
         # further into the existing alpha channel (same rule as
