@@ -1,0 +1,14 @@
+{
+  "about": "MASK-1 sample: synthetic originals (see _generate.py and README.md). origins are synthetic URLs in the shapes the spine records; nothing is fetched.",
+  "entries": [
+    {"name": "dark-angel", "reference": "dark-angel", "backdrop": [250, 250, 248], "figure_id": "sample:1", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/1/900001-0a1b2c.jpg", "source": "mfc"}]},
+    {"name": "madoka", "reference": "madoka", "backdrop": [250, 250, 248], "figure_id": "sample:2", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/2/900002-1b2c3d.jpg", "source": "mfc"}]},
+    {"name": "miku-deepsea", "reference": "miku-deepsea", "backdrop": [232, 232, 236], "figure_id": "sample:3", "origins": [{"url": "https://myfigurecollection.net/?_tb=commit&commit=nsp&objectType=item&objectId=900003&size=1", "source": "mfc"}]},
+    {"name": "miku-nendo", "reference": "miku-nendo", "backdrop": [250, 250, 248], "figure_id": "sample:4", "origins": [{"url": "https://img.example-store.test/products/900004/main.jpg", "source": "example-store"}]},
+    {"name": "rem", "reference": "rem", "backdrop": [226, 236, 246], "figure_id": "sample:5", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/5/900005-3d4e5f.jpg", "source": "mfc"}]},
+    {"name": "ryuuko", "reference": "ryuuko", "backdrop": [250, 250, 248], "figure_id": "sample:6", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/6/900006-4e5f60.jpg", "source": "mfc"}]},
+    {"name": "spike", "reference": "spike", "backdrop": [250, 250, 248], "figure_id": "sample:7", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/7/900007-5f6071.jpg", "source": "mfc"}]},
+    {"name": "spike-collector-photo", "reference": "spike", "backdrop": [168, 120, 82], "figure_id": "sample:8", "origins": [{"url": "https://static.myfigurecollection.net/upload/pictures/2026/10/01/900008.jpeg", "source": "mfc"}]},
+    {"name": "madoka-black-dress", "reference": "madoka", "variant": "black_dress", "backdrop": "marble", "figure_id": "sample:9", "origins": [{"url": "https://static.myfigurecollection.net/upload/items/9/900009-718293.jpg", "source": "mfc"}]}
+  ]
+}

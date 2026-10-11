@@ -1,0 +1,89 @@
+{
+ "about": "Grounding of each reference cut-out's alpha as fc-mobile's own client code measures it: computeBottomMarginFrac + computeContactBand (fc-mobile develop 8ce6b40, src/components/display/alphaMargin.ts) and computeTopMarginFrac + computeSideMarginFracs (fc-mobile CASE-ADAPT branch 1fe5a5e). Run under node 26 on the RGBA bytes of reference/<name>.png. The mask lane must report the same numbers for the same alpha.",
+ "measured": {
+  "dark-angel": {
+   "width": 600,
+   "height": 738,
+   "bottom": 0.05013550135501355,
+   "top": 0.11924119241192412,
+   "left": 0.02,
+   "right": 0.02,
+   "contactBand": {
+    "centerXFrac": 0.49916666666666665,
+    "widthFrac": 0.31833333333333336
+   }
+  },
+  "madoka": {
+   "width": 600,
+   "height": 712,
+   "bottom": 0.03932584269662921,
+   "top": 0.25,
+   "left": 0.3,
+   "right": 0.3,
+   "contactBand": {
+    "centerXFrac": 0.49916666666666665,
+    "widthFrac": 0.11833333333333333
+   }
+  },
+  "miku-deepsea": {
+   "width": 600,
+   "height": 400,
+   "bottom": 0.05,
+   "top": 0.28,
+   "left": 0.05,
+   "right": 0.1,
+   "contactBand": {
+    "centerXFrac": 0.49916666666666665,
+    "widthFrac": 0.7983333333333333
+   }
+  },
+  "miku-nendo": {
+   "width": 523,
+   "height": 550,
+   "bottom": 0.023636363636363636,
+   "top": 0.12,
+   "left": 0.11854684512428298,
+   "right": 0.11854684512428298,
+   "contactBand": {
+    "centerXFrac": 0.49904397705544934,
+    "widthFrac": 0.5583173996175909
+   }
+  },
+  "rem": {
+   "width": 550,
+   "height": 800,
+   "bottom": 0.03,
+   "top": 0.18,
+   "left": 0.18,
+   "right": 0.22,
+   "contactBand": {
+    "centerXFrac": 0.47909090909090907,
+    "widthFrac": 0.5981818181818181
+   }
+  },
+  "ryuuko": {
+   "width": 600,
+   "height": 412,
+   "bottom": 0.06796116504854369,
+   "top": 0.08009708737864078,
+   "left": 0.1,
+   "right": 0.04,
+   "contactBand": {
+    "centerXFrac": 0.32416666666666666,
+    "widthFrac": 0.4483333333333333
+   }
+  },
+  "spike": {
+   "width": 550,
+   "height": 800,
+   "bottom": 0.04,
+   "top": 0.08,
+   "left": 0.4,
+   "right": 0.4,
+   "contactBand": {
+    "centerXFrac": 0.4990909090909091,
+    "widthFrac": 0.11818181818181818
+   }
+  }
+ }
+}
