@@ -15,11 +15,13 @@ from ..db import worker_session
 from ..hashing import compute_phash, detect_mime, get_image_dimensions, sha256_bytes
 from ..models import AlbumItem, FigureGallery, ImageVersion, UserImageLink
 from ..models import Image as ImageModel
+from ..object_store import S3ObjectStore
 from ..s3 import get_s3, move_object
 from ..url_guard import _validate_ingest_url
 from . import celery_app
 from .derivatives import compute_dominant_color, compute_thumbhash
 from .grounding import compute_bottom_margin_frac, compute_contact_band
+from .mask_job import run_mask_batch
 from .watermark import apply_watermark, strip_exif
 
 if TYPE_CHECKING:
@@ -523,3 +525,13 @@ def _create_matted_derivative(
     except Exception:
         logger.warning("matte_derivative_failed", extra={"image_id": image_id})
         return None
+
+
+@celery_app.task(name="generate_masks")
+def generate_masks(limit: int | None = None, apply: bool = False) -> dict[str, Any]:
+    """MASK-1 batch: a mask for every clean image that has none at the
+    current pipeline version. DRY RUN unless ``apply=True`` -- a dry run
+    computes and reports, and writes nothing."""
+    with worker_session() as db:
+        report = run_mask_batch(db, S3ObjectStore(), dry_run=not apply, limit=limit)
+    return report.as_dict()

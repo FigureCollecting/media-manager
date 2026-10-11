@@ -51,7 +51,7 @@ def _seed(db: Session, store: LocalObjectStore, n: int, *, url: str = ITEM) -> P
     return seed_clean_image(
         db,
         store,
-        _photo((40 + n, 30, 90), seed=n),
+        _photo((31 + 10 * n, 30, 90), seed=n),
         origins=[ImageOrigin(url=url.format(n=n), source="mfc", role="gallery")],
         figure_id=f"mfc:{n}",
     )
@@ -142,6 +142,31 @@ class TestSeed:
         assert mime == "image/png"
         assert Image.open(io.BytesIO(data)).mode == "RGBA"
 
+    def test_only_known_kinds_can_be_published(self, db_session: Session) -> None:
+        with pytest.raises(ValueError, match="kind"):
+            register_public_object(
+                db_session,
+                sha256="a" * 64,
+                kind="original",
+                mime="image/png",
+                size=1,
+                width=1,
+                height=1,
+                storage_key="derived/x",
+            )
+
+    def test_clean_copy_of_a_palette_png_with_transparency_keeps_it(self) -> None:
+        img = Image.new("P", (4, 4), 0)
+        img.putpalette([0, 0, 0, 255, 0, 0] + [0] * 762)
+        img.putpixel((1, 1), 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", transparency=0)
+        data, mime, _w, _h = make_clean_copy(buf.getvalue())
+        assert mime == "image/png"
+        out = np.asarray(Image.open(io.BytesIO(data)).convert("RGBA"))
+        assert out[0, 0, 3] == 0
+        assert out[1, 1, 3] == 255
+
     def test_an_original_can_never_be_registered_as_public(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
@@ -178,6 +203,16 @@ class TestDryRunByDefault:
         assert _public(db_session, "mask") == []
         assert db_session.execute(select(MaskBatch)).first() is None
         assert store.keys() == keys_before
+
+    def test_a_dry_run_reports_refusals_and_failures_without_recording_them(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1, url=PICTURE)
+        _seed(db_session, store, 2)
+        report = run_mask_batch(db_session, store, backend=_Boom())
+        assert sorted(i.status for i in report.items) == ["failed", "ineligible"]
+        assert (report.counts["failed"], report.counts["ineligible"]) == (1, 1)
+        assert _masks(db_session) == []
 
 
 class TestApply:
@@ -308,6 +343,30 @@ class TestApply:
         report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
         assert report.items == []
 
+    def test_a_deleted_clean_version_is_skipped(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        import datetime as dt
+
+        from app.models import ImageVersion
+
+        obj = _seed(db_session, store, 1)
+        version = db_session.get(ImageVersion, obj.image_version_id)
+        assert version is not None
+        version.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        assert report.items == []
+
+    def test_only_clean_copies_get_masks_not_a_matted_fallback(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        obj = _seed(db_session, store, 1)
+        obj.kind = "matted"
+        db_session.commit()
+        report = run_mask_batch(db_session, store, backend=StubMattingBackend(), dry_run=False)
+        assert report.items == []
+
     def test_a_soft_deleted_gallery_link_is_not_an_origin(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
@@ -371,6 +430,22 @@ class TestResume:
         assert batch.counts["ok"] == 3
         assert len(_masks(db_session)) == 3
 
+    def test_a_resumed_batch_keeps_its_limit(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        for n in range(4):
+            _seed(db_session, store, n)
+        with pytest.raises(_Crash):
+            run_mask_batch(db_session, store, backend=_CrashOnSecond(), dry_run=False, limit=3)
+        (batch,) = db_session.execute(select(MaskBatch)).scalars()
+        resumed = run_mask_batch(
+            db_session, store, backend=StubMattingBackend(), dry_run=False, resume_batch_id=batch.id
+        )
+        assert len(resumed.items) == 2
+        db_session.refresh(batch)
+        assert sum(batch.counts.values()) == 3
+        assert len(_masks(db_session)) == 3
+
     def test_resuming_a_finished_or_unknown_batch_is_refused(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
@@ -398,6 +473,20 @@ class TestObjectStores:
         s.put("derived/ab/abc.png", b"bytes", "image/png")
         assert s.get("derived/ab/abc.png") == b"bytes"
         assert s.keys() == {"derived/ab/abc.png"}
+
+    def test_an_empty_local_store_has_no_keys(self, tmp_path: Path) -> None:
+        assert LocalObjectStore(tmp_path / "missing").keys() == set()
+
+    def test_s3_store_defaults_to_the_configured_bucket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app.s3
+
+        sentinel = object()
+        monkeypatch.setattr(app.s3, "get_s3", lambda: sentinel)
+        s = S3ObjectStore()
+        assert s._client is sentinel
+        assert s._bucket == "images"
 
     def test_s3_store_round_trip(self) -> None:
         from moto import mock_aws

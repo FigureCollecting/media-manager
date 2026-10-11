@@ -246,6 +246,122 @@ class FigureGallery(Base):
     )
 
 
+class PublicObject(Base):
+    """The content-addressed registry the public origin answers from:
+    ``GET /d/<sha256>`` serves a row of this table and nothing else.
+
+    ONLY our own work products are registered here -- a clean (sanitized)
+    derivative, a matted fallback, or a MASK-1 mask. An original's bytes are
+    never registered (``mask_seed.register_public_object`` refuses an
+    ``images.sha256``), so no original is ever addressable.
+    """
+
+    __tablename__ = "public_objects"
+
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    mime: Mapped[str] = mapped_column(String(100), nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    #: The version whose bytes these are (derivatives); NULL for masks, which
+    #: point back at their clean image from image_masks.
+    image_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("image_versions.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind in ('sanitized','matted','mask')", name="ck_public_object_kind"),
+    )
+
+
+class MaskBatch(Base):
+    """One applied run of the MASK-1 batch job (dry runs are never stored).
+    ``cursor_sha256`` is the last clean image settled, so a killed run
+    resumes after it; ``counts`` accumulate across resumes."""
+
+    __tablename__ = "mask_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pipeline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    backend: Mapped[str] = mapped_column(String(32), nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    cursor_sha256: Mapped[str | None] = mapped_column(String(64))
+    item_limit: Mapped[int | None] = mapped_column(Integer)
+    counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (CheckConstraint("status in ('running','done')", name="ck_mask_batch_status"),)
+
+
+class ImageMask(Base):
+    """MASK-1's answer for one clean image at one mask pipeline version --
+    the idempotency key of the batch job. ``ok`` rows carry a mask that is
+    registered in public_objects; ``held`` rows keep their mask privately
+    for review; ``empty``/``ineligible``/``failed`` rows carry no mask.
+
+    Grounding is measured on the mask's alpha (contract ProductImage:
+    bottom_margin_frac, contact_band) plus the CONTRACT-1 follow-up fields
+    (top margin, opaque box as half-open fractions). The appearance is kept
+    twice: ``masked_*`` with the mask applied, ``plain_*`` without it, so a
+    caller denied the mask (``no_mask``) is described without it.
+    """
+
+    __tablename__ = "image_masks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_sha256: Mapped[str] = mapped_column(
+        ForeignKey("public_objects.sha256", ondelete="CASCADE"), nullable=False
+    )
+    pipeline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64))
+    origin_class: Mapped[str | None] = mapped_column(String(32))
+    backend: Mapped[str | None] = mapped_column(String(32))
+    batch_id: Mapped[int | None] = mapped_column(ForeignKey("mask_batches.id", ondelete="SET NULL"))
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    mask_sha256: Mapped[str | None] = mapped_column(String(64))
+    mask_storage_key: Mapped[str | None] = mapped_column(String(512))
+    bottom_margin_frac: Mapped[float | None] = mapped_column(Float)
+    top_margin_frac: Mapped[float | None] = mapped_column(Float)
+    box_top_frac: Mapped[float | None] = mapped_column(Float)
+    box_bottom_frac: Mapped[float | None] = mapped_column(Float)
+    box_left_frac: Mapped[float | None] = mapped_column(Float)
+    box_right_frac: Mapped[float | None] = mapped_column(Float)
+    contact_band_center_x_frac: Mapped[float | None] = mapped_column(Float)
+    contact_band_width_frac: Mapped[float | None] = mapped_column(Float)
+    masked_thumbhash: Mapped[str | None] = mapped_column(String(64))
+    masked_dominant_color: Mapped[str | None] = mapped_column(String(7))
+    plain_thumbhash: Mapped[str | None] = mapped_column(String(64))
+    plain_dominant_color: Mapped[str | None] = mapped_column(String(7))
+    #: Grounding on the clean copy's OWN alpha, when it has one (rare: a
+    #: transparent PNG source); the AlphaGrounding fields by name.
+    own_alpha_grounding: Mapped[dict[str, float] | None] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_sha256", "pipeline_version", name="uq_image_mask_source_version"),
+        CheckConstraint(
+            "status in ('ok','held','empty','ineligible','failed')", name="ck_image_mask_status"
+        ),
+        Index("ix_image_masks_mask_sha256", "mask_sha256"),
+    )
+
+
 # Useful indexes
 Index("ix_image_versions_image_id_visibility", ImageVersion.image_id, ImageVersion.visibility)
 Index("ix_album_title_trgm", Album.title)
