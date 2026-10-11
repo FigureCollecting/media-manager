@@ -2,7 +2,10 @@
 
 DRY RUN BY DEFAULT. A dry run computes everything -- eligibility, the mask,
 its grounding -- and reports it, but writes nothing: no object, no row, no
-batch record. ``dry_run=False`` is the only way anything is stored.
+batch record. ``dry_run=False`` is the only way anything is stored, and it
+refuses a backend that is not a mask model (``publishes_masks``; the stub,
+which is also the configured default) before writing anything: a stub mask
+would otherwise be published and, being a result, settle its image for good.
 
 IDEMPOTENT. A clean image is selected only while it has no image_masks row
 at the current MASK_PIPELINE_VERSION, so a re-run is a no-op and a version
@@ -313,6 +316,8 @@ def run_mask_batch(
     if resume_batch_id is not None and dry_run:
         raise ValueError("a dry run cannot resume a batch: it records nothing to resume")
     active = backend or get_matting_backend()
+    if not dry_run and not active.publishes_masks:
+        raise ValueError(f"backend {active.name!r} is not a mask model: dry run only")
     batch: MaskBatch | None = None
     if not dry_run:
         batch = _open_batch(

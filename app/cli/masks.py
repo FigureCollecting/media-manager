@@ -10,7 +10,8 @@
     python -m app.cli.masks [--sandbox DIR] report --batch ID
 
 ``run`` is a DRY RUN unless ``--apply``: it computes and prints every mask's
-outcome and grounding, and writes nothing. ``--sandbox DIR`` keeps the whole
+outcome and grounding, and writes nothing. ``--apply`` needs a mask model
+(birefnet, birefnet-basekept, or one configured): the stub is dry run only. ``--sandbox DIR`` keeps the whole
 lane in DIR (``masks.db`` SQLite + ``objects/``), so a seeded sample runs with
 no Postgres or bucket; without it the configured DATABASE_URL and S3 bucket
 are used. ``--backend birefnet --model PATH`` runs the real model (CUDA
@@ -44,6 +45,7 @@ from ..workers.matting import (
     IsNetMattingBackend,
     MattingBackend,
     StubMattingBackend,
+    get_matting_backend,
 )
 
 #: Grounding fields summarised as [min, max] over a run's measured masks.
@@ -224,7 +226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "run":
             # refuse before touching any store
-            make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
+            chosen = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
+            active = chosen or get_matting_backend()
+            if args.apply and not active.publishes_masks:
+                raise Refused(f"backend {active.name!r} is not a mask model: dry run only")
         db, store = open_stores(args.sandbox)
         try:
             if args.command == "seed":

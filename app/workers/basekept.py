@@ -116,6 +116,7 @@ class BaseKeptMattingBackend(MattingBackend):
     """BiRefNet (``primary``) plus the July base-keep pass over IS-Net donors."""
 
     name: ClassVar[str] = "birefnet_basekept"
+    publishes_masks: ClassVar[bool] = True
 
     def __init__(self, *, primary: MattingBackend, donors: Sequence[MattingBackend]) -> None:
         if not donors:

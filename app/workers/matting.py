@@ -41,6 +41,11 @@ class MattingBackend(ABC):
 
     #: Recorded beside every mask as its provenance (which backend made it).
     name: ClassVar[str] = "custom"
+    #: Whether an APPLIED mask batch may store and publish this backend's
+    #: masks (app.workers.mask_job). Opt-in: only a real matting model sets
+    #: it. The stub's backdrop-distance heuristic keeps a dark floor under a
+    #: dark figure and still passes the quality gate, so it is dry run only.
+    publishes_masks: ClassVar[bool] = False
 
     @abstractmethod
     def matte(self, image: Image.Image) -> Image.Image:
@@ -149,6 +154,7 @@ class BiRefNetMattingBackend(MattingBackend):
     INPUT_SIZE = 1024
 
     name: ClassVar[str] = "birefnet"
+    publishes_masks: ClassVar[bool] = True
     #: ImageNet normalization stats used by the model's own preprocessor.
     MEAN = (0.485, 0.456, 0.406)
     STD = (0.229, 0.224, 0.225)
