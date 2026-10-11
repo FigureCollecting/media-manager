@@ -42,6 +42,12 @@ def _photo(color: tuple[int, int, int], seed: int = 0) -> bytes:
     return buf.getvalue()
 
 
+def _flat_png() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGBA", (6, 6), (5, 6, 7, 0)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @pytest.fixture()
 def store(tmp_path: Path) -> LocalObjectStore:
     return LocalObjectStore(tmp_path / "objects")
@@ -154,6 +160,26 @@ class TestSeed:
                 height=1,
                 storage_key="derived/x",
             )
+
+    @pytest.mark.parametrize("channels", [3, 4])
+    def test_a_clean_copy_differs_from_an_original_our_encoder_wrote(self, channels: int) -> None:
+        y, x = np.mgrid[0:64, 0:64]
+        planes = [(x * 7 + y * 3) % 256, (x * x + y) % 256, (y * 5) % 256, (x * y) % 256]
+        arr = np.dstack(planes[:channels]).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        first, _m, _w, _h = make_clean_copy(buf.getvalue())
+        again, _m, _w, _h = make_clean_copy(first)
+        assert again != first
+
+    def test_an_original_no_encoding_can_change_is_refused_loudly(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """A tiny flat PNG compresses identically at every level: its clean
+        copy would BE the original, whose address must never be public."""
+        first, _m, _w, _h = make_clean_copy(_flat_png())
+        with pytest.raises(ValueError, match="original"):
+            seed_clean_image(db_session, store, first, origins=[], figure_id="x")
 
     def test_clean_copy_of_a_palette_png_with_transparency_keeps_it(self) -> None:
         img = Image.new("P", (4, 4), 0)

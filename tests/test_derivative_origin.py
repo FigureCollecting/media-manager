@@ -22,8 +22,8 @@ from app.config import Settings, get_settings
 from app.db import get_db
 from app.derivative_main import app as origin_app
 from app.derivative_main import get_object_store
-from app.models import ImageMask, PublicObject
 from app.models import Image as ImageModel
+from app.models import ImageMask, PublicObject
 from app.object_store import LocalObjectStore
 from app.workers.mask_job import run_mask_batch
 from app.workers.mask_policy import ImageOrigin
@@ -123,9 +123,22 @@ class TestRoutes:
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
 
+    def test_healthz_degraded_when_the_database_is_down(self, client: TestClient) -> None:
+        class _DownSession:
+            def execute(self, *_a: object) -> None:
+                raise ConnectionError("db down")
+
+        def _db() -> Generator[object, None, None]:
+            yield _DownSession()
+
+        origin_app.dependency_overrides[get_db] = _db
+        resp = client.get("/healthz")
+        assert resp.status_code == 503
+        assert resp.json() == {"status": "degraded"}
+
 
 class TestServe:
-    @pytest.mark.parametrize(("which", "mime"), [("clean", "image/png"), ("mask", "image/png")])
+    @pytest.mark.parametrize(("which", "mime"), [("clean", "image/jpeg"), ("mask", "image/png")])
     def test_serves_exactly_the_addressed_bytes(
         self, client: TestClient, seeded: dict[str, str], which: str, mime: str
     ) -> None:
@@ -139,14 +152,16 @@ class TestServe:
         assert resp.headers["vary"] == "Origin"
         _hardening(resp)
 
-    def test_the_clean_copy_of_a_jpeg_is_served_as_jpeg(
+    def test_the_clean_copy_of_a_transparent_png_is_served_as_png(
         self, client: TestClient, db_session: Session, store: LocalObjectStore
     ) -> None:
         buf = io.BytesIO()
-        Image.new("RGB", (8, 8), (9, 9, 9)).save(buf, format="JPEG")
+        arr = np.zeros((16, 16, 4), dtype=np.uint8)
+        arr[4:12, 4:12] = (9, 99, 199, 255)
+        Image.fromarray(arr, mode="RGBA").save(buf, format="PNG", compress_level=1)
         obj = seed_clean_image(db_session, store, buf.getvalue(), origins=[], figure_id="x")
         resp = client.get(f"/d/{obj.sha256}")
-        assert resp.headers["content-type"] == "image/jpeg"
+        assert resp.headers["content-type"] == "image/png"
 
     def test_head_sends_the_headers_and_no_body(
         self, client: TestClient, seeded: dict[str, str], db_session: Session
@@ -243,7 +258,8 @@ class TestNotFound:
             "/d/{sha}/",
             "/d/{sha}/x",
             "/d/{sha}?raw=1",
-            "/d/{sha}?",
+            "/e/{sha}",
+            "/d//{sha}",
             "/d/" + "g" * 64,
             "/d/",
             "/d",
@@ -271,6 +287,10 @@ class TestNotFound:
         resp = client.request(method, f"/d/{seeded['mask']}", headers={"Origin": APP})
         self._assert_404(resp)
         assert "access-control-allow-origin" not in resp.headers
+
+    @pytest.mark.parametrize("method", ["POST", "HEAD", "OPTIONS"])
+    def test_healthz_is_get_only(self, client: TestClient, method: str) -> None:
+        self._assert_404(client.request(method, "/healthz"))
 
     def test_a_malformed_address_never_reaches_the_database_or_the_store(
         self, client: TestClient
@@ -316,3 +336,11 @@ class TestIntegrity:
         assert resp.status_code == 500
         assert resp.headers["cache-control"] == "no-store"
         assert b"s3://" not in resp.content
+
+
+def test_the_deployed_store_is_the_configured_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.s3
+    from app.object_store import S3ObjectStore
+
+    monkeypatch.setattr(app.s3, "get_s3", lambda: object())
+    assert isinstance(get_object_store(), S3ObjectStore)

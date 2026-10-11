@@ -44,6 +44,16 @@ class Settings(BaseSettings):
         "https://figurecollecting.com",
     ]
 
+    # The public derivative origin (app.derivative_main): the app origins
+    # that may read /d/<sha256> bytes cross-origin (the service worker caches
+    # them; the case view composites a mask over its derivative). fc-infra
+    # edge README "The public image address (ADDR-1)". Env MEDIA_CORS_ORIGINS
+    # as a JSON list.
+    media_cors_origins: list[str] = [
+        "https://figurecollecting.com",
+        "https://fc-api-canary.mindsignals1.com",
+    ]
+
     # Rate limiting
     rate_limit_per_minute: int = 120
 

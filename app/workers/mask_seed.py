@@ -38,14 +38,22 @@ def make_clean_copy(original: bytes) -> tuple[bytes, str, int, int]:
         mode = "RGBA" if has_alpha else "RGB"
         pixels = oriented.convert(mode)
         fresh = Image.frombytes(mode, pixels.size, pixels.tobytes())
-    out = io.BytesIO()
-    if has_alpha:
-        fresh.save(out, format="PNG")
-        mime = "image/png"
-    else:
-        fresh.save(out, format="JPEG", quality=95, subsampling=0)
-        mime = "image/jpeg"
-    return out.getvalue(), mime, fresh.width, fresh.height
+    # The clean copy must never be byte-identical to its original (the
+    # original's address must never become public): if the first encoding
+    # happens to reproduce the original exactly -- an original that was
+    # itself written by the same encoder -- the next setting is used.
+    mime = "image/png" if has_alpha else "image/jpeg"
+    data = b""
+    for setting in (9, 8) if has_alpha else (95, 94):
+        out = io.BytesIO()
+        if has_alpha:
+            fresh.save(out, format="PNG", compress_level=setting)
+        else:
+            fresh.save(out, format="JPEG", quality=setting, subsampling=0)
+        data = out.getvalue()
+        if data != original:
+            break
+    return data, mime, fresh.width, fresh.height
 
 
 def register_public_object(
