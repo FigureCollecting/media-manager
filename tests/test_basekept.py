@@ -70,9 +70,9 @@ class TestBaseKeptAlpha:
         out, _ = base_kept_alpha(_figure_without_base(), {"isnet": _donor_with_base()})
         assert out[5:12, 2:9].max() == 0
 
-    def test_a_stray_blob_in_birefnets_own_answer_is_dropped(self) -> None:
+    def test_faint_haze_in_birefnets_own_answer_is_dropped(self) -> None:
         b = _figure_without_base()
-        b[185:195, 2:8] = 255  # a blob BiRefNet kept, nowhere near the figure
+        b[185:195, 2:8] = 60  # faint haze BiRefNet left, nowhere near the figure
         out, _ = base_kept_alpha(b, {"isnet": _donor_with_base()})
         assert out[185:195, 2:8].max() == 0
         assert out[100, 50] == 255
@@ -96,6 +96,30 @@ class TestBaseKeptAlpha:
         out, donor = base_kept_alpha(b, {"isnet": _donor_with_base()})
         assert donor is None
         assert out.max() == 0
+
+    def test_a_donor_that_sees_nothing_leaves_birefnet_alone(self) -> None:
+        b = _figure_without_base()
+        out, donor = base_kept_alpha(b, {"blind": np.zeros((H, W), dtype=np.float32)})
+        assert donor == "blind"
+        assert np.array_equal(out, b.astype(np.uint8))
+
+    def test_a_figure_two_rows_tall_at_the_top_edge(self) -> None:
+        b = np.zeros((H, W), dtype=np.float32)
+        b[0:2, 40:60] = 255
+        out, _ = base_kept_alpha(b, {"isnet": b.copy()})
+        assert np.array_equal(out, b.astype(np.uint8))
+
+    def test_a_small_but_confident_base_is_kept(self) -> None:
+        i = np.zeros((H, W), dtype=np.float32)  # this donor sees only the base
+        i[160:166, 47:53] = 240  # 36 px, under 150, but every one confident
+        out, _ = base_kept_alpha(_figure_without_base(), {"isnet": i})
+        assert out[163, 50] > 200
+
+    def test_what_the_donor_adds_beside_the_body_above_the_band_is_ignored(self) -> None:
+        i = _figure_without_base().copy()
+        i[100:110, 60:75] = 240  # a "cape" touching the body, high above the base band
+        out, _ = base_kept_alpha(_figure_without_base(), {"isnet": i})
+        assert out[100:110, 61:75].max() == 0
 
     def test_output_is_uint8(self) -> None:
         out, _ = base_kept_alpha(_figure_without_base(), {"isnet": _donor_with_base()})
@@ -180,6 +204,19 @@ class TestIsNet:
 
 
 class TestFactory:
+    def test_naming_the_base_keep_backend_reads_the_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import Settings
+
+        monkeypatch.setattr(
+            "app.config.get_settings",
+            lambda: Settings(matting_model_path="/m/b.onnx", matting_isnet_anime_path="/m/a.onnx"),
+        )
+        backend = get_matting_backend("birefnet_basekept")
+        assert isinstance(backend, BaseKeptMattingBackend)
+        assert backend.donors[1]._model_path == "/m/a.onnx"  # type: ignore[attr-defined]
+
     def test_the_configured_base_keep_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.config import Settings, get_settings
 

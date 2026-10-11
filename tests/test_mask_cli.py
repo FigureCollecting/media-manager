@@ -120,14 +120,37 @@ class TestBackends:
     def test_birefnet_with_weights_is_built_lazily(self, tmp_path: Path) -> None:
         from app.workers.matting import BiRefNetMattingBackend
 
-        backend = cli.make_backend("birefnet", str(tmp_path / "w.onnx"))
+        backend = cli.make_backend("birefnet", str(tmp_path / "w.onnx"), None, None)
         assert isinstance(backend, BiRefNetMattingBackend)
+
+    def test_base_keep_needs_all_three_weights(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.workers.basekept import BaseKeptMattingBackend
+
+        for var in ("MATTING_MODEL_PATH", "MATTING_ISNET_GENERAL_PATH", "MATTING_ISNET_ANIME_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        backend = cli.make_backend("birefnet-basekept", "b.onnx", "g.onnx", "a.onnx")
+        assert isinstance(backend, BaseKeptMattingBackend)
+        assert [d._model_path for d in backend.donors] == ["g.onnx", "a.onnx"]  # type: ignore[attr-defined]
+        with pytest.raises(cli.Refused, match="--isnet-anime"):
+            cli.make_backend("birefnet-basekept", "b.onnx", "g.onnx", None)
+        with pytest.raises(cli.Refused, match="--isnet-general"):
+            cli.make_backend("birefnet-basekept", "b.onnx", None, "a.onnx")
+        with pytest.raises(cli.Refused, match="--model"):
+            cli.make_backend("birefnet-basekept", None, "g.onnx", "a.onnx")
+
+    def test_base_keep_weights_can_come_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MATTING_MODEL_PATH", "b.onnx")
+        monkeypatch.setenv("MATTING_ISNET_GENERAL_PATH", "g.onnx")
+        monkeypatch.setenv("MATTING_ISNET_ANIME_PATH", "a.onnx")
+        assert cli.make_backend("birefnet-basekept", None, None, None) is not None
 
     def test_stub_and_default(self) -> None:
         from app.workers.matting import StubMattingBackend
 
-        assert isinstance(cli.make_backend("stub", None), StubMattingBackend)
-        assert cli.make_backend(None, None) is None
+        assert isinstance(cli.make_backend("stub", None, None, None), StubMattingBackend)
+        assert cli.make_backend(None, None, None, None) is None
 
 
 class TestConfiguredStores:

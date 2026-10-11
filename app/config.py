@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # (see Dockerfile.worker). Only consulted when matting_backend is
     # "birefnet"; unset in dev/tests, where the stub backend is used.
     matting_model_path: str | None = None
+    # "birefnet_basekept" (the July base-keep pass, app.workers.basekept)
+    # also needs the two IS-Net base donors' ONNX weights.
+    matting_isnet_general_path: str | None = None
+    matting_isnet_anime_path: str | None = None
 
 
 @lru_cache(maxsize=1)

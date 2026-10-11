@@ -180,10 +180,11 @@ class BiRefNetMattingBackend(MattingBackend):
 
         if not self._model_path:
             raise RuntimeError(
-                "BiRefNetMattingBackend has no ONNX weights configured: "
+                f"{type(self).__name__} has no ONNX weights configured: "
                 "set Settings.matting_model_path (env MATTING_MODEL_PATH) "
                 "to the BiRefNet weights baked into the worker image (see "
-                "Dockerfile.worker), or pass session= explicitly."
+                "Dockerfile.worker; matting_isnet_*_path for IS-Net), or "
+                "pass session= explicitly."
             )
 
         # Import onnxruntime lazily -- never at module import time -- so
@@ -282,6 +283,42 @@ class BiRefNetMattingBackend(MattingBackend):
         return Image.fromarray(out, mode="RGBA")
 
 
+class IsNetMattingBackend(BiRefNetMattingBackend):
+    """IS-Net (DIS) via onnxruntime: the ``isnet-general-use`` and
+    ``isnet-anime`` exports the July base-keep pass used as its base donors
+    (app.workers.basekept). Same lazy, CUDA-required session as BiRefNet;
+    only the tensor conventions differ, and they follow the exports' own
+    reference pipeline (rembg's DIS sessions): LANCZOS to 1024, scaled by
+    the image's own maximum, ImageNet mean subtracted with unit std; the
+    output is min-max normalised with NO sigmoid and truncated to 8 bits,
+    then resized back with LANCZOS.
+    """
+
+    STD = (1.0, 1.0, 1.0)
+
+    name: ClassVar[str] = "isnet"
+
+    def _preprocess(self, image: Image.Image) -> np.ndarray:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        rgb_arr = np.ascontiguousarray(np.asarray(rgba)[..., :3])
+        resized = Image.fromarray(rgb_arr, mode="RGB").resize(
+            (self.INPUT_SIZE, self.INPUT_SIZE), Image.LANCZOS
+        )
+        arr = np.asarray(resized).astype(np.float32)
+        scale = np.float32(max(float(arr.max()), 1e-6))
+        mean = np.array(self.MEAN, dtype=np.float32)
+        std = np.array(self.STD, dtype=np.float32)
+        normalized = (arr / scale - mean) / std
+        return np.expand_dims(normalized.transpose(2, 0, 1), axis=0).astype(np.float32)
+
+    def _postprocess(self, raw_output: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+        pred = np.squeeze(raw_output[:, 0, :, :], axis=0)
+        lo, hi = float(pred.min()), float(pred.max())
+        pred = (pred - lo) / max(hi - lo, 1e-12)
+        mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
+        return np.asarray(mask.resize(size, Image.LANCZOS))
+
+
 _BACKENDS: dict[str, type[MattingBackend]] = {
     "stub": StubMattingBackend,
     "birefnet": BiRefNetMattingBackend,
@@ -300,6 +337,20 @@ def get_matting_backend(name: str | None = None) -> MattingBackend:
         name = getattr(settings, "matting_backend", "stub")
 
     key = (name or "stub").lower()
+    if key == "birefnet_basekept":
+        from .basekept import BaseKeptMattingBackend
+
+        if settings is None:
+            from ..config import get_settings
+
+            settings = get_settings()
+        return BaseKeptMattingBackend(
+            primary=BiRefNetMattingBackend(model_path=settings.matting_model_path),
+            donors=[
+                IsNetMattingBackend(model_path=settings.matting_isnet_general_path),
+                IsNetMattingBackend(model_path=settings.matting_isnet_anime_path),
+            ],
+        )
     if key == "birefnet":
         if settings is None:
             from ..config import get_settings

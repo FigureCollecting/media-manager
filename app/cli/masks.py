@@ -3,7 +3,9 @@
     python -m app.cli.masks [--sandbox DIR] seed --sample DIR
     python -m app.cli.masks [--sandbox DIR] run [--apply] [--limit N] [--page-size N]
                                                 [--resume BATCH] [--retry-failed]
-                                                [--backend stub|birefnet] [--model PATH]
+                                                [--backend stub|birefnet|birefnet-basekept]
+                                                [--model PATH] [--isnet-general PATH]
+                                                [--isnet-anime PATH]
                                                 [--report FILE]
     python -m app.cli.masks [--sandbox DIR] report --batch ID
 
@@ -33,10 +35,16 @@ from sqlalchemy.orm import Session
 
 from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
+from ..workers.basekept import BaseKeptMattingBackend
 from ..workers.mask_job import run_mask_batch
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
-from ..workers.matting import BiRefNetMattingBackend, MattingBackend, StubMattingBackend
+from ..workers.matting import (
+    BiRefNetMattingBackend,
+    IsNetMattingBackend,
+    MattingBackend,
+    StubMattingBackend,
+)
 
 #: Grounding fields summarised as [min, max] over a run's measured masks.
 RANGE_FIELDS = (
@@ -57,19 +65,45 @@ def _citext_sqlite(type_: CITEXT, compiler: Any, **kw: Any) -> str:
     return "TEXT"
 
 
-class _Refused(Exception):
-    pass
+class Refused(Exception):
+    """A request the CLI refuses before changing anything (exit status 2)."""
 
 
-def make_backend(name: str | None, model: str | None) -> MattingBackend | None:
+def _weights(given: str | None, env: str, flag: str, backend: str) -> str:
+    path = given or os.environ.get(env)
+    if not path:
+        raise Refused(f"--backend {backend} needs {flag} PATH (or {env})")
+    return path
+
+
+def make_backend(
+    name: str | None, model: str | None, isnet_general: str | None, isnet_anime: str | None
+) -> MattingBackend | None:
     """None = the configured backend (Settings.matting_backend)."""
     if name is None:
         return None
     if name == "birefnet":
-        path = model or os.environ.get("MATTING_MODEL_PATH")
-        if not path:
-            raise _Refused("--backend birefnet needs --model PATH (or MATTING_MODEL_PATH)")
-        return BiRefNetMattingBackend(model_path=path)
+        return BiRefNetMattingBackend(
+            model_path=_weights(model, "MATTING_MODEL_PATH", "--model", name)
+        )
+    if name == "birefnet-basekept":
+        return BaseKeptMattingBackend(
+            primary=BiRefNetMattingBackend(
+                model_path=_weights(model, "MATTING_MODEL_PATH", "--model", name)
+            ),
+            donors=[
+                IsNetMattingBackend(
+                    model_path=_weights(
+                        isnet_general, "MATTING_ISNET_GENERAL_PATH", "--isnet-general", name
+                    )
+                ),
+                IsNetMattingBackend(
+                    model_path=_weights(
+                        isnet_anime, "MATTING_ISNET_ANIME_PATH", "--isnet-anime", name
+                    )
+                ),
+            ],
+        )
     return StubMattingBackend()
 
 
@@ -115,7 +149,7 @@ def _figure_ids(db: Session, source_sha256: str) -> list[str]:
 
 
 def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str, Any]:
-    backend = make_backend(args.backend, args.model)
+    backend = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
     try:
         report = run_mask_batch(
             db,
@@ -128,7 +162,7 @@ def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str,
             retry_failed=args.retry_failed,
         )
     except ValueError as exc:
-        raise _Refused(str(exc)) from exc
+        raise Refused(str(exc)) from exc
     summary = report.as_dict()
     for item in summary["items"]:
         item["figure_ids"] = _figure_ids(db, item["source_sha256"])
@@ -146,7 +180,7 @@ def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str,
 def _report(db: Session, batch_id: int) -> dict[str, Any]:
     batch = db.get(MaskBatch, batch_id)
     if batch is None:
-        raise _Refused(f"no mask batch {batch_id}")
+        raise Refused(f"no mask batch {batch_id}")
     return {
         "id": batch.id,
         "status": batch.status,
@@ -174,8 +208,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--page-size", type=int, default=50)
     run.add_argument("--resume", type=int, help="continue an unfinished batch")
     run.add_argument("--retry-failed", action="store_true")
-    run.add_argument("--backend", choices=["stub", "birefnet"])
-    run.add_argument("--model", help="BiRefNet ONNX weights (with --backend birefnet)")
+    run.add_argument("--backend", choices=["stub", "birefnet", "birefnet-basekept"])
+    run.add_argument("--model", help="BiRefNet ONNX weights (birefnet, birefnet-basekept)")
+    run.add_argument("--isnet-general", help="IS-Net general-use ONNX weights (birefnet-basekept)")
+    run.add_argument("--isnet-anime", help="IS-Net anime ONNX weights (birefnet-basekept)")
     run.add_argument("--report", help="also write the full JSON report here")
 
     rep = sub.add_parser("report", help="show one applied batch")
@@ -187,7 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "run":
-            make_backend(args.backend, args.model)  # refuse before touching any store
+            # refuse before touching any store
+            make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
         db, store = open_stores(args.sandbox)
         try:
             if args.command == "seed":
@@ -198,7 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(_report(db, args.batch))
         finally:
             db.close()
-    except _Refused as exc:
+    except Refused as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     return 0
