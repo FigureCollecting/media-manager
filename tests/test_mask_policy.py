@@ -37,6 +37,9 @@ class TestClassifyOrigin:
             ("https://myfigurecollection.net/item/1154594", "unknown_origin"),
             ("https://myfigurecollection.net/?objectType=item", "item_main"),
             ("https://myfigurecollection.net/?objectType=Item", "unknown_origin"),
+            ("https://myfigurecollection.net/?objectType=item&objectType=x", "unknown_origin"),
+            ("https://myfigurecollection.net/?objectType=item&objectType=picture", "user_photo"),
+            ("https://myfigurecollection.net/item/1?objectType=item", "unknown_origin"),
         ],
     )
     def test_mfc_is_classified_by_path(self, url: str, expected: str) -> None:
@@ -77,7 +80,14 @@ class TestClassifyOrigin:
         o = ImageOrigin(url=None, source_class="user_photo")
         assert classify_origin(o) == "user_photo"
 
-    @pytest.mark.parametrize("url", ["not a url", "ftp://static.myfigurecollection.net/x"])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not a url",
+            "ftp://static.myfigurecollection.net/upload/items/0/9-9.jpg",
+            "ftp://shop.example/p/1.jpg",
+        ],
+    )
     def test_an_unreadable_or_non_http_url_is_unknown(self, url: str) -> None:
         assert classify_origin(ImageOrigin(url=url, source="mfc")) == "unknown_origin"
 
