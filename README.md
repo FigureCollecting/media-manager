@@ -45,3 +45,10 @@ Testing:
 
 - Run locally: `make test` (requires Python 3.12 + Poetry). Integration tests are skipped unless backing services are available.
 
+
+Mask lane (MASK-1):
+
+- A separate alpha mask per clean image (Ross 2026-09-26: non-destructive; the clean copy is never cut out). The mask is a PNG whose alpha channel is the mask (`LA`, luminance white), the same size as its derivative; the client composites it over the clean copy (CSS `mask-image` / canvas `destination-in`). Grounding and appearance per fc-api-contract 0.4.0 `ProductImage`, plus the top margin and opaque box (CONTRACT-1 follow-up). See `app/workers/mask.py`.
+- Eligibility keys on origin: MFC `/upload/items/` and store listing images get masks; collector photos (`/upload/pictures/`, role `user`, class `user_photo`) do not (`app/workers/mask_policy.py`).
+- Batch job, dry run by default: `python -m app.cli.masks [--sandbox DIR] seed --sample tests/fixtures/mask_sample`, then `... run` (report only) or `... run --apply`; `--resume BATCH`, `--retry-failed`, `--backend stub|birefnet|birefnet-basekept` (the July base-keep pass: BiRefNet plus IS-Net base donors). Celery task `generate_masks(limit, apply=False)`.
+- Public origin: `app/derivative_main.py` is its own ASGI app (never `app.main`) serving `GET`/`HEAD /d/<sha256>` for registered derivatives and masks only: immutable caching, CORS for `MEDIA_CORS_ORIGINS`, `Vary: Origin`, nosniff, CORP cross-origin, CSP sandbox; anything else is a bodiless 404.
