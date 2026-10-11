@@ -1,0 +1,208 @@
+"""MASK-1 operator CLI.
+
+    python -m app.cli.masks [--sandbox DIR] seed --sample DIR
+    python -m app.cli.masks [--sandbox DIR] run [--apply] [--limit N] [--page-size N]
+                                                [--resume BATCH] [--retry-failed]
+                                                [--backend stub|birefnet] [--model PATH]
+                                                [--report FILE]
+    python -m app.cli.masks [--sandbox DIR] report --batch ID
+
+``run`` is a DRY RUN unless ``--apply``: it computes and prints every mask's
+outcome and grounding, and writes nothing. ``--sandbox DIR`` keeps the whole
+lane in DIR (``masks.db`` SQLite + ``objects/``), so a seeded sample runs with
+no Postgres or bucket; without it the configured DATABASE_URL and S3 bucket
+are used. ``--backend birefnet --model PATH`` runs the real model (CUDA
+required, see app.workers.matting); the default is the configured backend.
+Exit status: 0 done, 2 refused (nothing was changed by the refused step).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import create_engine, select
+from sqlalchemy.dialects.postgresql import CITEXT, UUID
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session
+
+from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
+from ..object_store import LocalObjectStore, ObjectStore
+from ..workers.mask_job import run_mask_batch
+from ..workers.mask_policy import ImageOrigin
+from ..workers.mask_seed import seed_clean_image
+from ..workers.matting import BiRefNetMattingBackend, MattingBackend, StubMattingBackend
+
+#: Grounding fields summarised as [min, max] over a run's measured masks.
+RANGE_FIELDS = (
+    "bottom_margin_frac",
+    "top_margin_frac",
+    "contact_band_center_x_frac",
+    "contact_band_width_frac",
+)
+
+
+@compiles(UUID, "sqlite")
+def _uuid_sqlite(type_: UUID[Any], compiler: Any, **kw: Any) -> str:
+    return "TEXT"
+
+
+@compiles(CITEXT, "sqlite")
+def _citext_sqlite(type_: CITEXT, compiler: Any, **kw: Any) -> str:
+    return "TEXT"
+
+
+class _Refused(Exception):
+    pass
+
+
+def make_backend(name: str | None, model: str | None) -> MattingBackend | None:
+    """None = the configured backend (Settings.matting_backend)."""
+    if name is None:
+        return None
+    if name == "birefnet":
+        path = model or os.environ.get("MATTING_MODEL_PATH")
+        if not path:
+            raise _Refused("--backend birefnet needs --model PATH (or MATTING_MODEL_PATH)")
+        return BiRefNetMattingBackend(model_path=path)
+    return StubMattingBackend()
+
+
+def open_stores(sandbox: str | None) -> tuple[Session, ObjectStore]:
+    if sandbox is None:
+        from .. import db as configured_db
+        from .. import object_store as configured_store
+
+        return configured_db.SessionLocal(), configured_store.S3ObjectStore()
+    root = Path(sandbox)
+    root.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(f"sqlite:///{root / 'masks.db'}")
+    Base.metadata.create_all(engine)
+    return Session(engine, expire_on_commit=False), LocalObjectStore(root / "objects")
+
+
+def _print(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, indent=1, sort_keys=True, default=str))
+
+
+def _seed(db: Session, store: ObjectStore, sample: Path) -> dict[str, Any]:
+    manifest = json.loads((sample / "manifest.json").read_text())
+    for entry in manifest["entries"]:
+        seed_clean_image(
+            db,
+            store,
+            (sample / "originals" / f"{entry['name']}.png").read_bytes(),
+            origins=[ImageOrigin(**o) for o in entry["origins"]],
+            figure_id=entry["figure_id"],
+        )
+    return {"seeded": len(manifest["entries"])}
+
+
+def _figure_ids(db: Session, source_sha256: str) -> list[str]:
+    rows = db.execute(
+        select(FigureGallery.figure_id)
+        .join(ImageVersion, ImageVersion.image_id == FigureGallery.image_id)
+        .join(PublicObject, PublicObject.image_version_id == ImageVersion.id)
+        .where(PublicObject.sha256 == source_sha256)
+        .order_by(FigureGallery.id)
+    ).scalars()
+    return list(rows)
+
+
+def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str, Any]:
+    backend = make_backend(args.backend, args.model)
+    try:
+        report = run_mask_batch(
+            db,
+            store,
+            backend=backend,
+            dry_run=not args.apply,
+            limit=args.limit,
+            page_size=args.page_size,
+            resume_batch_id=args.resume,
+            retry_failed=args.retry_failed,
+        )
+    except ValueError as exc:
+        raise _Refused(str(exc)) from exc
+    summary = report.as_dict()
+    for item in summary["items"]:
+        item["figure_ids"] = _figure_ids(db, item["source_sha256"])
+    measured = [i["grounding"] for i in summary["items"] if i["grounding"]]
+    summary["grounding_ranges"] = {
+        f: [min(g[f] for g in measured), max(g[f] for g in measured)]
+        for f in RANGE_FIELDS
+        if measured
+    }
+    if args.report:
+        Path(args.report).write_text(json.dumps(summary, indent=1, sort_keys=True, default=str))
+    return summary
+
+
+def _report(db: Session, batch_id: int) -> dict[str, Any]:
+    batch = db.get(MaskBatch, batch_id)
+    if batch is None:
+        raise _Refused(f"no mask batch {batch_id}")
+    return {
+        "id": batch.id,
+        "status": batch.status,
+        "pipeline_version": batch.pipeline_version,
+        "backend": batch.backend,
+        "counts": batch.counts,
+        "cursor_sha256": batch.cursor_sha256,
+        "item_limit": batch.item_limit,
+        "started_at": batch.started_at,
+        "finished_at": batch.finished_at,
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python -m app.cli.masks", description=__doc__.split("\n")[0])
+    p.add_argument("--sandbox", help="keep the lane in this directory (SQLite + local objects)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    seed = sub.add_parser("seed", help="register a sample's originals and their clean copies")
+    seed.add_argument("--sample", required=True, type=Path)
+
+    run = sub.add_parser("run", help="mask every clean image without one (dry run by default)")
+    run.add_argument("--apply", action="store_true", help="store results (default: dry run)")
+    run.add_argument("--limit", type=int)
+    run.add_argument("--page-size", type=int, default=50)
+    run.add_argument("--resume", type=int, help="continue an unfinished batch")
+    run.add_argument("--retry-failed", action="store_true")
+    run.add_argument("--backend", choices=["stub", "birefnet"])
+    run.add_argument("--model", help="BiRefNet ONNX weights (with --backend birefnet)")
+    run.add_argument("--report", help="also write the full JSON report here")
+
+    rep = sub.add_parser("report", help="show one applied batch")
+    rep.add_argument("--batch", required=True, type=int)
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "run":
+            make_backend(args.backend, args.model)  # refuse before touching any store
+        db, store = open_stores(args.sandbox)
+        try:
+            if args.command == "seed":
+                _print(_seed(db, store, args.sample))
+            elif args.command == "run":
+                _print(_run(db, store, args))
+            else:
+                _print(_report(db, args.batch))
+        finally:
+            db.close()
+    except _Refused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

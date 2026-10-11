@@ -103,6 +103,7 @@ class TestRefusals:
         code = cli.main(["--sandbox", sandbox, "run", "--backend", "birefnet"])
         assert code == 2
         assert "--model" in capsys.readouterr().err
+        assert not Path(sandbox).exists()
 
     def test_report_of_an_unknown_batch(
         self, sandbox: str, capsys: pytest.CaptureFixture[str]
