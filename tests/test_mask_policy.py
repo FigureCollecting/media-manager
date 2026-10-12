@@ -6,13 +6,15 @@ would come from /upload/pictures/ (collectors' photos), so only the URL tells
 them apart. Item-main images are eligible for a mask; user photos are not --
 they stay displayable, unmasked.
 
-A store's listing photo gets a mask only when its source holds a MASK GRANT
-for the host the bytes came from (Settings.mask_store_grants, env
-MASK_STORE_GRANTS = {"<source>": ["<domain>", ...]}); none is granted by
-default. Everything else is refused: an ungranted source or host, a host
-that does not match the recorded source, a URL carrying credentials or a
-backslash, an IP literal. media-manager records an origin as (source, url)
-only, so nothing else about the image is consulted.
+A store's listing photo gets a mask when its source is a registered store
+source and the bytes came from one of its domains (Settings.mask_store_grants,
+env MASK_STORE_GRANTS = {"<source>": ["<domain>", ...]}; none is registered
+by default). MASK-G: every registered source is granted, and a revoked one
+(MASK_STORE_REVOKED, ``masks revoke-store``) is refused whatever its grant.
+Everything else is refused: an unregistered source or host, a host that does
+not match the recorded source, a URL carrying credentials or a backslash, an
+IP literal. media-manager records an origin as (source, url) only, so nothing
+else about the image is consulted.
 """
 
 from __future__ import annotations

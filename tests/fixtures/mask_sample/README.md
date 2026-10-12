@@ -9,8 +9,8 @@
   failure case (black dress on a black marble floor); `spike-collector-photo` carries a
   collector-photo origin and must get no mask.
 - `manifest.json` -- entries, backdrops and synthetic origin URLs (nothing is fetched). The one
-  store listing (`miku-nendo`, source `example-store`) gets a mask only under
-  `MASK_STORE_GRANTS='{"example-store": ["example-store.test"]}'`; without a grant it is refused.
+  store listing (`miku-nendo`, source `example-store`) gets a mask only once its source is
+  registered, `MASK_STORE_GRANTS='{"example-store": ["example-store.test"]}'`; unregistered it is refused.
 - `client_golden.json` -- the grounding fc-mobile's own client code measures on each
   reference alpha; the lane must report the same numbers.
 

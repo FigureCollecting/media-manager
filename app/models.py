@@ -253,7 +253,9 @@ class PublicObject(Base):
     ONLY our own work products are registered here -- a clean (sanitized)
     derivative, a matted fallback, or a MASK-1 mask. An original's bytes are
     never registered (``mask_seed.register_public_object`` refuses an
-    ``images.sha256``), so no original is ever addressable.
+    ``images.sha256``). The one overlap: an original whose bytes ARE one of
+    our clean copies (that copy captured again) is linked behind the copy by
+    its pixels and judged with it (app.publication).
     """
 
     __tablename__ = "public_objects"
