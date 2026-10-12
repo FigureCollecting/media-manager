@@ -99,11 +99,21 @@ class TestTheSample:
             assert np.array_equal(gen._over(ref, backdrop), committed), name
 
     def test_origins_split_item_images_from_the_collector_photo(self) -> None:
-        verdicts = {
-            name: mask_eligibility([ImageOrigin(**o) for o in e["origins"]]).eligible
+        grant = {"example-store": ["example-store.test"]}
+        refused = {
+            name
             for name, e in ENTRIES.items()
+            if not mask_eligibility([ImageOrigin(**o) for o in e["origins"]], grant).eligible
         }
-        assert [n for n, ok in verdicts.items() if not ok] == ["spike-collector-photo"]
+        assert refused == {"spike-collector-photo"}
+
+    def test_without_a_grant_the_store_listing_is_refused_too(self) -> None:
+        refused = {
+            name
+            for name, e in ENTRIES.items()
+            if not mask_eligibility([ImageOrigin(**o) for o in e["origins"]], {}).eligible
+        }
+        assert refused == {"spike-collector-photo", "miku-nendo"}
 
 
 @pytest.mark.parametrize("reference", REFERENCES)

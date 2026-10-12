@@ -1,36 +1,58 @@
 """MASK-1: which clean images may get a mask, keyed on where the bytes came from.
 
 A mask is our derivative work on an image, so it is made only for imagery
-that represents the ITEM: a store's listing photos and MFC's item-main
-images. A collector's own photo (MFC ``/upload/pictures/``, a ``user`` role
-or a ``user_photo`` source class) is never masked; it may still be shown,
-unmasked, wherever display allows it. Display itself is not decided here:
-the spine's rights gate and the coordinator's display restrictions own that.
+that represents the ITEM, and only where its source permits it:
+
+- MFC (source ``mfc`` on an MFC host): the item-main images under
+  ``/upload/items/`` (or the item image endpoint) get a mask; a collector's
+  own photo (``/upload/pictures/``) never does -- it may still be shown,
+  unmasked, wherever display allows it.
+- A store's listing photo gets a mask only when its source holds a MASK
+  GRANT for the host the bytes came from (``Settings.mask_store_grants``,
+  env ``MASK_STORE_GRANTS`` = ``{"<source>": ["<domain>", ...]}``, a domain
+  covering its subdomains). None is granted by default: this is the
+  per-source permission split, and granting a store is a decision about that
+  store's imagery, made by name.
+
+Display itself is not decided here: the spine's rights gate and the
+coordinator's display restrictions own that.
 
 WHY THE ORIGIN AND NOT THE ROLE. Measured 2026-10-09 (SIZE-MEASURE): every
 captured MFC image row carries role ``gallery``, whether it came from
 ``/upload/items/`` or would come from ``/upload/pictures/``; only the URL the
-bytes were captured from separates the two lanes.
+bytes were captured from separates the two lanes. media-manager records an
+origin as (source, url) only (``figure_galleries``), so that is all this
+policy reads.
 
-FAIL CLOSED. An MFC URL that matches neither rule, an unreadable URL, and
-bytes with no known origin get no mask; so do bytes seen under several
-origins when ANY of them is ineligible (the same picture captured as an item
-image and as a collector's photo is a collector's photo somewhere).
+FAIL CLOSED. No mask for: an ungranted source or host (``not_granted``); an
+MFC URL that matches neither rule, an MFC host recorded under another source
+or an ``mfc`` row on another host, a URL carrying credentials or a
+backslash (which host served it is ambiguous), a URL that is not http(s)
+(``unknown_origin``); bytes with no origin (``no_origin``); and bytes seen
+under several origins when ANY of them is ineligible (the same picture
+captured as an item image and as a collector's photo is a collector's photo
+somewhere). Hosts are compared lower-cased without trailing dots.
 """
 
 from __future__ import annotations
 
 import posixpath
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import parse_qs, unquote, urlsplit
 
-OriginClass = Literal["item_main", "store_listing", "user_photo", "unknown_origin", "no_origin"]
+OriginClass = Literal[
+    "item_main", "store_listing", "user_photo", "not_granted", "unknown_origin", "no_origin"
+]
 
 #: The origin classes a mask may be made for.
 MASKABLE: frozenset[str] = frozenset({"item_main", "store_listing"})
 
+#: Per source, the domains its listing photos may be masked from.
+StoreGrants = Mapping[str, Sequence[str]]
+
+MFC_SOURCE = "mfc"
 _MFC_DOMAIN = "myfigurecollection.net"
 _MFC_ITEM_PREFIX = "/upload/items/"
 _MFC_PICTURE_PREFIX = "/upload/pictures/"
@@ -42,8 +64,6 @@ class ImageOrigin:
 
     url: str | None
     source: str | None = None
-    role: str | None = None
-    source_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,8 +74,12 @@ class MaskEligibility:
     reason: str
 
 
-def _is_mfc(host: str) -> bool:
-    return host == _MFC_DOMAIN or host.endswith("." + _MFC_DOMAIN)
+def _domain(name: str) -> str:
+    return name.strip().lower().rstrip(".")
+
+
+def _within(host: str, domain: str) -> bool:
+    return host == domain or host.endswith("." + domain)
 
 
 def _classify_mfc(path: str, query: str) -> OriginClass:
@@ -73,27 +97,42 @@ def _classify_mfc(path: str, query: str) -> OriginClass:
     return "unknown_origin"
 
 
-def classify_origin(origin: ImageOrigin) -> OriginClass:
-    if origin.source_class == "user_photo" or origin.role == "user":
-        return "user_photo"
+def configured_store_grants() -> StoreGrants:
+    from ..config import get_settings
+
+    return get_settings().mask_store_grants
+
+
+def classify_origin(origin: ImageOrigin, store_grants: StoreGrants | None = None) -> OriginClass:
+    """``store_grants`` defaults to the configured grants."""
     if not origin.url:
         return "no_origin"
     parts = urlsplit(origin.url)
-    host = parts.hostname
-    if parts.scheme not in ("http", "https") or not host:
+    if parts.scheme not in ("http", "https") or "@" in parts.netloc or "\\" in origin.url:
         return "unknown_origin"
-    if not _is_mfc(host):
+    host = _domain(parts.hostname or "")
+    if not host:
+        return "unknown_origin"
+    if _within(host, _MFC_DOMAIN) or origin.source == MFC_SOURCE:
+        if not (_within(host, _MFC_DOMAIN) and origin.source == MFC_SOURCE):
+            return "unknown_origin"
+        # Judge the path where it actually lands: percent-decode, then resolve
+        # any ../ so /upload/items/../pictures/ is a picture.
+        path = posixpath.normpath(unquote(parts.path or "/"))
+        return _classify_mfc(path, parts.query)
+    grants = configured_store_grants() if store_grants is None else store_grants
+    granted = grants.get(origin.source or "", ())
+    if any(_within(host, _domain(d)) for d in granted):
         return "store_listing"
-    # Judge the path where it actually lands: percent-decode, then resolve
-    # any ../ so /upload/items/../pictures/ is a picture.
-    path = posixpath.normpath(unquote(parts.path or "/"))
-    return _classify_mfc(path, parts.query)
+    return "not_granted"
 
 
-def mask_eligibility(origins: Sequence[ImageOrigin]) -> MaskEligibility:
+def mask_eligibility(
+    origins: Sequence[ImageOrigin], store_grants: StoreGrants | None = None
+) -> MaskEligibility:
     if not origins:
         return MaskEligibility(eligible=False, origin_class="no_origin", reason="no_origin")
-    classes = [classify_origin(o) for o in origins]
+    classes = [classify_origin(o, store_grants) for o in origins]
     for cls in classes:
         if cls not in MASKABLE:
             return MaskEligibility(eligible=False, origin_class=cls, reason=cls)

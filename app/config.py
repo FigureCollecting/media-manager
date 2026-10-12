@@ -54,6 +54,13 @@ class Settings(BaseSettings):
         "https://fc-api-canary.mindsignals1.com",
     ]
 
+    # MASK-1 per-source mask grants (app.workers.mask_policy): per source, the
+    # domains (subdomains included) whose listing photos may get a mask. Env
+    # MASK_STORE_GRANTS as a JSON object, e.g. {"amiami": ["amiami.com"]}.
+    # None by default: MFC item-main images are the only maskable origin
+    # until a store is granted by name.
+    mask_store_grants: dict[str, list[str]] = {}
+
     # Rate limiting
     rate_limit_per_minute: int = 120
 

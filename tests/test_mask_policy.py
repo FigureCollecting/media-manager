@@ -165,6 +165,7 @@ class TestStores:
             ("https://user:pw@shop.example/p/1.jpg", "shop"),
             ("https://evil.test\\@static.myfigurecollection.net/upload/items/1/1-a.jpg", "mfc"),
             ("https://shop.example\\.evil.test/p/1.jpg", "shop"),
+            ("https:///p/1.jpg", "shop"),
         ],
     )
     def test_credentials_or_a_backslash_make_the_host_ambiguous(
