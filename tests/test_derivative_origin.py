@@ -457,6 +457,21 @@ class TestNotFound:
         self._assert_404(client.get(f"/d/{row.mask_sha256}"))
         assert client.get(f"/d/{row.source_sha256}").status_code == 200
 
+    def test_an_origin_less_capture_of_the_picture_takes_the_mask_not_the_copy_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Pooling fails closed for the MASK (a capture with no live origin
+        makes it ineligible); the clean copy is judged by liveness alone."""
+        self._seed_capture(db_session, store, 0, ITEM.format(n=0))
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        row = db_session.execute(select(ImageMask)).scalar_one()
+        assert client.get(f"/d/{row.mask_sha256}").status_code == 200
+        seed_clean_image(
+            db_session, store, _capture("capture 1"), origins=[], figure_id="mfc:capture-1"
+        )
+        self._assert_404(client.get(f"/d/{row.mask_sha256}"))
+        assert client.get(f"/d/{row.source_sha256}").status_code == 200
+
     @pytest.mark.parametrize(
         ("second_url", "mask_served"),
         [(ITEM.format(n=2), True), (PICTURE, False)],

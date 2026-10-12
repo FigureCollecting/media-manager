@@ -608,6 +608,42 @@ class TestPixelIdenticalCaptures:
         assert [(i.status, i.reason) for i in report.items] == [("ineligible", "no_origin")]
         assert _public(db_session, "mask") == []
 
+    @pytest.mark.parametrize("second", ["no-gallery-row", "url-none", "row-soft-deleted"])
+    def test_a_capture_with_no_live_origin_makes_the_pool_ineligible(
+        self, db_session: Session, store: LocalObjectStore, second: str
+    ) -> None:
+        """Pooling fails closed: a capture behind the shared copy with NO live
+        origin would be refused on its own (no_origin), so the pool's mask is
+        refused too -- whichever capture lacks it."""
+        import datetime as dt
+
+        seed_clean_image(
+            db_session,
+            store,
+            _capture("capture 0"),
+            origins=[ImageOrigin(url=ITEM.format(n=1), source="mfc")],
+            figure_id="mfc:capture-0",
+        )
+        origins = {
+            "no-gallery-row": [],
+            "url-none": [ImageOrigin(url=None, source="mfc")],
+            "row-soft-deleted": [ImageOrigin(url=ITEM.format(n=2), source="mfc")],
+        }[second]
+        seed_clean_image(
+            db_session, store, _capture("capture 1"), origins=origins, figure_id="mfc:capture-1"
+        )
+        if second == "row-soft-deleted":
+            row = db_session.execute(
+                select(FigureGallery).where(FigureGallery.figure_id == "mfc:capture-1")
+            ).scalar_one()
+            row.deleted_at = dt.datetime.now(dt.UTC)
+            db_session.commit()
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason, i.origin_class) for i in report.items] == [
+            ("ineligible", "no_origin", "no_origin")
+        ]
+        assert _public(db_session, "mask") == []
+
     def test_a_collector_photo_with_the_same_pixels_seeded_later_withdraws_the_mask(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
