@@ -900,14 +900,17 @@ class TestNotFound:
         assert client.get(f"/d/{shas['shop_clean']}").status_code == 200
 
     @pytest.mark.usefixtures("shop_registered")
+    @pytest.mark.parametrize("written", ["shop", " Shop "])
     def test_a_configured_revocation_is_a_404(
-        self, client: TestClient, db_session: Session, store: LocalObjectStore
+        self, client: TestClient, db_session: Session, store: LocalObjectStore, written: str
     ) -> None:
+        """MASK_STORE_REVOKED names a source as the policy compares it,
+        whatever its case or surrounding spaces."""
         shas = self._store_and_item_masks(db_session, store)
         revoked = Settings(
             environment="test",
             mask_store_grants={"shop": ["shop.example"]},
-            mask_store_revoked=["shop"],
+            mask_store_revoked=[written],
         )
         origin_app.dependency_overrides[get_settings] = lambda: revoked
         self._assert_404(client.get(f"/d/{shas['shop_mask']}"))

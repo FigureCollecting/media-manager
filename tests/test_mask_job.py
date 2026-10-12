@@ -1638,19 +1638,24 @@ class TestStoreRevocation:
         report = revoke_store_applied(db_session, "shop")
         assert shas["shop1"] in report["reevaluate"]["withdrawn"]
 
+    @pytest.mark.parametrize("recorded", ["SHOP", " Shop "])
     def test_revoke_matches_the_source_as_the_policy_does(
-        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+        self,
+        db_session: Session,
+        store: LocalObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+        recorded: str,
     ) -> None:
-        """A source registered and recorded as ``SHOP`` is the source
-        ``revoke-store shop`` names: the origin refuses it, and its row is
-        withdrawn too."""
+        """A source registered and recorded as ``SHOP`` or `` Shop `` is the
+        source ``revoke-store shop`` names: the origin refuses it, and its row
+        is withdrawn too."""
         import json
 
         from app.config import get_settings
 
-        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"SHOP": ["shop.example"]}))
+        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({recorded: ["shop.example"]}))
         get_settings.cache_clear()
-        sha = self._seed(db_session, store, 1, SHOP, "SHOP")
+        sha = self._seed(db_session, store, 1, SHOP, recorded)
         run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert self._status(db_session)[sha] == ("ok", None)
         report = revoke_store_applied(db_session, "shop")
@@ -1667,6 +1672,42 @@ class TestStoreRevocation:
         db_session.commit()
         report = reevaluate_masks(db_session, dry_run=False)
         assert sorted(report["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+
+    def test_a_reevaluation_limited_to_a_source_names_it_as_the_policy_does(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import MaskStoreRevocation
+        from app.workers.mask_job import reevaluate_masks
+
+        shas = self._settle_all(db_session, store)
+        db_session.add(MaskStoreRevocation(source="shop"))
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False, source=" Shop ")
+        assert sorted(report["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+
+    @pytest.mark.parametrize(
+        ("value", "revoked"), [('["shop"]', ["shop"]), ('["shop", "other"]', ["shop", "other"])]
+    )
+    def test_the_runbooks_environment_form_is_a_json_list(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, revoked: list[str]
+    ) -> None:
+        from app.config import Settings
+
+        monkeypatch.setenv("MASK_STORE_REVOKED", value)
+        assert Settings().mask_store_revoked == revoked
+
+    @pytest.mark.parametrize("value", ["shop", "shop,other"])
+    def test_a_bare_or_comma_separated_revocation_stops_the_service_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Never read as an empty or a wrong deny list: the settings refuse to
+        load (README runbook)."""
+        from app.config import Settings
+        from pydantic_settings import SettingsError
+
+        monkeypatch.setenv("MASK_STORE_REVOKED", value)
+        with pytest.raises(SettingsError, match="mask_store_revoked"):
+            Settings()
 
     def test_a_revoked_store_gets_no_new_masks(
         self, db_session: Session, store: LocalObjectStore
@@ -1931,6 +1972,70 @@ class TestResume:
         db_session.refresh(batch)
         assert (batch.status, batch.pipeline_version) == ("running", MASK_PIPELINE_VERSION)
         assert len(_masks(db_session)) == 1
+
+    def _crash_a_shop_batch(
+        self, db: Session, store: LocalObjectStore, source: str | None = "shop"
+    ) -> tuple[MaskBatch, set[str]]:
+        """Three shop listings and two MFC items; a batch (limited to
+        ``source``) killed on its second image."""
+        shop = {
+            seed_clean_image(
+                db,
+                store,
+                _photo((31 + 10 * n, 30, 90), seed=n),
+                origins=[ImageOrigin(url=SHOP.format(n=n), source="shop")],
+                figure_id=f"shop:{n}",
+            ).sha256
+            for n in (1, 2, 3)
+        }
+        for n in (4, 5):
+            _seed(db, store, n)
+        with pytest.raises(_Crash):
+            run_mask_batch(db, store, backend=_CrashOnSecond(), dry_run=False, source=source)
+        db.rollback()
+        (batch,) = db.execute(select(MaskBatch)).scalars()
+        return batch, shop
+
+    @pytest.mark.usefixtures("stores_registered")
+    @pytest.mark.parametrize("again", [None, " Shop "], ids=["no-source", "same-source"])
+    def test_a_resumed_batch_keeps_its_source(
+        self, db_session: Session, store: LocalObjectStore, again: str | None
+    ) -> None:
+        """``--resume BATCH`` continues the batch it names, scope included:
+        a batch limited to one source stays limited to it."""
+        batch, shop = self._crash_a_shop_batch(db_session, store)
+        assert batch.source == "shop"
+        resumed = run_mask_batch(
+            db_session,
+            store,
+            backend=_Model(),
+            dry_run=False,
+            resume_batch_id=batch.id,
+            source=again,
+        )
+        assert len(resumed.items) == 2
+        assert {i.source_sha256 for i in resumed.items} <= shop
+        assert {r.source_sha256 for r in _masks(db_session)} == shop
+
+    @pytest.mark.usefixtures("stores_registered")
+    @pytest.mark.parametrize(
+        ("first", "again"), [("shop", "other"), (None, "shop")], ids=["another", "narrower"]
+    )
+    def test_a_batch_is_resumed_only_with_its_own_source(
+        self, db_session: Session, store: LocalObjectStore, first: str | None, again: str
+    ) -> None:
+        batch, _shop = self._crash_a_shop_batch(db_session, store, first)
+        with pytest.raises(ValueError, match="source"):
+            run_mask_batch(
+                db_session,
+                store,
+                backend=_Model(),
+                dry_run=False,
+                resume_batch_id=batch.id,
+                source=again,
+            )
+        db_session.refresh(batch)
+        assert (batch.status, len(_masks(db_session))) == ("running", 1)
 
     def test_a_dry_run_cannot_resume(self, db_session: Session, store: LocalObjectStore) -> None:
         with pytest.raises(ValueError, match="dry run"):

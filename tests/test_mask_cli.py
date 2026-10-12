@@ -191,6 +191,35 @@ class TestStoreRevocation:
         rows = {r.source_sha256: (r.status, r.reason) for r in _rows(sandbox, ImageMask)}
         assert rows[store_sha] == ("ok", None)
 
+    def test_restore_is_a_dry_run_unless_applied(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None, store_granted: None
+    ) -> None:
+        from app.models import ImageMask, MaskStoreRevocation
+
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        _run(capsys, "--sandbox", sandbox, "revoke-store", "example-store", "--apply")
+        withdrawn = [r.source_sha256 for r in _rows(sandbox, ImageMask) if r.status == "withdrawn"]
+        assert len(withdrawn) == 1
+        code, dry = _run(capsys, "--sandbox", sandbox, "restore-store", "example-store")
+        assert (code, dry["dry_run"], dry["reevaluate"]["restored"]) == (0, True, withdrawn)
+        assert [r.source for r in _rows(sandbox, MaskStoreRevocation)] == ["example-store"]
+        assert [
+            r.source_sha256 for r in _rows(sandbox, ImageMask) if r.status == "withdrawn"
+        ] == withdrawn
+
+    def test_a_batchs_report_names_its_source(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None, store_granted: None
+    ) -> None:
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _, applied = _run(
+            capsys, "--sandbox", sandbox, "run", "--apply", "--source", "Example-Store"
+        )
+        code, report = _run(
+            capsys, "--sandbox", sandbox, "report", "--batch", str(applied["batch_id"])
+        )
+        assert (code, report["source"]) == (0, "example-store")
+
     def test_a_batch_run_can_target_one_source(
         self, sandbox: str, capsys: pytest.CaptureFixture[str], store_granted: None
     ) -> None:
