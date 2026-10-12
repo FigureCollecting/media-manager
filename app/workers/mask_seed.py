@@ -171,15 +171,17 @@ def _link(db: Session, copies: set[str], images: set[int]) -> None:
     db.flush()
 
 
-def _copies_showing(db: Session, digest: str, sha256: str | None = None) -> list[PublicObject]:
+def _copies_showing(db: Session, digest: str, sha256: str) -> list[PublicObject]:
     """The registered clean copies of the picture with pixel digest
     ``digest``: minted from those pixels (``pixel_sha256``) or showing them
     (``own_pixel_sha256``) -- plus the clean copy whose bytes are
     ``sha256``, whatever a decoder makes of them. The copy minted from
     ``digest`` comes first."""
-    keys = [PublicObject.pixel_sha256 == digest, PublicObject.own_pixel_sha256 == digest]
-    if sha256 is not None:
-        keys.append(PublicObject.sha256 == sha256)
+    keys = (
+        PublicObject.pixel_sha256 == digest,
+        PublicObject.own_pixel_sha256 == digest,
+        PublicObject.sha256 == sha256,
+    )
     found = db.execute(
         select(PublicObject).where(PublicObject.kind == "sanitized", or_(*keys))
     ).scalars()
