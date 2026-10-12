@@ -247,3 +247,37 @@ class TestIngestLinksEveryCapture:
         image = _ingest(db_session, data, PICTURE.format(n=1))
         assert image.pixel_sha256 == pixel_digest(data)
         assert db_session.execute(select(PublicObjectImage)).first() is None
+
+
+class TestACaptureOfOurMaskIsBehindIt:
+    """Challenger i5 C: an original whose bytes ARE one of our masks (our
+    silhouette captured, after the mask was registered -- before, the
+    registration refuses those bytes) is linked behind the mask by those
+    bytes, whichever route captured it: while it is soft-deleted (a
+    takedown) the mask is not served."""
+
+    @pytest.mark.parametrize("route", ["seed", "ingest"])
+    def test_soft_deleting_a_capture_of_the_masks_bytes_takes_the_mask_offline(
+        self, db_session: Session, store: LocalObjectStore, origin: TestClient, route: str
+    ) -> None:
+        _seed(db_session, store, _opaque(), ITEM.format(n=1))
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        (mask,) = _ok_masks(db_session)
+        obj = db_session.get(PublicObject, mask)
+        assert obj is not None
+        data = store.get(obj.storage_key)
+        if route == "seed":
+            _seed(db_session, store, data, ITEM.format(n=2))
+            captured = db_session.execute(
+                select(ImageModel).where(ImageModel.sha256 == mask)
+            ).scalar_one()
+        else:
+            captured = _ingest(db_session, data, ITEM.format(n=2), figure_id="mfc:item")
+        assert captured.sha256 == mask
+        assert origin.get(f"/d/{mask}").status_code == 200
+        captured.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        assert origin.get(f"/d/{mask}").status_code == 404
+        captured.deleted_at = None
+        db_session.commit()
+        assert origin.get(f"/d/{mask}").status_code == 200

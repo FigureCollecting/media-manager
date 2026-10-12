@@ -725,6 +725,38 @@ class TestNotFound:
         sha = self._register_matted(db_session, store, clean_version.image_id, 2)
         assert client.get(f"/d/{sha}").status_code == status
 
+    def test_soft_deleting_a_capture_of_a_cut_outs_bytes_takes_it_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Challenger i5 C, for a cut-out: an original whose bytes ARE it is
+        linked behind it; while that original is soft-deleted it is a 404."""
+        clean = seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=ITEM.format(n=7), source="mfc")],
+            figure_id="mfc:7",
+        )
+        clean_version = db_session.get(ImageVersion, clean.image_version_id)
+        assert clean_version is not None
+        sha = self._register_matted(db_session, store, clean_version.image_id, 2)
+        obj = db_session.get(PublicObject, sha)
+        assert obj is not None
+        seed_clean_image(
+            db_session,
+            store,
+            store.get(obj.storage_key),
+            origins=[ImageOrigin(url=ITEM.format(n=8), source="mfc")],
+            figure_id="mfc:8",
+        )
+        captured = db_session.execute(
+            select(ImageModel).where(ImageModel.sha256 == sha)
+        ).scalar_one()
+        assert client.get(f"/d/{sha}").status_code == 200
+        captured.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{sha}"))
+
     def test_a_matted_cut_out_of_a_shared_picture_is_judged_over_every_capture(
         self, client: TestClient, db_session: Session, store: LocalObjectStore
     ) -> None:
