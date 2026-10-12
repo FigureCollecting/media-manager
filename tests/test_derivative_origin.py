@@ -36,7 +36,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 APP = "https://figurecollecting.com"
-CANARY = "https://fc-api-canary.mindsignals1.com"
+
+
+def test_only_the_app_origin_is_allowed_by_default() -> None:
+    """The canary origin is a Phase-2 deployment's to add (MEDIA_CORS_ORIGINS),
+    never a default."""
+    assert Settings(environment="test").media_cors_origins == [APP]
+
+
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/9.jpeg"
 
@@ -213,7 +220,7 @@ class TestServe:
 
 
 class TestCors:
-    @pytest.mark.parametrize("origin", [APP, CANARY])
+    @pytest.mark.parametrize("origin", [APP])
     def test_an_app_origin_is_allowed(
         self, client: TestClient, seeded: dict[str, str], origin: str
     ) -> None:
@@ -411,6 +418,17 @@ class TestNotFound:
     ) -> None:
         sha = seeded["mask"]
         url = path.format(sha=sha, sha_upper=sha.upper(), sha63=sha[:63])
+        self._assert_404(client.get(url))
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/d%2F{sha}", "/d%2f{sha}", "/%64/{sha}", "/d/%{hex0}{rest}", "/healthz%2F", "/%68ealthz"],
+    )
+    def test_a_percent_encoded_alias_is_not_the_address(
+        self, client: TestClient, seeded: dict[str, str], path: str
+    ) -> None:
+        sha = seeded["mask"]
+        url = path.format(sha=sha, hex0=format(ord(sha[0]), "02x"), rest=sha[1:])
         self._assert_404(client.get(url))
 
     @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
