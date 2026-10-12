@@ -34,11 +34,16 @@ the answer is the same bytes whatever it asks. 404s and 500s are
 ``no-store`` -- a judgment that raises included: a mask registered tomorrow
 must not be shadowed by a cached miss today.
 
-CORS. ``Access-Control-Allow-Origin`` echoes an app origin
-(``Settings.media_cors_origins``, exact match) and ``Vary: Origin`` is always
-sent: the service worker must read the bytes to cache them and the case view
-composites the mask over its derivative, neither of which an opaque
-response allows. No credentials, ever.
+CORS. Every answer carries the constant ``Access-Control-Allow-Origin: *``,
+never credentials and never a ``Vary``: the service worker must read the
+bytes to cache them and the case view composites the mask over its
+derivative, neither of which an opaque response allows. The bytes are public
+and immutable, and the edge in front of this app (Cloudflare, by default)
+keys its cache on the URL alone and replays the stored headers to every
+later request, so an answer that varied with the request's ``Origin`` would
+hand the first requester's CORS headers to everyone for a year. A bodiless
+404 or 500 carries it too, so a cross-origin reader sees the real status
+rather than a CORS failure.
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ _DERIVATIVE_PATH = re.compile(rb"/d/[0-9a-f]{64}")
 IMMUTABLE = "public, max-age=31536000, immutable"
 
 _HARDENING = {
+    "Access-Control-Allow-Origin": "*",
     "X-Content-Type-Options": "nosniff",
     "Cross-Origin-Resource-Policy": "cross-origin",
     "Content-Security-Policy": "default-src 'none'; sandbox",
@@ -119,7 +125,6 @@ def healthz(db: Session = Depends(get_db)) -> Response:  # noqa: B008
 @app.api_route("/d/{sha256}", methods=["GET", "HEAD"])
 def derivative(
     sha256: str,
-    request: Request,
     db: Session = Depends(get_db),  # noqa: B008
     store: ObjectStore = Depends(get_object_store),  # noqa: B008
     settings: Settings = Depends(get_settings),  # noqa: B008
@@ -146,13 +151,5 @@ def derivative(
         logger.error("derivative_integrity_mismatch", extra={"sha256": sha256})
         return _bare(500)
 
-    headers = {
-        "Cache-Control": IMMUTABLE,
-        "ETag": f'"{sha256}"',
-        "Vary": "Origin",
-        **_HARDENING,
-    }
-    origin = request.headers.get("origin")
-    if origin is not None and origin in settings.media_cors_origins:
-        headers["Access-Control-Allow-Origin"] = origin
+    headers = {"Cache-Control": IMMUTABLE, "ETag": f'"{sha256}"', **_HARDENING}
     return Response(content=data, media_type=obj.mime, headers=headers)
