@@ -16,6 +16,7 @@ import hashlib
 import io
 from collections.abc import Sequence
 
+import numpy as np
 from PIL import Image, ImageOps
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -34,7 +35,10 @@ def _picture(original: bytes) -> Image.Image:
     some pixel IS transparent, else RGB -- as a fresh image (no EXIF, XMP,
     ICC or text chunks): exactly what its clean copy encodes. An alpha
     channel whose every pixel is opaque, or a colour key no pixel has, is no
-    transparency: such a file shows the same picture as its RGB twin."""
+    transparency: such a file shows the same picture as its RGB twin. The
+    colour under a FULLY transparent pixel shows nothing (lossless WebP and
+    PNG optimisers rewrite it) and is zeroed: two files differing only
+    there show one picture, and the clean copy carries no hidden pixels."""
     with Image.open(io.BytesIO(original)) as src:
         src.load()
         oriented = ImageOps.exif_transpose(src) or src
@@ -42,7 +46,10 @@ def _picture(original: bytes) -> Image.Image:
         pixels = oriented.convert("RGBA" if may_have_alpha else "RGB")
         if pixels.mode == "RGBA" and pixels.getchannel("A").getextrema()[0] == 255:
             pixels = pixels.convert("RGB")
-        return Image.frombytes(pixels.mode, pixels.size, pixels.tobytes())
+        arr = np.array(pixels)
+        if pixels.mode == "RGBA":
+            arr[arr[..., 3] == 0] = 0
+        return Image.fromarray(arr)
 
 
 def _digest(picture: Image.Image) -> str:
@@ -53,7 +60,8 @@ def _digest(picture: Image.Image) -> str:
 
 def pixel_digest(original: bytes) -> str:
     """The PIXEL DIGEST of ``original``: the sha-256 of the mode, the size and
-    the decoded bytes after EXIF orientation. Two captures with the same
+    the decoded bytes after EXIF orientation (``_picture``: the colour under
+    a fully transparent pixel zeroed). Two captures with the same
     pixels share it whatever their bytes (metadata, a lossless re-save, our
     own lossless PNG copy captured again). Our JPEG copy decodes to other
     pixels than its original, so it has a digest of its own, recorded on the
@@ -65,21 +73,26 @@ def pixel_digest(original: bytes) -> str:
 def _encode(picture: Image.Image, original: bytes) -> tuple[bytes, str]:
     # The clean copy must never be byte-identical to its original (the
     # original's address must never become public): if the first encoding
-    # happens to reproduce the original exactly -- an original that was
-    # itself written by the same encoder -- the next setting is used.
+    # reproduces the original exactly -- an original that was itself written
+    # by the same encoder -- the other setting is used, which never writes
+    # the same bytes: for a PNG another zlib level class, whose header
+    # differs (levels 8 and 9 often write the same bytes), for a JPEG other
+    # quantisation tables.
     has_alpha = picture.mode == "RGBA"
-    mime = "image/png" if has_alpha else "image/jpeg"
-    data = b""
-    for setting in (9, 8) if has_alpha else (95, 94):
+
+    def save(setting: int) -> bytes:
         out = io.BytesIO()
         if has_alpha:
             picture.save(out, format="PNG", compress_level=setting)
         else:
             picture.save(out, format="JPEG", quality=setting, subsampling=0)
-        data = out.getvalue()
-        if data != original:
-            break
-    return data, mime
+        return out.getvalue()
+
+    first, other = (9, 1) if has_alpha else (95, 94)
+    data = save(first)
+    if data == original:
+        data = save(other)
+    return data, "image/png" if has_alpha else "image/jpeg"
 
 
 def make_clean_copy(original: bytes) -> tuple[bytes, str, int, int]:

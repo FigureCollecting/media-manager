@@ -189,14 +189,35 @@ class TestSeed:
         again, _m, _w, _h = make_clean_copy(first)
         assert again != first
 
-    def test_an_original_no_encoding_can_change_is_refused_loudly(
-        self, db_session: Session, store: LocalObjectStore
-    ) -> None:
-        """A tiny flat PNG compresses identically at every level: its clean
-        copy would BE the original, whose address must never be public."""
+    def test_a_jpeg_our_encoder_reproduces_gets_a_copy_of_other_bytes(self) -> None:
+        """A flat JPEG written at quality 95 re-encodes to its very bytes: the
+        copy falls back to quality 94's quantisation tables."""
+        buf = io.BytesIO()
+        flat = Image.new("RGB", (16, 16), (120, 30, 200))
+        flat.save(buf, format="JPEG", quality=95, subsampling=0)
+        data, mime, _w, _h = make_clean_copy(buf.getvalue())
+        assert mime == "image/jpeg"
+        assert data != buf.getvalue()
+
+    def test_even_a_tiny_flat_pngs_copy_of_its_copy_differs(self) -> None:
+        """zlib levels 8 and 9 write a tiny flat PNG identically; the
+        fallback, level 1, differs in the zlib header itself."""
         first, _m, _w, _h = make_clean_copy(_flat_png())
+        again, _m, _w, _h = make_clean_copy(first)
+        assert again != first
+
+    def test_an_original_its_encoder_reproduces_is_refused_loudly(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Were the clean copy ever to BE the original, whose address must
+        never be public, the seed refuses rather than publish it."""
+        from app.workers import mask_seed
+
+        monkeypatch.setattr(
+            mask_seed, "_encode", lambda _picture, original: (original, "image/png")
+        )
         with pytest.raises(ValueError, match="original"):
-            seed_clean_image(db_session, store, first, origins=[], figure_id="x")
+            seed_clean_image(db_session, store, _flat_png(), origins=[], figure_id="x")
 
     def test_clean_copy_of_a_palette_png_with_transparency_keeps_it(self) -> None:
         img = Image.new("P", (4, 4), 0)
@@ -1069,6 +1090,15 @@ class TestTheColourUnderATransparentPixelIsNotThePicture:
         assert clear.any()
         assert not rgba[clear][:, :3].any()
         assert np.array_equal(_shown(data), _shown(_rgba_png(_transparent((255, 0, 255)))))
+
+    def test_a_partly_transparent_pixel_keeps_its_colour(self) -> None:
+        """Only a FULLY transparent pixel shows nothing: under alpha 1 the
+        colour still shows, in the picture and in the public copy."""
+        arr = _transparent((255, 255, 255))
+        arr[0, 0] = (200, 100, 50, 1)
+        data, _mime, _w, _h = make_clean_copy(_rgba_png(arr))
+        with Image.open(io.BytesIO(data)) as im:
+            assert im.convert("RGBA").getpixel((0, 0)) == (200, 100, 50, 1)
 
     def test_a_transparent_grey_alpha_png_keeps_its_alpha_and_shares_its_rgba_twins_digest(
         self,
