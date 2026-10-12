@@ -140,6 +140,40 @@ def _hardening(resp: object) -> None:
     assert headers["content-security-policy"] == "default-src 'none'; sandbox"
 
 
+def _asgi_get(path: str, *, raw_path: bytes | None = None, query: bytes = b"") -> int:
+    """The origin's status for a GET whose ASGI scope is built by hand -- the
+    shape a real server sends, which the TestClient does not reproduce."""
+    import anyio
+
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    scope: dict[str, object] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "query_string": query,
+        "headers": [],
+        "client": ("testclient", 1),
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+    if raw_path is not None:
+        scope["raw_path"] = raw_path
+    anyio.run(origin_app, scope, receive, send)
+    status = sent[0]["status"]
+    assert isinstance(status, int)
+    return status
+
+
 class TestRoutes:
     def test_the_app_mounts_only_healthz_and_the_derivative_path(self) -> None:
         paths = {getattr(r, "path", None) for r in origin_app.routes}
@@ -437,31 +471,21 @@ class TestNotFound:
     ) -> None:
         """ASGI makes ``raw_path`` optional; a server that omits it is judged
         on the decoded path, by the same grammar."""
-        import anyio
+        assert _asgi_get(path.format(sha=seeded["mask"])) == status
 
-        sent: list[dict[str, object]] = []
-
-        async def receive() -> dict[str, object]:
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message: dict[str, object]) -> None:
-            sent.append(message)
-
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": path.format(sha=seeded["mask"]),
-            "query_string": b"",
-            "headers": [],
-            "client": ("testclient", 1),
-            "server": ("testserver", 80),
-            "root_path": "",
-        }
-        anyio.run(origin_app, scope, receive, send)
-        assert sent[0]["status"] == status
+    @pytest.mark.parametrize(
+        ("query", "status"), [(b"", 200), (b"raw=1", 404), (b"raw", 404), (b"=", 404)]
+    )
+    def test_a_query_is_refused_where_the_server_keeps_it_out_of_raw_path(
+        self, client: TestClient, seeded: dict[str, str], query: bytes, status: int
+    ) -> None:
+        """uvicorn keeps the query out of ``raw_path`` (it splits the target
+        at ``?``), so in production the grammar never sees it and only the
+        no-query guard stops ``/d/<sha>?raw=1`` from aliasing the address.
+        The TestClient leaves the query IN ``raw_path``, where the grammar
+        alone refuses it -- so the guard is shown here, on the server's shape."""
+        path = f"/d/{seeded['mask']}"
+        assert _asgi_get(path, raw_path=path.encode(), query=query) == status
 
     @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     def test_any_other_method(
