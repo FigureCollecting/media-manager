@@ -778,7 +778,8 @@ class TestNotFound:
         assert _asgi_get(path.format(sha=seeded["mask"])) == status
 
     @pytest.mark.parametrize(
-        ("query", "status"), [(b"", 200), (b"raw=1", 404), (b"raw", 404), (b"=", 404)]
+        ("query", "status"),
+        [(b"", 200), (b"raw=1", 404), (b"raw", 404), (b"=", 404), (b"&", 404)],
     )
     def test_a_query_is_refused_where_the_server_keeps_it_out_of_raw_path(
         self, client: TestClient, seeded: dict[str, str], query: bytes, status: int
@@ -834,6 +835,38 @@ class TestIntegrity:
         assert resp.status_code == 500
         assert resp.headers["cache-control"] == "no-store"
         assert b"corrupted" not in resp.content
+
+    def test_a_judgment_that_raises_is_a_500_that_is_never_cached(
+        self, client: TestClient, seeded: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app import derivative_main
+
+        def _raises(*args: object, **kwargs: object) -> bool:
+            raise RuntimeError("postgresql://user:pw@db/mm unreachable")
+
+        monkeypatch.setattr(derivative_main, "servable", _raises)
+        resp = client.get(f"/d/{seeded['mask']}")
+        assert resp.status_code == 500
+        assert resp.headers["cache-control"] == "no-store"
+        _hardening(resp)
+        assert b"postgresql" not in resp.content
+
+    def test_a_malformed_origin_is_a_404_not_a_500(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        image = _source_image(db_session, seeded["clean"])
+        db_session.add(
+            FigureGallery(
+                figure_id="shop:bad",
+                source_url="http://[evil]/x.jpg",
+                image_id=image.id,
+                source="shop",
+            )
+        )
+        db_session.commit()
+        resp = client.get(f"/d/{seeded['mask']}")
+        assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"
 
     def test_a_store_failure_is_a_500_that_is_never_cached(
         self, client: TestClient, seeded: dict[str, str]

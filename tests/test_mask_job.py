@@ -390,6 +390,59 @@ class TestApply:
         (row,) = _masks(db_session)
         assert (row.status, row.reason) == ("ok", None)
 
+    def test_a_malformed_origin_row_never_wedges_the_batch(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Challenger i3 D5: a gallery row whose URL the parser rejects is an
+        unknown origin for its image, and every other image still settles."""
+        from app.models import ImageVersion
+
+        objs = sorted((_seed(db_session, store, n) for n in range(1, 5)), key=lambda o: o.sha256)
+        version = db_session.get(ImageVersion, objs[1].image_version_id)
+        assert version is not None
+        db_session.add(
+            FigureGallery(
+                figure_id="shop:bad",
+                source_url="http://[::1/x.jpg",
+                image_id=version.image_id,
+                source="shop",
+            )
+        )
+        db_session.commit()
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [
+            ("ok", None),
+            ("ineligible", "unknown_origin"),
+            ("ok", None),
+            ("ok", None),
+        ]
+        batches = list(db_session.execute(select(MaskBatch)).scalars())
+        assert [b.status for b in batches] == ["done"]
+
+    def test_a_judgment_that_raises_is_a_failure_and_the_batch_goes_on(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        objs = sorted((_seed(db_session, store, n) for n in range(1, 4)), key=lambda o: o.sha256)
+        real = mask_job.judged_origins
+
+        def judged(db: Session, sha256: str) -> object:
+            if sha256 == objs[1].sha256:
+                raise RuntimeError("s3://bucket/key exploded")
+            return real(db, sha256)
+
+        monkeypatch.setattr(mask_job, "judged_origins", judged)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [
+            ("ok", None),
+            ("failed", "RuntimeError"),
+            ("ok", None),
+        ]
+        assert [(r.status, r.reason) for r in _masks(db_session)] == [
+            ("ok", None),
+            ("failed", "RuntimeError"),
+            ("ok", None),
+        ]
+
     def test_a_store_granted_later_is_masked_on_an_ineligible_recheck(
         self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -592,21 +645,30 @@ class TestPixelIdenticalCaptures:
         report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
 
-    def test_a_capture_soft_deleted_after_selection_gets_no_mask(
+    def test_a_capture_soft_deleted_after_selection_gets_no_mask_and_no_row(
         self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The batch re-judges what it selected: a capture soft-deleted between
-        the candidate query and the judgment fails closed (no origin)."""
+        the candidate query and the judgment is SKIPPED as ``deleted`` and
+        nothing is recorded -- as when it is deleted before selection -- so
+        a restore makes it a candidate again for a plain batch."""
         import datetime as dt
 
         clean, images = _seed_captures(db_session, store, [ITEM.format(n=1), ITEM.format(n=2)])
         pages = iter([[clean], []])
-        monkeypatch.setattr(mask_job, "_candidates", lambda *a, **kw: next(pages))
-        images[1].deleted_at = dt.datetime.now(dt.UTC)
-        db_session.commit()
-        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
-        assert [(i.status, i.reason) for i in report.items] == [("ineligible", "no_origin")]
+        with monkeypatch.context() as m:
+            m.setattr(mask_job, "_candidates", lambda *a, **kw: next(pages))
+            images[1].deleted_at = dt.datetime.now(dt.UTC)
+            db_session.commit()
+            report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [("skipped", "deleted")]
+        assert report.counts["skipped"] == 1
+        assert _masks(db_session) == []
         assert _public(db_session, "mask") == []
+        images[1].deleted_at = None
+        db_session.commit()
+        again = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [i.status for i in again.items] == ["ok"]
 
     @pytest.mark.parametrize("second", ["no-gallery-row", "url-none", "row-soft-deleted"])
     def test_a_capture_with_no_live_origin_makes_the_pool_ineligible(
@@ -1083,6 +1145,60 @@ class TestReevaluate:
         assert (report["withdrawn"], report["unchanged"]) == ([first.source_sha256], 1)
         db_session.refresh(first)
         assert (first.status, first.reason) == ("withdrawn", "deleted")
+
+    @pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "apply"])
+    def test_a_judgment_that_raises_withdraws_that_row_and_the_rest_are_judged(
+        self,
+        db_session: Session,
+        store: LocalObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+        dry_run: bool,
+    ) -> None:
+        """Fail closed, one row at a time: a row whose judgment raises is
+        withdrawn (reason: the exception's class), and the batch goes on."""
+        from app.workers.mask_job import reevaluate_masks
+
+        first, second = self._settle_two(db_session, store)
+        real = mask_job.mask_refusal
+
+        def refusal(db: Session, sha256: str, *args: object, **kwargs: object) -> object:
+            if sha256 == first.source_sha256:
+                raise RuntimeError("boom")
+            return real(db, sha256, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(mask_job, "mask_refusal", refusal)
+        report = reevaluate_masks(db_session, dry_run=dry_run)
+        assert (report["withdrawn"], report["unchanged"]) == ([first.source_sha256], 1)
+        db_session.refresh(first)
+        db_session.refresh(second)
+        expected = ("ok", None) if dry_run else ("withdrawn", "RuntimeError")
+        assert (first.status, first.reason) == expected
+        assert (second.status, second.reason) == ("ok", None)
+
+    def test_a_malformed_origin_withdraws_only_its_mask(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import ImageVersion
+        from app.workers.mask_job import reevaluate_masks
+
+        first, second = self._settle_two(db_session, store)
+        clean = db_session.get(PublicObject, first.source_sha256)
+        assert clean is not None
+        version = db_session.get(ImageVersion, clean.image_version_id)
+        assert version is not None
+        db_session.add(
+            FigureGallery(
+                figure_id="shop:bad",
+                source_url="http://[evil]/x.jpg",
+                image_id=version.image_id,
+                source="shop",
+            )
+        )
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False)
+        assert (report["withdrawn"], report["unchanged"]) == ([first.source_sha256], 1)
+        db_session.refresh(first)
+        assert (first.status, first.reason) == ("withdrawn", "unknown_origin")
 
     def test_held_and_ineligible_rows_are_left_alone(
         self, db_session: Session, store: LocalObjectStore
