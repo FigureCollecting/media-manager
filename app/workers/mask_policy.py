@@ -27,8 +27,9 @@ policy reads.
 FAIL CLOSED. No mask for: an ungranted source or host (``not_granted``); an
 MFC URL that matches neither rule, an MFC host recorded under another source
 or an ``mfc`` row on another host, a URL carrying credentials or a
-backslash (which host served it is ambiguous), a URL that is not http(s)
-(``unknown_origin``); bytes with no origin (``no_origin``); and bytes seen
+backslash, a host that is not a plain name (whitespace, a percent escape:
+which host served it is ambiguous), a URL that is not http(s), schemeless
+included (``unknown_origin``); bytes with no origin (``no_origin``); and bytes seen
 under several origins when ANY of them is ineligible (the same picture
 captured as an item image and as a collector's photo is a collector's photo
 somewhere). Hosts are compared lower-cased without trailing dots.
@@ -37,6 +38,7 @@ somewhere). Hosts are compared lower-cased without trailing dots.
 from __future__ import annotations
 
 import posixpath
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -56,6 +58,11 @@ MFC_SOURCE = "mfc"
 _MFC_DOMAIN = "myfigurecollection.net"
 _MFC_ITEM_PREFIX = "/upload/items/"
 _MFC_PICTURE_PREFIX = "/upload/pictures/"
+
+#: A host as a fetcher resolves it: a DNS name, an IPv4 or an IPv6 literal
+#: (urlsplit lower-cases it and drops the brackets). Anything else -- a
+#: space, a percent escape, a non-ASCII letter -- is ambiguous.
+_PLAIN_HOST = re.compile(r"[a-z0-9._:-]+")
 
 
 @dataclass(frozen=True)
@@ -110,8 +117,8 @@ def classify_origin(origin: ImageOrigin, store_grants: StoreGrants | None = None
     parts = urlsplit(origin.url)
     if parts.scheme not in ("http", "https") or "@" in parts.netloc or "\\" in origin.url:
         return "unknown_origin"
-    host = _domain(parts.hostname or "")
-    if not host:
+    host = (parts.hostname or "").rstrip(".")
+    if not _PLAIN_HOST.fullmatch(host):
         return "unknown_origin"
     if _within(host, _MFC_DOMAIN) or origin.source == MFC_SOURCE:
         if not (_within(host, _MFC_DOMAIN) and origin.source == MFC_SOURCE):
