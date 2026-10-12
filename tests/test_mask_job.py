@@ -592,6 +592,22 @@ class TestPixelIdenticalCaptures:
         report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
 
+    def test_a_capture_soft_deleted_after_selection_gets_no_mask(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The batch re-judges what it selected: a capture soft-deleted between
+        the candidate query and the judgment fails closed (no origin)."""
+        import datetime as dt
+
+        clean, images = _seed_captures(db_session, store, [ITEM.format(n=1), ITEM.format(n=2)])
+        pages = iter([[clean], []])
+        monkeypatch.setattr(mask_job, "_candidates", lambda *a, **kw: next(pages))
+        images[1].deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [("ineligible", "no_origin")]
+        assert _public(db_session, "mask") == []
+
     def test_a_collector_photo_with_the_same_pixels_seeded_later_withdraws_the_mask(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
