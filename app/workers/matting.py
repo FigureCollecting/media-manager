@@ -120,7 +120,8 @@ class StubMattingBackend(MattingBackend):
 class BiRefNetMattingBackend(MattingBackend):
     """Real subject-segmentation backend: BiRefNet, run via
     onnxruntime-gpu against ONNX weights baked into the worker Docker
-    image (see Dockerfile.worker) at deploy time.
+    image (see Dockerfile.worker) at deploy time: rembg's fp32
+    BiRefNet-general export, the weights the mask lane was measured on.
 
     Model spec (see onnx-community/BiRefNet-ONNX preprocessor_config.json
     on Hugging Face, MIT licensed export of ZhengPeng7/BiRefNet):

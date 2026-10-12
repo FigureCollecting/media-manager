@@ -65,29 +65,40 @@ RUN pip install --no-cache-dir poetry==1.8.3 && \
 # cuDNN 9.x pair documented above.
 RUN pip install --no-cache-dir onnxruntime-gpu==1.27.0
 
-# --- BiRefNet ONNX weights --------------------------------------------
-# onnx-community/BiRefNet-ONNX on Hugging Face (MIT licensed ONNX export
-# of ZhengPeng7/BiRefNet, itself MIT licensed -- "Bilateral Reference for
-# High-Resolution Dichotomous Image Segmentation", CAAI AIR'24). The fp16
-# export (~490MB) is baked in rather than the full fp32 model.onnx
-# (~973MB) to roughly halve image size and GPU memory footprint; swap the
-# URL below to .../onnx/model.onnx if fp16 precision loss is ever
-# unacceptable for a given deployment.
+# --- Matting weights: exactly the bytes the mask lane was measured on -----
+# MASK-1's live acceptance (2026-10-11: the seven July figures, IoU 0.91-0.99
+# against the July cut-outs) ran on rembg's release assets (danielgatis/rembg,
+# MIT; release v0.0.0): BiRefNet-general (the fp32 export of ZhengPeng7/
+# BiRefNet, MIT) and the two IS-Net (DIS) exports the ported July base-keep
+# pass uses as base donors (app.workers.basekept). Each is pinned by sha-256
+# below (and matches rembg's own md5 pin), so the image can only carry the
+# weights that were measured. The earlier fp16 export of a DIFFERENT BiRefNet
+# conversion (onnx-community/BiRefNet-ONNX, ~490MB) was never measured against
+# the July references, so it is not baked; it would roughly halve this layer
+# (the fp32 file is ~973MB) only after its own measurement.
 #
-# NOTE: MATTING_MODEL_PATH is set here so the weights are always present
-# and ready in this image, but MATTING_BACKEND is deliberately left unset
-# -- activating "birefnet" (vs. the CPU-only "stub" default) is a runtime
-# deploy-environment decision (e.g. a k3s/Coolify env var on a GPU node),
-# not baked into the image itself. Setting MATTING_BACKEND=birefnet here
-# would make this same image fail matte requests when run without a GPU
-# attached (e.g. local docker-compose dev, where the worker service builds
-# this Dockerfile with no --gpus device) since BiRefNetMattingBackend
-# refuses to run without CUDAExecutionProvider rather than silently
-# degrading to CPU.
-ENV MATTING_MODEL_PATH=/models/birefnet/model_fp16.onnx
-RUN mkdir -p "$(dirname "${MATTING_MODEL_PATH}")" && \
-    curl -fL "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model_fp16.onnx" \
-      -o "${MATTING_MODEL_PATH}"
+# NOTE: the weight paths are set here so the weights are always present, but
+# MATTING_BACKEND is deliberately left unset -- activating "birefnet" or
+# "birefnet_basekept" (vs. the CPU-only "stub" default) is a runtime
+# deploy-environment decision (e.g. a k3s env var on a GPU node), not baked
+# into the image itself: both refuse to run without CUDAExecutionProvider
+# rather than silently degrading to CPU, so a GPU-less run of this image
+# (local docker-compose dev) would fail every matte request. The stub is dry
+# run only for masks (app.workers.mask_job refuses to apply with it).
+ENV MATTING_MODEL_PATH=/models/birefnet/BiRefNet-general-epoch_244.onnx \
+    MATTING_ISNET_GENERAL_PATH=/models/isnet/isnet-general-use.onnx \
+    MATTING_ISNET_ANIME_PATH=/models/isnet/isnet-anime.onnx
+RUN set -eu; \
+    mkdir -p /models/birefnet /models/isnet; \
+    rembg="https://github.com/danielgatis/rembg/releases/download/v0.0.0"; \
+    curl -fL "${rembg}/BiRefNet-general-epoch_244.onnx" -o "${MATTING_MODEL_PATH}"; \
+    curl -fL "${rembg}/isnet-general-use.onnx" -o "${MATTING_ISNET_GENERAL_PATH}"; \
+    curl -fL "${rembg}/isnet-anime.onnx" -o "${MATTING_ISNET_ANIME_PATH}"; \
+    printf '%s  %s\n' \
+      58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c "${MATTING_MODEL_PATH}" \
+      60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a "${MATTING_ISNET_GENERAL_PATH}" \
+      f15622d853e8260172812b657053460e20806f04b9e05147d49af7bed31a6e99 "${MATTING_ISNET_ANIME_PATH}" \
+      | sha256sum -c -
 
 COPY app /app/app
 
