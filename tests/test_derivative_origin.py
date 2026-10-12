@@ -4,8 +4,9 @@ fc-infra nodes/fc-app-01/edge/README.md "The public image address (ADDR-1)"
 is the contract: MEDIA_PUBLIC_BASE_URL = https://images.figurecollecting.com/d;
 the body is exactly the bytes whose SHA-256 is the path, with the stored
 Content-Type; Cache-Control public, max-age=31536000, immutable; the request's
-Cache-Control/Pragma are ignored; CORS allow-origin for the app origins with
-Vary: Origin; nosniff, CORP cross-origin, CSP default-src 'none'; sandbox.
+Cache-Control/Pragma are ignored; a constant Access-Control-Allow-Origin: *,
+no credentials and no Vary (the edge caches by URL alone and replays the stored
+headers); nosniff, CORP cross-origin, CSP default-src 'none'; sandbox.
 It is its own ASGI app (image track I11): app.main's routes are never mounted.
 """
 
@@ -36,12 +37,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 APP = "https://figurecollecting.com"
+CANARY = "https://fc-api-canary.mindsignals1.com"
 
 
-def test_only_the_app_origin_is_allowed_by_default() -> None:
-    """The canary origin is a Phase-2 deployment's to add (MEDIA_CORS_ORIGINS),
-    never a default."""
-    assert Settings(environment="test").media_cors_origins == [APP]
+def test_no_origin_allow_list_is_configured() -> None:
+    """The answer never depends on the request's Origin, so there is no list
+    of app origins to keep in step with the deployments."""
+    assert "media_cors_origins" not in Settings.model_fields
 
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
@@ -248,7 +250,8 @@ class TestServe:
         assert resp.headers["content-type"] == mime
         assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
         assert resp.headers["etag"] == f'"{sha}"'
-        assert resp.headers["vary"] == "Origin"
+        assert resp.headers["access-control-allow-origin"] == "*"
+        assert "vary" not in resp.headers
         _hardening(resp)
 
     def test_the_clean_copy_of_a_transparent_png_is_served_as_png(
@@ -272,7 +275,8 @@ class TestServe:
         assert resp.status_code == 200
         assert resp.content == b""
         assert resp.headers["content-length"] == str(obj.bytes)
-        assert resp.headers["access-control-allow-origin"] == APP
+        assert resp.headers["access-control-allow-origin"] == "*"
+        assert "vary" not in resp.headers
         assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
 
     def test_the_requests_cache_control_and_pragma_change_nothing(
@@ -292,42 +296,66 @@ class TestServe:
 
 
 class TestCors:
-    @pytest.mark.parametrize("origin", [APP])
-    def test_an_app_origin_is_allowed(
-        self, client: TestClient, seeded: dict[str, str], origin: str
-    ) -> None:
-        resp = client.get(f"/d/{seeded['mask']}", headers={"Origin": origin})
-        assert resp.headers["access-control-allow-origin"] == origin
-        assert resp.headers["vary"] == "Origin"
-        assert "access-control-allow-credentials" not in resp.headers
+    """The derivative bytes are public and immutable, and the edge in front of
+    the origin (Cloudflare, by default) keys its cache on the URL alone and
+    replays the stored headers to every later request: an answer that varied
+    with the Origin would hand the first requester's CORS headers to everyone.
+    So every answer carries the same constant ``*``, never credentials and
+    never a Vary."""
 
     @pytest.mark.parametrize(
-        "origin", ["https://evil.example", "https://figurecollecting.com.evil.example", "null"]
+        "origin",
+        [APP, CANARY, "https://evil.example", "https://figurecollecting.com.evil.example", "null"],
     )
-    def test_any_other_origin_gets_the_bytes_but_no_allow_origin(
+    def test_every_origin_gets_the_constant_allow_origin(
         self, client: TestClient, seeded: dict[str, str], origin: str
     ) -> None:
         resp = client.get(f"/d/{seeded['mask']}", headers={"Origin": origin})
         assert resp.status_code == 200
-        assert "access-control-allow-origin" not in resp.headers
-        assert resp.headers["vary"] == "Origin"
+        assert resp.headers["access-control-allow-origin"] == "*"
+        assert "access-control-allow-credentials" not in resp.headers
+        assert "vary" not in resp.headers
 
-    def test_no_origin_header_no_allow_origin(
-        self, client: TestClient, seeded: dict[str, str]
-    ) -> None:
+    def test_no_origin_header_gets_it_too(self, client: TestClient, seeded: dict[str, str]) -> None:
         resp = client.get(f"/d/{seeded['mask']}")
-        assert "access-control-allow-origin" not in resp.headers
+        assert resp.headers["access-control-allow-origin"] == "*"
+        assert "access-control-allow-credentials" not in resp.headers
 
-    def test_the_allowed_origins_come_from_settings(
-        self, client: TestClient, seeded: dict[str, str]
+    @pytest.mark.parametrize("which", ["clean", "mask"])
+    def test_the_answer_is_the_same_whatever_the_origin(
+        self, client: TestClient, seeded: dict[str, str], which: str
     ) -> None:
-        origin_app.dependency_overrides[get_settings] = lambda: Settings(
-            environment="test", media_cors_origins=["https://other.example"]
-        )
-        resp = client.get(f"/d/{seeded['mask']}", headers={"Origin": APP})
-        assert "access-control-allow-origin" not in resp.headers
-        resp = client.get(f"/d/{seeded['mask']}", headers={"Origin": "https://other.example"})
-        assert resp.headers["access-control-allow-origin"] == "https://other.example"
+        """What a URL-keyed edge stores from a first fetch without an Origin is
+        exactly what an app fetch with one would have been sent."""
+        path = f"/d/{seeded[which]}"
+        first = client.get(path)
+        for origin in (APP, CANARY):
+            later = client.get(path, headers={"Origin": origin})
+            assert later.content == first.content
+            assert dict(later.headers) == dict(first.headers)
+
+    @pytest.mark.parametrize("status", [404, 500])
+    def test_a_bodiless_answer_carries_it_too(self, client: TestClient, status: int) -> None:
+        """A cross-origin reader sees the real status, not a CORS failure."""
+        if status == 404:
+            resp = client.get(f"/d/{'0' * 64}", headers={"Origin": APP})
+        else:
+
+            class _Broken:
+                def get(self, *_a: object) -> None:
+                    raise ConnectionError("db down")
+
+            def _db() -> Generator[object, None, None]:
+                yield _Broken()
+
+            origin_app.dependency_overrides[get_db] = _db
+            resp = client.get(f"/d/{'0' * 64}", headers={"Origin": APP})
+        assert resp.status_code == status
+        assert resp.content == b""
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.headers["access-control-allow-origin"] == "*"
+        assert "access-control-allow-credentials" not in resp.headers
+        assert "vary" not in resp.headers
 
 
 class TestNotFound:
@@ -1034,7 +1062,8 @@ class TestNotFound:
     ) -> None:
         resp = client.request(method, f"/d/{seeded['mask']}", headers={"Origin": APP})
         self._assert_404(resp)
-        assert "access-control-allow-origin" not in resp.headers
+        assert resp.content == b""
+        assert resp.headers["access-control-allow-origin"] == "*"
 
     @pytest.mark.parametrize("method", ["POST", "HEAD", "OPTIONS"])
     def test_healthz_is_get_only(self, client: TestClient, method: str) -> None:
