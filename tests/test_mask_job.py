@@ -102,6 +102,11 @@ class _Crash(BaseException):
     """Stands in for the worker being killed mid-batch (not an item failure)."""
 
 
+class _CrashOnFirst(_Model):
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        raise _Crash
+
+
 class _CrashOnSecond(_Model):
     def __init__(self) -> None:
         self.calls = 0
@@ -1977,7 +1982,8 @@ class TestResume:
         self, db: Session, store: LocalObjectStore, source: str | None = "shop"
     ) -> tuple[MaskBatch, set[str]]:
         """Three shop listings and two MFC items; a batch (limited to
-        ``source``) killed on its second image."""
+        ``source``) killed on its first image, so its cursor holds nothing
+        back and every candidate is in reach of the resume."""
         shop = {
             seed_clean_image(
                 db,
@@ -1991,9 +1997,10 @@ class TestResume:
         for n in (4, 5):
             _seed(db, store, n)
         with pytest.raises(_Crash):
-            run_mask_batch(db, store, backend=_CrashOnSecond(), dry_run=False, source=source)
+            run_mask_batch(db, store, backend=_CrashOnFirst(), dry_run=False, source=source)
         db.rollback()
         (batch,) = db.execute(select(MaskBatch)).scalars()
+        assert batch.cursor_sha256 is None
         return batch, shop
 
     @pytest.mark.usefixtures("stores_registered")
@@ -2013,8 +2020,7 @@ class TestResume:
             resume_batch_id=batch.id,
             source=again,
         )
-        assert len(resumed.items) == 2
-        assert {i.source_sha256 for i in resumed.items} <= shop
+        assert {i.source_sha256 for i in resumed.items} == shop
         assert {r.source_sha256 for r in _masks(db_session)} == shop
 
     @pytest.mark.usefixtures("stores_registered")
@@ -2035,7 +2041,7 @@ class TestResume:
                 source=again,
             )
         db_session.refresh(batch)
-        assert (batch.status, len(_masks(db_session))) == ("running", 1)
+        assert (batch.status, _masks(db_session)) == ("running", [])
 
     def test_a_dry_run_cannot_resume(self, db_session: Session, store: LocalObjectStore) -> None:
         with pytest.raises(ValueError, match="dry run"):
