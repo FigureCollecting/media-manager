@@ -454,6 +454,19 @@ class TestApply:
             ("ok", None),
         ]
 
+    def test_a_dry_run_reports_a_judgment_that_raises_and_records_nothing(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed(db_session, store, 1)
+
+        def judged(db: Session, sha256: str) -> object:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mask_job, "judged_origins", judged)
+        report = run_mask_batch(db_session, store, backend=_Model())
+        assert [(i.status, i.reason) for i in report.items] == [("failed", "RuntimeError")]
+        assert _masks(db_session) == []
+
     def test_a_store_granted_later_is_masked_on_an_ineligible_recheck(
         self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
