@@ -117,6 +117,7 @@ class TestMfc:
             "not a url",
             "ftp://static.myfigurecollection.net/upload/items/0/9-9.jpg",
             "https:///upload/items/0/9-9.jpg",
+            "//static.myfigurecollection.net/upload/items/0/9-9.jpg",
         ],
     )
     def test_an_unreadable_or_non_http_url_is_unknown(self, url: str) -> None:
@@ -172,6 +173,37 @@ class TestStores:
         self, granted: None, url: str, source: str
     ) -> None:
         assert classify_origin(ImageOrigin(url=url, source=source)) == "unknown_origin"
+
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            ("https://evil.test img.shop.example/p/1.jpg", "shop"),
+            ("https://evil.test%20img.shop.example/p/1.jpg", "shop"),
+            ("https:// img.shop.example/p/1.jpg", "shop"),
+            ("https://evil.test static.myfigurecollection.net/upload/items/1/1-a.jpg", "mfc"),
+            ("https://evil.test%2f.static.myfigurecollection.net/upload/items/1/1-a.jpg", "mfc"),
+        ],
+    )
+    def test_a_host_that_is_not_a_plain_name_is_ambiguous(self, url: str, source: str) -> None:
+        """Whitespace or a percent escape in the host: which host served the
+        bytes is as ambiguous as with a backslash, so no mask."""
+        grants = {"shop": ["shop.example"]}
+        assert classify_origin(ImageOrigin(url=url, source=source), grants) == "unknown_origin"
+
+    def test_a_schemeless_url_is_unknown_even_on_a_granted_host(self) -> None:
+        o = ImageOrigin(url="//cdn.shop.example/p/1.jpg", source="shop")
+        assert classify_origin(o, store_grants={"shop": ["shop.example"]}) == "unknown_origin"
+
+    def test_a_grant_domain_is_read_without_surrounding_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MASK_STORE_GRANTS is hand-written JSON: whitespace around a domain
+        neither voids the grant nor, alone, grants anything."""
+        url = "https://cdn.shop.example/p/1.jpg"
+        _grant(monkeypatch, {"shop": ["  shop.example \n"]})
+        assert classify_origin(ImageOrigin(url=url, source="shop")) == "store_listing"
+        _grant(monkeypatch, {"shop": ["   "]})
+        assert classify_origin(ImageOrigin(url=url, source="shop")) == "not_granted"
 
     def test_grants_are_normalised(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _grant(monkeypatch, {"shop": ["Shop.Example.", ""]})
