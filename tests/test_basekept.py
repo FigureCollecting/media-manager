@@ -121,6 +121,30 @@ class TestBaseKeptAlpha:
         out, _ = base_kept_alpha(_figure_without_base(), {"isnet": i})
         assert out[100:110, 61:75].max() == 0
 
+    def test_floor_haze_attached_to_the_base_stays_out(self) -> None:
+        """The black-dress mechanism: the donor sees the base AND faint floor
+        haze spreading from it across the band. Only the base (and a few
+        pixels around it) may be added; the floor below stays clear."""
+        i = _figure_without_base().copy()
+        i[160:175, 45:55] = 230  # the base, touching the body
+        i[165:200, :] = np.maximum(i[165:200, :], 30)  # haze under COMP_T, attached
+        out, _ = base_kept_alpha(_figure_without_base(), {"isnet": i})
+        assert out[170, 50] > 200  # the base is restored
+        assert out[195, 50] == 0  # the floor 20 px below it is not
+        assert out[190:, :].max() == 0
+
+    def test_a_donor_blob_touching_only_birefnets_soft_edge_is_not_added(self) -> None:
+        """BiRefNet's soft edge (alpha 28, under FIGURE_T) reaches 12 px right
+        of the body; a donor blob starting 6 px from the body touches that
+        haze but not the figure itself, so it is not a base."""
+        b = _figure_without_base()
+        b[130:160, 60:72] = 28
+        i = _figure_without_base().copy()
+        i[135:158, 66:80] = 240
+        out, _ = base_kept_alpha(b, {"isnet": i})
+        assert out[150, 76] == 0
+        assert out[135:158, 75:80].max() == 0
+
     def test_output_is_uint8(self) -> None:
         out, _ = base_kept_alpha(_figure_without_base(), {"isnet": _donor_with_base()})
         assert out.dtype == np.uint8

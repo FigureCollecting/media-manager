@@ -559,6 +559,23 @@ class TestResume:
         with pytest.raises(ValueError, match="not resumable"):
             run_mask_batch(db_session, store, backend=_Model(), dry_run=False, resume_batch_id=999)
 
+    def test_a_batch_of_an_older_pipeline_version_is_not_resumed(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for n in range(3):
+            _seed(db_session, store, n)
+        with pytest.raises(_Crash):
+            run_mask_batch(db_session, store, backend=_CrashOnSecond(), dry_run=False)
+        (batch,) = db_session.execute(select(MaskBatch)).scalars()
+        monkeypatch.setattr(mask_job, "MASK_PIPELINE_VERSION", "mask-v2")
+        with pytest.raises(ValueError, match="not resumable"):
+            run_mask_batch(
+                db_session, store, backend=_Model(), dry_run=False, resume_batch_id=batch.id
+            )
+        db_session.refresh(batch)
+        assert (batch.status, batch.pipeline_version) == ("running", MASK_PIPELINE_VERSION)
+        assert len(_masks(db_session)) == 1
+
     def test_a_dry_run_cannot_resume(self, db_session: Session, store: LocalObjectStore) -> None:
         with pytest.raises(ValueError, match="dry run"):
             run_mask_batch(db_session, store, resume_batch_id=1)

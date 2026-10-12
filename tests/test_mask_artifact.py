@@ -531,6 +531,17 @@ class TestBuildMaskArtifact:
         assert out.own_alpha_grounding is not None
         assert out.own_alpha_grounding.top_margin_frac == pytest.approx(5 / 20)
 
+    def test_an_alpha_of_254_is_the_clean_copys_own_alpha(self) -> None:
+        rgba = np.full((20, 10, 4), 200, dtype=np.uint8)
+        rgba[..., 3] = 255
+        rgba[19, 9, 3] = 254  # one pixel translucent, by one step
+        clean = _encode(Image.fromarray(rgba, mode="RGBA"), "PNG")
+        out = build_mask_artifact(
+            clean, backend=_ConstantAlphaBackend(np.full((20, 10), 255, np.uint8))
+        )
+        assert out.own_alpha_grounding is not None
+        assert out.own_alpha_grounding.top_margin_frac == 0
+
     def test_an_empty_answer_stores_no_mask(self) -> None:
         out = build_mask_artifact(
             _studio_photo("PNG"), backend=_ConstantAlphaBackend(np.zeros((100, 80), np.uint8))
