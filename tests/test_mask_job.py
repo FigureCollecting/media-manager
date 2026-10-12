@@ -881,6 +881,92 @@ class TestPixelDigest:
             )
 
 
+def _visible() -> np.ndarray:
+    arr = np.full((60, 40, 3), (245, 245, 245), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30)
+    return arr
+
+
+def _encoded(kind: str) -> bytes:
+    """One visible picture saved four ways: ``rgb``; ``rgba-opaque`` (an alpha
+    channel, every pixel 255); ``rgb-unused-trns`` (a tRNS colour key no pixel
+    has); ``rgba-254`` (one pixel just short of opaque -- a transparency)."""
+    arr = _visible()
+    buf = io.BytesIO()
+    if kind == "rgb":
+        Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
+    elif kind == "rgb-unused-trns":
+        Image.fromarray(arr, mode="RGB").save(buf, format="PNG", transparency=(1, 2, 3))
+    else:
+        alpha = np.full(arr.shape[:2], 255, dtype=np.uint8)
+        if kind == "rgba-254":
+            alpha[0, 0] = 254
+        Image.fromarray(np.dstack([arr, alpha]), mode="RGBA").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+OPAQUE_KINDS = ["rgb", "rgba-opaque", "rgb-unused-trns"]
+
+
+class TestTransparencyIsMeasured:
+    """Challenger i4: a picture is RGBA only when some pixel IS transparent
+    (its alpha's minimum is below 255), never because its file has an alpha
+    channel or a colour key nobody uses. One visible picture saved as RGB,
+    as RGBA with every pixel opaque, or with an unused tRNS key is ONE
+    picture: one digest, one clean copy (a JPEG), one judgment."""
+
+    @pytest.mark.parametrize("kind", OPAQUE_KINDS)
+    def test_an_opaque_picture_is_rgb_whatever_its_file_says(self, kind: str) -> None:
+        from app.workers.mask_seed import _picture
+
+        assert _picture(_encoded(kind)).mode == "RGB"
+        assert pixel_digest(_encoded(kind)) == pixel_digest(_encoded("rgb"))
+        assert make_clean_copy(_encoded(kind))[1] == "image/jpeg"
+
+    def test_one_pixel_short_of_opaque_is_a_transparency(self) -> None:
+        from app.workers.mask_seed import _picture
+
+        assert _picture(_encoded("rgba-254")).mode == "RGBA"
+        assert pixel_digest(_encoded("rgba-254")) != pixel_digest(_encoded("rgb"))
+        assert make_clean_copy(_encoded("rgba-254"))[1] == "image/png"
+
+    def test_a_used_colour_key_is_a_transparency(self) -> None:
+        from app.workers.mask_seed import _picture
+
+        buf = io.BytesIO()
+        Image.fromarray(_visible(), mode="RGB").save(
+            buf, format="PNG", transparency=(245, 245, 245)
+        )
+        picture = _picture(buf.getvalue())
+        assert picture.mode == "RGBA"
+        assert picture.getchannel("A").getextrema() == (0, 255)
+
+    @pytest.mark.parametrize(
+        ("item", "photo"),
+        [(a, b) for a in OPAQUE_KINDS for b in OPAQUE_KINDS if a != b],
+    )
+    def test_a_collector_photo_saved_another_way_refuses_the_mask(
+        self, db_session: Session, store: LocalObjectStore, item: str, photo: str
+    ) -> None:
+        """Every ordered pair of encodings: whichever is seeded first, the two
+        captures share one clean copy and the mask is refused."""
+        copies = {
+            seed_clean_image(
+                db_session,
+                store,
+                _encoded(kind),
+                origins=[ImageOrigin(url=url, source="mfc")],
+                figure_id=f"mfc:{kind}",
+            ).sha256
+            for kind, url in ((item, ITEM.format(n=1)), (photo, PICTURE.format(n=1)))
+        }
+        assert len(copies) == 1
+        assert len(_public(db_session, "sanitized")) == 1
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [("ineligible", "user_photo")]
+        assert _public(db_session, "mask") == []
+
+
 class TestCapturesKeyedOnPixels:
     """Challenger i3 D2: two captures of one picture whose clean copies would
     NOT coincide -- one of them is the canonical clean encoding itself -- still
