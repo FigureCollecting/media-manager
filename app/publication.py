@@ -5,14 +5,17 @@ this module decides, on every request, whether it still is. A clean copy is
 judged over EVERY image behind it: the image its version belongs to and each
 pixel-identical capture linked to it (``public_object_images``):
 
-- a clean derivative (``sanitized``/``matted``) is served while its version
-  and every image behind it are not soft-deleted. A row with no version is
-  never served.
+- a clean copy (``sanitized``) is served while its version and every image
+  behind it are not soft-deleted. A row with no version is never served.
 - a mask is served while some ``ok`` image_masks row names it whose clean
   copy is live (as above) and still mask-eligible from the CURRENT origins
   of every image behind it (app.workers.mask_policy). A mask shared by
   several clean copies (different pictures, the same mask) stays while any
   of them qualifies.
+- a ``matted`` cut-out is our derivative work on the picture, like a mask,
+  so it is judged like a mask's clean copy: live AND mask-eligible. Nothing
+  registers one yet; the rule is here so that whatever does cannot skip the
+  per-source permission split.
 
 ALL, NOT ANY, for the images behind one clean copy: the address names the
 pixels, so a soft delete (a takedown) under any capture of a picture
@@ -101,4 +104,8 @@ def servable(db: Session, obj: PublicObject, store_grants: StoreGrants | None = 
             )
         ).scalars()
         return any(mask_refusal(db, s, store_grants) is None for s in sources)
-    return images_behind(db, obj.sha256) is not None
+    if obj.kind == "sanitized":
+        return images_behind(db, obj.sha256) is not None
+    # 'matted' -- and any kind not named above -- is derivative work: live
+    # and mask-eligible, like a mask's clean copy.
+    return mask_refusal(db, obj.sha256, store_grants) is None
