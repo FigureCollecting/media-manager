@@ -145,17 +145,30 @@ def test_full_chain_downgrade_and_upgrade_again(empty_database_url: str) -> None
     assert "already exists" not in combined
 
 
-def _schema_snapshot(engine) -> tuple[dict[str, object], dict[str, set[tuple[str, ...]]]]:
+#: The two raw-SQL GIN trigram indexes the migration chain adds on albums,
+#: deliberately not modeled as SQLAlchemy Index() objects.
+GIN_TRGM_INDEXES = {
+    ("idx_album_desc_trgm", ("description",)),
+    ("idx_album_title_trgm", ("title",)),
+}
+
+
+def _schema_snapshot(
+    engine,
+) -> tuple[dict[str, object], dict[str, set[tuple[str, tuple[str, ...]]]]]:
     """Reflect tables/columns/keys and, separately, indexes (excludes alembic's own table).
 
+    A foreign key is compared with its ON DELETE rule: a migration that
+    cascades differently from the model is drift too.
+
     Tables/columns/keys are returned as an exact-comparable snapshot. Indexes are
-    returned separately (per table, as a set of sorted column-name tuples) because
-    the migration chain adds two raw-SQL GIN trigram indexes on top of what
-    Base.metadata.create_all() alone would produce -- see the caller.
+    returned separately (per table, as a set of (name, sorted column names))
+    because the migration chain adds two raw-SQL GIN trigram indexes on top of
+    what Base.metadata.create_all() alone would produce -- see the caller.
     """
     insp = inspect(engine)
     tables: dict[str, object] = {}
-    indexes: dict[str, set[tuple[str, ...]]] = {}
+    indexes: dict[str, set[tuple[str, tuple[str, ...]]]] = {}
     for table_name in sorted(insp.get_table_names()):
         if table_name == "alembic_version":
             continue
@@ -165,15 +178,30 @@ def _schema_snapshot(engine) -> tuple[dict[str, object], dict[str, set[tuple[str
         }
         pk = sorted(insp.get_pk_constraint(table_name).get("constrained_columns") or [])
         fks = sorted(
-            (fk["constrained_columns"][0], fk["referred_table"], fk["referred_columns"][0])
+            (
+                fk["constrained_columns"][0],
+                fk["referred_table"],
+                fk["referred_columns"][0],
+                str(fk["options"].get("ondelete")),
+            )
             for fk in insp.get_foreign_keys(table_name)
         )
         uniques = sorted(
             tuple(sorted(uc["column_names"])) for uc in insp.get_unique_constraints(table_name)
         )
-        tables[table_name] = {"columns": columns, "pk": pk, "fks": fks, "uniques": uniques}
+        checks = sorted(
+            (cc["name"], cc["sqltext"]) for cc in insp.get_check_constraints(table_name)
+        )
+        tables[table_name] = {
+            "columns": columns,
+            "pk": pk,
+            "fks": fks,
+            "uniques": uniques,
+            "checks": checks,
+        }
         indexes[table_name] = {
-            tuple(sorted(ix["column_names"])) for ix in insp.get_indexes(table_name)
+            (str(ix["name"]), tuple(sorted(ix["column_names"])))
+            for ix in insp.get_indexes(table_name)
         }
     return tables, indexes
 
@@ -205,12 +233,12 @@ def test_migrated_schema_matches_live_models(empty_database_url: str, pg_admin_u
             live_tables, live_indexes = _schema_snapshot(live_engine)
             assert migrated_tables == live_tables
 
-            # The migration chain additionally creates two raw-SQL GIN trigram
-            # indexes on albums that are deliberately not modeled as SQLAlchemy
-            # Index() objects, so live (create_all-only) indexes must be a subset
-            # of the migrated ones, not an exact match.
-            for table_name, live_table_indexes in live_indexes.items():
-                assert live_table_indexes <= migrated_indexes[table_name], table_name
+            # Every index exactly, by name and columns -- one a migration
+            # creates that the model lacks is drift too -- except the two GIN
+            # trigram indexes on albums, which only the migration chain makes.
+            assert migrated_indexes["albums"] >= GIN_TRGM_INDEXES
+            migrated_indexes["albums"] -= GIN_TRGM_INDEXES
+            assert migrated_indexes == live_indexes
         finally:
             migrated_engine.dispose()
 
@@ -227,4 +255,38 @@ def test_migrated_schema_matches_live_models(empty_database_url: str, pg_admin_u
         admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
         with admin_engine.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{live_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_downgrading_the_mask_lane_restores_its_predecessors_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0004's downgrade undoes all of 0004, the column it adds to images included."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    down = _run_alembic(
+        "downgrade", "0003_add_matte_grounding_fields", database_url=empty_database_url
+    )
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0003_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0003_add_matte_grounding_fields", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
         admin_engine.dispose()

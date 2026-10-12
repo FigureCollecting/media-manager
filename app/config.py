@@ -44,6 +44,30 @@ class Settings(BaseSettings):
         "https://figurecollecting.com",
     ]
 
+    # The public derivative origin (app.derivative_main): the app origins
+    # that may read /d/<sha256> bytes cross-origin (the service worker caches
+    # them; the case view composites a mask over its derivative). fc-infra
+    # edge README "The public image address (ADDR-1)". Env MEDIA_CORS_ORIGINS
+    # as a JSON list; a canary origin is added by its deployment's env, never
+    # by default.
+    media_cors_origins: list[str] = ["https://figurecollecting.com"]
+
+    # MASK-1 store masks (app.workers.mask_policy). MASK-G, Ross 2026-10-12
+    # (option b): cut-out masks for EVERY store's listing photos, revocable
+    # per store. MASK_STORE_GRANTS registers the store sources: per source,
+    # the domains (subdomains included) its listing photos come from -- the
+    # spine's source.domains for that retailer. Every registered source is
+    # granted; there is no per-store opt-in. Env as a JSON object, e.g.
+    # {"amiami": ["amiami.com"]}. Empty here: no store's images reach
+    # media-manager yet (gallery ingest records source "mfc" only).
+    mask_store_grants: dict[str, list[str]] = {}
+    # The per-source deny list that wins over any grant (MFC included):
+    # MASK_STORE_REVOKED as a JSON list, e.g. '["shop"]' (a bare or
+    # comma-separated value fails to load), plus what `masks revoke-store`
+    # persists at run time (mask_store_revocations). README runbook "A store
+    # asks for its cut-outs to be removed".
+    mask_store_revoked: list[str] = []
+
     # Rate limiting
     rate_limit_per_minute: int = 120
 
@@ -59,6 +83,10 @@ class Settings(BaseSettings):
     # (see Dockerfile.worker). Only consulted when matting_backend is
     # "birefnet"; unset in dev/tests, where the stub backend is used.
     matting_model_path: str | None = None
+    # "birefnet_basekept" (the July base-keep pass, app.workers.basekept)
+    # also needs the two IS-Net base donors' ONNX weights.
+    matting_isnet_general_path: str | None = None
+    matting_isnet_anime_path: str | None = None
 
 
 @lru_cache(maxsize=1)

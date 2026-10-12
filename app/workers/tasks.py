@@ -15,11 +15,14 @@ from ..db import worker_session
 from ..hashing import compute_phash, detect_mime, get_image_dimensions, sha256_bytes
 from ..models import AlbumItem, FigureGallery, ImageVersion, UserImageLink
 from ..models import Image as ImageModel
+from ..object_store import S3ObjectStore
 from ..s3 import get_s3, move_object
 from ..url_guard import _validate_ingest_url
 from . import celery_app
 from .derivatives import compute_dominant_color, compute_thumbhash
 from .grounding import compute_bottom_margin_frac, compute_contact_band
+from .mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
+from .mask_seed import link_capture, pixel_digest
 from .watermark import apply_watermark, strip_exif
 
 if TYPE_CHECKING:
@@ -366,7 +369,7 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
             ).scalar_one_or_none()
 
             if existing_img:
-                image_id = existing_img.id
+                image = existing_img
             else:
                 # Upload to S3 and create Image record. detect_mime sniffs
                 # the real bytes rather than assuming one -- a wrong
@@ -399,7 +402,8 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
                 )
                 db.add(new_img)
                 db.flush()
-                image_id = new_img.id
+                image = new_img
+                image_id = image.id
 
                 v1 = ImageVersion(
                     image_id=image_id,
@@ -427,11 +431,16 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
                     family=source,
                 )
 
+            # Every capture -- a new image or one another route recorded --
+            # is linked behind every clean copy of its picture, whichever
+            # came first (MASK-1: its masks are judged over all of them).
+            link_capture(db, image, pixel_digest(data))
+
             # Create FigureGallery record
             gallery_entry = FigureGallery(
                 figure_id=figure_id,
                 source_url=url,
-                image_id=image_id,
+                image_id=image.id,
                 position=position,
                 caption=caption,
                 source=source,
@@ -523,3 +532,38 @@ def _create_matted_derivative(
     except Exception:
         logger.warning("matte_derivative_failed", extra={"image_id": image_id})
         return None
+
+
+@celery_app.task(name="generate_masks")
+def generate_masks(limit: int | None = None, apply: bool = False) -> dict[str, Any]:
+    """MASK-1 batch: a mask for every clean image that has none at the
+    current pipeline version. DRY RUN unless ``apply=True`` -- a dry run
+    computes and reports, and writes nothing."""
+    with worker_session() as db:
+        report = run_mask_batch(db, S3ObjectStore(), dry_run=not apply, limit=limit)
+    return report.as_dict()
+
+
+@celery_app.task(name="reevaluate_masks")
+def reevaluate_published_masks(apply: bool = False) -> dict[str, Any]:
+    """MASK-1: withdraw published masks whose image was deleted or is no
+    longer eligible, restore withdrawn ones that qualify again. DRY RUN
+    unless ``apply=True``."""
+    with worker_session() as db:
+        return reevaluate_masks(db, dry_run=not apply)
+
+
+@celery_app.task(name="revoke_mask_store")
+def revoke_mask_store(source: str, apply: bool = False) -> dict[str, Any]:
+    """MASK-G: revoke every mask of ``source`` (README runbook "A store asks
+    for its cut-outs to be removed"). DRY RUN unless ``apply=True``."""
+    with worker_session() as db:
+        return revoke_store(db, source, dry_run=not apply)
+
+
+@celery_app.task(name="restore_mask_store")
+def restore_mask_store(source: str, apply: bool = False) -> dict[str, Any]:
+    """MASK-G: lift a store's revocation, restore its masks and re-check its
+    refused images (needs the mask model). DRY RUN unless ``apply=True``."""
+    with worker_session() as db:
+        return restore_store(db, S3ObjectStore(), source, dry_run=not apply)

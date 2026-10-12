@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy import Select, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -27,7 +27,7 @@ def search_images(
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> ImageSearchResponse:
     limit = max(1, min(limit, 100))
-    stmt: Select[tuple[Image]] = select(Image).where(Image.deleted_at.is_(None))
+    stmt = select(Image).where(Image.deleted_at.is_(None))
     if not ctx.is_service:
         stmt = stmt.join(UserImageLink, UserImageLink.image_id == Image.id).where(
             UserImageLink.user_id == ctx.subject
@@ -65,7 +65,7 @@ def search_albums(
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> AlbumSearchResponse:
     limit = max(1, min(limit, 100))
-    stmt: Select[tuple[Album]] = select(Album).where(Album.deleted_at.is_(None))
+    stmt = select(Album).where(Album.deleted_at.is_(None))
     # TODO(C1): album search scopes by tenant while image search scopes by
     # owner link; reconcile owner-vs-tenant consistency under the grant model.
     if not ctx.is_service:

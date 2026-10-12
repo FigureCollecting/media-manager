@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 from PIL import Image
@@ -39,11 +39,31 @@ if TYPE_CHECKING:
 class MattingBackend(ABC):
     """Interface for producing an RGBA cutout from a source image."""
 
+    #: Recorded beside every mask as its provenance (which backend made it).
+    name: ClassVar[str] = "custom"
+    #: Whether an APPLIED mask batch may store and publish this backend's
+    #: masks (app.workers.mask_job). Opt-in: only a real matting model sets
+    #: it. The stub's backdrop-distance heuristic keeps a dark floor under a
+    #: dark figure and still passes the quality gate, so it is dry run only.
+    publishes_masks: ClassVar[bool] = False
+
     @abstractmethod
     def matte(self, image: Image.Image) -> Image.Image:
         """Given an RGBA PIL Image, return a new RGBA Image with the alpha
         channel replaced (or refined) to cut out the background."""
         raise NotImplementedError
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        """The backend's foreground answer alone, as a ``(height, width)``
+        uint8 alpha -- the separate mask MASK-1 stores (Ross 2026-09-26: the
+        clean copy is never cut out; the client composites this over it).
+
+        This default reads the alpha of ``matte()`` for backends that only
+        implement the cut-out; the shipped backends override it so the mask
+        is the model's answer without the image's own alpha folded in.
+        """
+        cutout = self.matte(image.convert("RGBA"))
+        return np.asarray(cutout.convert("RGBA"))[..., 3].copy()
 
 
 class StubMattingBackend(MattingBackend):
@@ -62,9 +82,10 @@ class StubMattingBackend(MattingBackend):
     #: Corner patch size (pixels) used to sample the backdrop color.
     CORNER_SAMPLE = 5
 
-    def matte(self, image: Image.Image) -> Image.Image:
-        rgba = image.convert("RGBA")
-        arr = np.asarray(rgba)
+    name: ClassVar[str] = "stub"
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        arr = np.asarray(image.convert("RGBA"))
         h, w = arr.shape[0], arr.shape[1]
         rgb = arr[..., :3].astype(np.float32)
 
@@ -80,7 +101,12 @@ class StubMattingBackend(MattingBackend):
         backdrop = np.median(corners, axis=0)
 
         dist = np.sqrt(((rgb - backdrop) ** 2).sum(axis=-1))
-        computed_alpha = np.where(dist < self.BACKDROP_DISTANCE_THRESHOLD, 0, 255).astype(np.uint8)
+        return np.where(dist < self.BACKDROP_DISTANCE_THRESHOLD, 0, 255).astype(np.uint8)
+
+    def matte(self, image: Image.Image) -> Image.Image:
+        rgba = image.convert("RGBA")
+        arr = np.asarray(rgba)
+        computed_alpha = self.predict_alpha(rgba)
 
         # Never make an already-transparent pixel opaque -- only ever cut
         # further into the existing alpha channel.
@@ -94,7 +120,8 @@ class StubMattingBackend(MattingBackend):
 class BiRefNetMattingBackend(MattingBackend):
     """Real subject-segmentation backend: BiRefNet, run via
     onnxruntime-gpu against ONNX weights baked into the worker Docker
-    image (see Dockerfile.worker) at deploy time.
+    image (see Dockerfile.worker) at deploy time: rembg's fp32
+    BiRefNet-general export, the weights the mask lane was measured on.
 
     Model spec (see onnx-community/BiRefNet-ONNX preprocessor_config.json
     on Hugging Face, MIT licensed export of ZhengPeng7/BiRefNet):
@@ -126,6 +153,9 @@ class BiRefNetMattingBackend(MattingBackend):
 
     #: BiRefNet's fixed square input resolution.
     INPUT_SIZE = 1024
+
+    name: ClassVar[str] = "birefnet"
+    publishes_masks: ClassVar[bool] = True
     #: ImageNet normalization stats used by the model's own preprocessor.
     MEAN = (0.485, 0.456, 0.406)
     STD = (0.229, 0.224, 0.225)
@@ -157,10 +187,11 @@ class BiRefNetMattingBackend(MattingBackend):
 
         if not self._model_path:
             raise RuntimeError(
-                "BiRefNetMattingBackend has no ONNX weights configured: "
+                f"{type(self).__name__} has no ONNX weights configured: "
                 "set Settings.matting_model_path (env MATTING_MODEL_PATH) "
                 "to the BiRefNet weights baked into the worker image (see "
-                "Dockerfile.worker), or pass session= explicitly."
+                "Dockerfile.worker; matting_isnet_*_path for IS-Net), or "
+                "pass session= explicitly."
             )
 
         # Import onnxruntime lazily -- never at module import time -- so
@@ -239,14 +270,15 @@ class BiRefNetMattingBackend(MattingBackend):
         mask_img = Image.fromarray(mask_u8, mode="L").resize(size, Image.BILINEAR)
         return np.asarray(mask_img)
 
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        raw_output = self._run(self._preprocess(rgba))
+        return self._postprocess(raw_output, (rgba.width, rgba.height))
+
     def matte(self, image: Image.Image) -> Image.Image:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
         arr = np.asarray(rgba)
-        width, height = rgba.width, rgba.height
-
-        input_array = self._preprocess(rgba)
-        raw_output = self._run(input_array)
-        computed_alpha = self._postprocess(raw_output, (width, height))
+        computed_alpha = self.predict_alpha(rgba)
 
         # Never make an already-transparent pixel opaque -- only ever cut
         # further into the existing alpha channel (same rule as
@@ -256,6 +288,42 @@ class BiRefNetMattingBackend(MattingBackend):
 
         out = np.dstack([arr[..., :3], combined_alpha]).astype(np.uint8)
         return Image.fromarray(out, mode="RGBA")
+
+
+class IsNetMattingBackend(BiRefNetMattingBackend):
+    """IS-Net (DIS) via onnxruntime: the ``isnet-general-use`` and
+    ``isnet-anime`` exports the July base-keep pass used as its base donors
+    (app.workers.basekept). Same lazy, CUDA-required session as BiRefNet;
+    only the tensor conventions differ, and they follow the exports' own
+    reference pipeline (rembg's DIS sessions): LANCZOS to 1024, scaled by
+    the image's own maximum, ImageNet mean subtracted with unit std; the
+    output is min-max normalised with NO sigmoid and truncated to 8 bits,
+    then resized back with LANCZOS.
+    """
+
+    STD = (1.0, 1.0, 1.0)
+
+    name: ClassVar[str] = "isnet"
+
+    def _preprocess(self, image: Image.Image) -> np.ndarray:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        rgb_arr = np.ascontiguousarray(np.asarray(rgba)[..., :3])
+        resized = Image.fromarray(rgb_arr, mode="RGB").resize(
+            (self.INPUT_SIZE, self.INPUT_SIZE), Image.LANCZOS
+        )
+        arr = np.asarray(resized).astype(np.float32)
+        scale = np.float32(max(float(arr.max()), 1e-6))
+        mean = np.array(self.MEAN, dtype=np.float32)
+        std = np.array(self.STD, dtype=np.float32)
+        normalized = (arr / scale - mean) / std
+        return np.expand_dims(normalized.transpose(2, 0, 1), axis=0).astype(np.float32)
+
+    def _postprocess(self, raw_output: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+        pred = np.squeeze(raw_output[:, 0, :, :], axis=0)
+        lo, hi = float(pred.min()), float(pred.max())
+        pred = (pred - lo) / max(hi - lo, 1e-12)
+        mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
+        return np.asarray(mask.resize(size, Image.LANCZOS))
 
 
 _BACKENDS: dict[str, type[MattingBackend]] = {
@@ -276,6 +344,20 @@ def get_matting_backend(name: str | None = None) -> MattingBackend:
         name = getattr(settings, "matting_backend", "stub")
 
     key = (name or "stub").lower()
+    if key == "birefnet_basekept":
+        from .basekept import BaseKeptMattingBackend
+
+        if settings is None:
+            from ..config import get_settings
+
+            settings = get_settings()
+        return BaseKeptMattingBackend(
+            primary=BiRefNetMattingBackend(model_path=settings.matting_model_path),
+            donors=[
+                IsNetMattingBackend(model_path=settings.matting_isnet_general_path),
+                IsNetMattingBackend(model_path=settings.matting_isnet_anime_path),
+            ],
+        )
     if key == "birefnet":
         if settings is None:
             from ..config import get_settings

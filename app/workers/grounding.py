@@ -16,6 +16,7 @@ grounding scalars.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -87,3 +88,65 @@ def compute_contact_band(rgba: np.ndarray) -> tuple[float, float] | None:
     center_x_frac = (min_x + max_x) / 2 / width
     width_frac = (max_x - min_x) / width
     return center_x_frac, width_frac
+
+
+@dataclass(frozen=True)
+class AlphaGrounding:
+    """Everything the case view needs to stand a figure on a shelf, measured
+    on one alpha channel (a MASK-1 mask, or a clean copy's own alpha).
+
+    ``bottom_margin_frac`` and the contact band are fc-api-contract 0.4.0
+    ProductImage fields. ``top_margin_frac`` and the opaque box are what the
+    case view measures client-side today (fc-mobile computeTopMarginFrac /
+    computeSideMarginFracs); they have no contract field yet (CONTRACT-1
+    follow-up). The box is the HALF-OPEN opaque extent as fractions of the
+    image: rows ``[box_top, box_bottom)`` of the height and columns
+    ``[box_left, box_right)`` of the width, so ``1 - box_bottom`` is the clear
+    bottom margin and ``1 - box_right`` the clear right margin.
+    """
+
+    bottom_margin_frac: float
+    top_margin_frac: float
+    box_top_frac: float
+    box_bottom_frac: float
+    box_left_frac: float
+    box_right_frac: float
+    contact_band_center_x_frac: float
+    contact_band_width_frac: float
+
+
+def measure_alpha_grounding(alpha: np.ndarray) -> AlphaGrounding | None:
+    """Grounding on a bare ``(height, width)`` alpha channel, where opaque
+    means alpha above ALPHA_THRESHOLD (the contract's "above 10 of 255").
+
+    Same arithmetic as compute_bottom_margin_frac / compute_contact_band, so
+    a mask and a cut-out with the same alpha report the same numbers. Returns
+    ``None`` -- unmeasured, never a bogus 0 -- when nothing is opaque or the
+    buffer is empty.
+    """
+    if alpha.ndim != 2:
+        raise ValueError(f"expected a (height, width) alpha channel, got shape {alpha.shape}")
+    height, width = alpha.shape
+    opaque = alpha > ALPHA_THRESHOLD
+    rows = np.nonzero(np.any(opaque, axis=1))[0]
+    if rows.size == 0:
+        return None
+    cols = np.nonzero(np.any(opaque, axis=0))[0]
+    first_row, last_row = int(rows.min()), int(rows.max())
+    first_col, last_col = int(cols.min()), int(cols.max())
+
+    band_height = max(1, _round_half_up(height * CONTACT_BAND_FRAC))
+    band_top = max(0, last_row - band_height + 1)
+    band_cols = np.nonzero(np.any(opaque[band_top : last_row + 1, :], axis=0))[0]
+    band_min, band_max = int(band_cols.min()), int(band_cols.max())
+
+    return AlphaGrounding(
+        bottom_margin_frac=float((height - 1 - last_row) / height),
+        top_margin_frac=first_row / height,
+        box_top_frac=first_row / height,
+        box_bottom_frac=(last_row + 1) / height,
+        box_left_frac=first_col / width,
+        box_right_frac=(last_col + 1) / width,
+        contact_band_center_x_frac=(band_min + band_max) / 2 / width,
+        contact_band_width_frac=(band_max - band_min) / width,
+    )
