@@ -972,6 +972,121 @@ class TestTransparencyIsMeasured:
         assert _public(db_session, "mask") == []
 
 
+def _transparent(hidden: tuple[int, int, int]) -> np.ndarray:
+    """A figure on a FULLY transparent background whose colour -- invisible
+    under alpha 0 -- is ``hidden``."""
+    arr = np.zeros((60, 40, 4), dtype=np.uint8)
+    arr[..., :3] = hidden
+    arr[10:50, 12:28] = (20, 20, 30, 255)
+    arr[20:30, 15:25] = (200, 40, 40, 255)
+    return arr
+
+
+def _rgba_png(arr: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGBA").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _palette_png() -> bytes:
+    """The same picture as a palette PNG whose transparent entry is black
+    (what a PNG optimiser writes)."""
+    index = np.zeros((60, 40), dtype=np.uint8)
+    index[10:50, 12:28] = 1
+    index[20:30, 15:25] = 2
+    im = Image.fromarray(index, mode="P")
+    im.putpalette([0, 0, 0, 20, 20, 30, 200, 40, 40])
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", transparency=0)
+    return buf.getvalue()
+
+
+def _hidden_twin(kind: str) -> tuple[bytes, bytes]:
+    """An item picture with white under its transparent pixels, and a capture
+    that shows the very same picture with another colour hidden there."""
+    item = _rgba_png(_transparent((255, 255, 255)))
+    if kind == "hidden-black":
+        return item, _rgba_png(_transparent((0, 0, 0)))
+    if kind == "palette-trns":
+        return item, _palette_png()
+    with Image.open(io.BytesIO(item)) as im:  # lossless WebP: exact=False by default
+        buf = io.BytesIO()
+        im.save(buf, format="WEBP", lossless=True)
+    return item, buf.getvalue()
+
+
+def _shown(data: bytes) -> np.ndarray:
+    """What a compositor shows: RGB premultiplied by alpha."""
+    with Image.open(io.BytesIO(data)) as im:
+        rgba = np.asarray(im.convert("RGBA")).astype(np.uint16)
+    return np.dstack([rgba[..., :3] * rgba[..., 3:4] // 255, rgba[..., 3]])
+
+
+HIDDEN_KINDS = ["hidden-black", "webp-lossless", "palette-trns"]
+
+
+class TestTheColourUnderATransparentPixelIsNotThePicture:
+    """Challenger i5 A: two files can show the same transparent picture and
+    differ only in the colour stored under fully transparent pixels (lossless
+    WebP, exact=False by default; a PNG optimiser). That colour is not part
+    of the picture: it is zeroed before the digest and the encode, so the two
+    are ONE picture -- one digest, one clean copy, one judgment -- and the
+    public copy carries no hidden pixels."""
+
+    @pytest.mark.parametrize("kind", HIDDEN_KINDS)
+    def test_the_two_files_show_one_picture_and_share_its_digest(self, kind: str) -> None:
+        item, photo = _hidden_twin(kind)
+        assert item != photo
+        assert np.array_equal(_shown(item), _shown(photo))
+        assert pixel_digest(item) == pixel_digest(photo)
+
+    @pytest.mark.parametrize("photo_first", [False, True], ids=["item-first", "photo-first"])
+    @pytest.mark.parametrize("kind", HIDDEN_KINDS)
+    def test_a_collector_photo_differing_only_under_transparency_refuses_the_mask(
+        self, db_session: Session, store: LocalObjectStore, kind: str, photo_first: bool
+    ) -> None:
+        item, photo = _hidden_twin(kind)
+        captures = [(item, ITEM.format(n=1), "item"), (photo, PICTURE.format(n=1), "photo")]
+        for data, url, name in captures[::-1] if photo_first else captures:
+            seed_clean_image(
+                db_session,
+                store,
+                data,
+                origins=[ImageOrigin(url=url, source="mfc")],
+                figure_id=f"mfc:{name}",
+            )
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [("ineligible", "user_photo")]
+        assert len(_public(db_session, "sanitized")) == 1
+        assert _public(db_session, "mask") == []
+
+    def test_the_public_copy_carries_no_hidden_pixels(self) -> None:
+        data, mime, _w, _h = make_clean_copy(_rgba_png(_transparent((255, 0, 255))))
+        assert mime == "image/png"
+        with Image.open(io.BytesIO(data)) as im:
+            rgba = np.asarray(im.convert("RGBA"))
+        clear = rgba[..., 3] == 0
+        assert clear.any()
+        assert not rgba[clear][:, :3].any()
+        assert np.array_equal(_shown(data), _shown(_rgba_png(_transparent((255, 0, 255)))))
+
+    def test_a_transparent_grey_alpha_png_keeps_its_alpha_and_shares_its_rgba_twins_digest(
+        self,
+    ) -> None:
+        from app.workers.mask_seed import _picture
+
+        grey = np.full((60, 40), 245, dtype=np.uint8)
+        grey[10:50, 12:28] = 20
+        alpha = np.full((60, 40), 255, dtype=np.uint8)
+        alpha[:5] = 0
+        la = io.BytesIO()
+        Image.fromarray(np.dstack([grey, alpha]), mode="LA").save(la, format="PNG")
+        twin = _rgba_png(np.dstack([grey, grey, grey, alpha]))
+        assert _picture(la.getvalue()).mode == "RGBA"
+        assert make_clean_copy(la.getvalue())[1] == "image/png"
+        assert pixel_digest(la.getvalue()) == pixel_digest(twin)
+
+
 class TestCapturesKeyedOnPixels:
     """Challenger i3 D2: two captures of one picture whose clean copies would
     NOT coincide -- one of them is the canonical clean encoding itself -- still
