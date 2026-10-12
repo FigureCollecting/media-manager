@@ -211,6 +211,7 @@ def _report(db: Session, batch_id: int) -> dict[str, Any]:
         "counts": batch.counts,
         "cursor_sha256": batch.cursor_sha256,
         "item_limit": batch.item_limit,
+        "source": batch.source,
         "started_at": batch.started_at,
         "finished_at": batch.finished_at,
     }
@@ -228,7 +229,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--apply", action="store_true", help="store results (default: dry run)")
     run.add_argument("--limit", type=int)
     run.add_argument("--page-size", type=int, default=50)
-    run.add_argument("--resume", type=int, help="continue an unfinished batch")
+    run.add_argument("--resume", type=int, help="continue an unfinished batch (keeps its --source)")
     run.add_argument("--retry-failed", action="store_true")
     run.add_argument(
         "--recheck-ineligible", action="store_true", help="re-judge images refused a mask"

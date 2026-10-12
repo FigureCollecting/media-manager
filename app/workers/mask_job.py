@@ -349,7 +349,12 @@ def _settle(
 
 
 def _open_batch(
-    db: Session, *, resume_batch_id: int | None, backend_name: str, limit: int | None
+    db: Session,
+    *,
+    resume_batch_id: int | None,
+    backend_name: str,
+    limit: int | None,
+    source: str | None,
 ) -> MaskBatch:
     if resume_batch_id is not None:
         batch = db.get(MaskBatch, resume_batch_id)
@@ -359,6 +364,11 @@ def _open_batch(
             or batch.pipeline_version != MASK_PIPELINE_VERSION
         ):
             raise ValueError(f"mask batch {resume_batch_id} is not resumable")
+        if source is not None and source != batch.source:
+            raise ValueError(
+                f"mask batch {resume_batch_id} is limited to source {batch.source!r}:"
+                " resume it with that source or none"
+            )
         return batch
     batch = MaskBatch(
         pipeline_version=MASK_PIPELINE_VERSION,
@@ -366,6 +376,7 @@ def _open_batch(
         dry_run=False,
         status="running",
         item_limit=limit,
+        source=source,
         counts=_zero_counts(),
     )
     db.add(batch)
@@ -391,23 +402,30 @@ def run_mask_batch(
     plus, on request, those whose result was ``failed`` (``retry_failed``) or
     ``ineligible`` (``recheck_ineligible``: after a store is granted or
     restored, or an image's origins changed). ``source`` limits the batch to
-    clean copies with a live origin of that source; ``revoked`` overrides
-    the revocations (``restore_store``'s dry run judges without its own)."""
+    clean copies with a live origin of that source, and is recorded: a
+    resumed batch keeps its own (another ``source`` is refused); ``revoked``
+    overrides the revocations (``restore_store``'s dry run judges without
+    its own)."""
     if resume_batch_id is not None and dry_run:
         raise ValueError("a dry run cannot resume a batch: it records nothing to resume")
     active = backend or get_matting_backend()
     if not dry_run and not active.publishes_masks:
         raise ValueError(f"backend {active.name!r} is not a mask model: dry run only")
+    key = None if source is None else source_key(source)
     batch: MaskBatch | None = None
     if not dry_run:
         batch = _open_batch(
-            db, resume_batch_id=resume_batch_id, backend_name=active.name, limit=limit
+            db,
+            resume_batch_id=resume_batch_id,
+            backend_name=active.name,
+            limit=limit,
+            source=key,
         )
+        key = batch.source
         if resume_batch_id is not None and batch.item_limit is not None:
             limit = max(0, batch.item_limit - sum(batch.counts.values()))
 
     redrive = ("failed",) * retry_failed + ("ineligible",) * recheck_ineligible
-    key = None if source is None else source_key(source)
     report = BatchReport(batch_id=batch.id if batch else None, dry_run=dry_run)
     cursor = batch.cursor_sha256 if batch else None
     remaining = limit

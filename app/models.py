@@ -341,7 +341,8 @@ class MaskStoreRevocation(Base):
 class MaskBatch(Base):
     """One applied run of the MASK-1 batch job (dry runs are never stored).
     ``cursor_sha256`` is the last clean image settled, so a killed run
-    resumes after it; ``counts`` accumulate across resumes."""
+    resumes after it; ``counts`` accumulate across resumes; ``source`` is the
+    scope a resume keeps."""
 
     __tablename__ = "mask_batches"
 
@@ -352,6 +353,9 @@ class MaskBatch(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     cursor_sha256: Mapped[str | None] = mapped_column(String(64))
     item_limit: Mapped[int | None] = mapped_column(Integer)
+    #: The one source the batch is limited to (``run --source``, as
+    #: ``mask_policy.source_key``); NULL for every source.
+    source: Mapped[str | None] = mapped_column(String(50))
     counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
     started_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False

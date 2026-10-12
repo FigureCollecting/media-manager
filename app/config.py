@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     # media-manager yet (gallery ingest records source "mfc" only).
     mask_store_grants: dict[str, list[str]] = {}
     # The per-source deny list that wins over any grant (MFC included):
-    # MASK_STORE_REVOKED as a JSON list, plus what `masks revoke-store`
+    # MASK_STORE_REVOKED as a JSON list, e.g. '["shop"]' (a bare or
+    # comma-separated value fails to load), plus what `masks revoke-store`
     # persists at run time (mask_store_revocations). README runbook "A store
     # asks for its cut-outs to be removed".
     mask_store_revoked: list[str] = []

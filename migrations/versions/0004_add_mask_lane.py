@@ -75,6 +75,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(16), nullable=False),
         sa.Column("cursor_sha256", sa.String(64), nullable=True),
         sa.Column("item_limit", sa.Integer, nullable=True),
+        sa.Column("source", sa.String(50), nullable=True),
         sa.Column("counts", sa.JSON, nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
