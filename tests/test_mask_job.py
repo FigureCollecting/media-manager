@@ -390,6 +390,46 @@ class TestApply:
         (row,) = _masks(db_session)
         assert (row.status, row.reason) == ("ok", None)
 
+    def test_a_store_granted_later_is_masked_on_an_ineligible_recheck(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from app.config import get_settings
+
+        _seed(db_session, store, 1, url="https://img.shop.example/p/{n}.jpg")
+        for row in db_session.execute(select(FigureGallery)).scalars():
+            row.source = "shop"
+        db_session.commit()
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(r.status, r.reason) for r in _masks(db_session)] == [("ineligible", "not_granted")]
+        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"shop": ["shop.example"]}))
+        get_settings.cache_clear()
+        try:
+            settled = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+            assert settled.items == []
+            rechecked = run_mask_batch(
+                db_session, store, backend=_Model(), dry_run=False, recheck_ineligible=True
+            )
+        finally:
+            get_settings.cache_clear()
+        assert [i.status for i in rechecked.items] == ["ok"]
+        (row,) = _masks(db_session)
+        assert (row.status, row.reason, row.origin_class) == ("ok", None, "store_listing")
+        assert len(_public(db_session, "mask")) == 1
+
+    def test_an_ineligible_recheck_leaves_failed_and_settled_rows_alone(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1)
+        _seed(db_session, store, 2, url=PICTURE)
+        run_mask_batch(db_session, store, backend=_Boom(), dry_run=False)
+        rechecked = run_mask_batch(
+            db_session, store, backend=_Model(), dry_run=False, recheck_ineligible=True
+        )
+        assert [(i.status, i.reason) for i in rechecked.items] == [("ineligible", "user_photo")]
+        assert sorted(r.status for r in _masks(db_session)) == ["failed", "ineligible"]
+
     def test_a_corrupted_clean_copy_is_refused(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:

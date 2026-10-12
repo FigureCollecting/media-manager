@@ -133,6 +133,15 @@ class TestSampleRun:
         code, applied = _run(capsys, "--sandbox", sandbox, "reevaluate", "--apply")
         assert (code, applied["dry_run"]) == (0, False)
 
+    def test_recheck_ineligible_reselects_refused_images(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None
+    ) -> None:
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        code, again = _run(capsys, "--sandbox", sandbox, "run", "--apply", "--recheck-ineligible")
+        assert code == 0
+        assert sorted(i["figure_ids"][0] for i in again["items"]) == ["sample:4", "sample:8"]
+
     def test_the_full_report_can_be_written_to_a_file(
         self, sandbox: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
