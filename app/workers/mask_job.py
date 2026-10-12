@@ -22,10 +22,13 @@ in flight. ``resume_batch_id`` continues a batch that never finished from
 its cursor (candidates are taken in sha order, a keyset rather than an
 offset, so nothing is skipped or seen twice).
 
-FAILURES are per image: recorded as ``failed`` with the exception's CLASS
-only (never a message, which can carry a bucket or key), and re-driven with
-``retry_failed=True``. An ``ineligible`` image is re-judged with
-``recheck_ineligible=True`` (a store granted later, origins that changed).
+FAILURES are per image -- in the judgment as in the mask -- recorded as
+``failed`` with the exception's CLASS only (never a message, which can carry
+a bucket or key), and re-driven with ``retry_failed=True``. An
+``ineligible`` image is re-judged with ``recheck_ineligible=True`` (a store
+granted later, origins that changed). An image soft-deleted after the batch
+selected it is ``skipped`` (reason ``deleted``) and nothing is recorded, so
+restoring it makes it a candidate again.
 
 RE-EVALUATION. ``reevaluate_masks`` re-judges every published (``ok``) and
 ``withdrawn`` row against its image's current state (app.publication): the
@@ -57,7 +60,7 @@ from .matting import MattingBackend, get_matting_backend
 
 logger = logging.getLogger(__name__)
 
-COUNT_KEYS = ("ok", "held", "empty", "ineligible", "failed")
+COUNT_KEYS = ("ok", "held", "empty", "ineligible", "failed", "skipped")
 
 DEFAULT_PAGE_SIZE = 50
 
@@ -210,9 +213,30 @@ def _settle(
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
     written then, the report is the whole result."""
     sha = obj.sha256
-    # Judged over every image behind the clean copy (app.publication); None
-    # -- soft-deleted since it was selected -- is judged as no origin at all.
-    eligibility = mask_eligibility(judged_origins(db, sha) or [])
+    try:
+        # Judged over every image behind the clean copy (app.publication).
+        origins = judged_origins(db, sha)
+        if origins is None:
+            # Soft-deleted since it was selected: skipped and NOT recorded,
+            # as when it is deleted before selection, so a restore makes it
+            # a candidate again for a plain batch.
+            return ItemReport(sha, "skipped", "deleted", None)
+        eligibility = mask_eligibility(origins)
+    except Exception as exc:
+        # A judgment that raises is this image's failure, never the batch's.
+        db.rollback()
+        reason = type(exc).__name__
+        logger.warning("mask_judgment_failed", extra={"source_sha256": sha, "reason": reason})
+        if batch is not None:
+            _write_row(
+                db,
+                source_sha256=sha,
+                batch=batch,
+                status="failed",
+                reason=reason,
+                origin_class=None,
+            )
+        return ItemReport(sha, "failed", reason, None)
     if not eligibility.eligible:
         if batch is not None:
             _write_row(
@@ -370,7 +394,9 @@ def reevaluate_masks(
     whose image qualifies again. Every pipeline version is judged: an old
     version's mask is as addressable as the current one's. Dry run unless
     ``dry_run=False``; held, empty, ineligible and failed rows are never
-    touched."""
+    touched. Each change is committed on its own, and a row whose judgment
+    raises is judged refused (reason: the exception's class) -- one bad row
+    never stops the rest."""
     rows = db.execute(
         select(ImageMask).where(ImageMask.status.in_(("ok", "withdrawn"))).order_by(ImageMask.id)
     ).scalars()
@@ -379,20 +405,27 @@ def reevaluate_masks(
     unchanged = 0
     now = dt.datetime.now(dt.UTC)
     for row in list(rows):
-        refusal = mask_refusal(db, row.source_sha256, store_grants)
+        sha = row.source_sha256
+        try:
+            refusal = mask_refusal(db, sha, store_grants)
+        except Exception as exc:
+            db.rollback()
+            refusal = type(exc).__name__
+            logger.warning(
+                "mask_reevaluate_failed", extra={"source_sha256": sha, "reason": refusal}
+            )
         if row.status == "ok" and refusal is not None:
-            withdrawn.append(row.source_sha256)
+            withdrawn.append(sha)
             status, reason = "withdrawn", refusal
         elif row.status == "withdrawn" and refusal is None:
-            restored.append(row.source_sha256)
+            restored.append(sha)
             status, reason = "ok", None
         else:
             unchanged += 1
             continue
         if not dry_run:
             row.status, row.reason, row.updated_at = status, reason, now
-    if not dry_run:
-        db.commit()
+            db.commit()
     return {
         "dry_run": dry_run,
         "withdrawn": withdrawn,

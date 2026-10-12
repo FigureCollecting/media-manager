@@ -27,8 +27,8 @@ CACHING. ``public, max-age=31536000, immutable``: the address can never name
 other bytes. The request's ``Cache-Control``/``Pragma``/``If-None-Match`` are
 not read -- the app's service worker sends ``no-cache`` on every fetch, and
 the answer is the same bytes whatever it asks. 404s and 500s are
-``no-store``: a mask registered tomorrow must not be shadowed by a cached
-miss today.
+``no-store`` -- a judgment that raises included: a mask registered tomorrow
+must not be shadowed by a cached miss today.
 
 CORS. ``Access-Control-Allow-Origin`` echoes an app origin
 (``Settings.media_cors_origins``, exact match) and ``Vary: Origin`` is always
@@ -57,8 +57,9 @@ from .publication import servable
 
 logger = logging.getLogger(__name__)
 
-#: The whole grammar, matched on the path AS SENT (ASGI ``raw_path``), so a
-#: percent-encoded alias (``/d%2F<sha>``, ``/d/%62...``) is not the address.
+#: The whole grammar, matched on the path as the server presents it (ASGI
+#: ``raw_path``, not the decoded path), so a percent-encoded alias
+#: (``/d%2F<sha>``, ``/d/%62...``) is not the address.
 _DERIVATIVE_PATH = re.compile(rb"/d/[0-9a-f]{64}")
 
 IMMUTABLE = "public, max-age=31536000, immutable"
@@ -89,8 +90,10 @@ async def only_the_grammar(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
     """Everything that is not GET/HEAD /d/<64 lowercase hex> (no query) or
-    GET /healthz, exactly as sent, is a 404 -- decided before any route,
-    database or store."""
+    GET /healthz, as the server presents it, is a 404 -- decided before any
+    route, database or store. The app cannot see what the server drops
+    before it: uvicorn strips an empty ``?`` and a ``#fragment``, so
+    ``/d/<sha>?`` reaches it as ``/d/<sha>`` (the same bytes, harmless)."""
     raw = request.scope.get("raw_path") or request.url.path.encode()
     method = request.method
     if method == "GET" and raw == b"/healthz":
@@ -117,8 +120,13 @@ def derivative(
     store: ObjectStore = Depends(get_object_store),  # noqa: B008
     settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> Response:
-    obj = db.get(PublicObject, sha256)
-    if obj is None or not servable(db, obj, settings.mask_store_grants):
+    try:
+        obj = db.get(PublicObject, sha256)
+        live = obj is not None and servable(db, obj, settings.mask_store_grants)
+    except Exception as exc:
+        logger.error("derivative_unjudged", extra={"sha256": sha256, "error": type(exc).__name__})
+        return _bare(500)
+    if obj is None or not live:
         return _bare(404)
     try:
         data = store.get(obj.storage_key)

@@ -419,27 +419,36 @@ class TestApply:
         batches = list(db_session.execute(select(MaskBatch)).scalars())
         assert [b.status for b in batches] == ["done"]
 
+    @pytest.mark.parametrize("error", ["RuntimeError", "IntegrityError"])
     def test_a_judgment_that_raises_is_a_failure_and_the_batch_goes_on(
-        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+        self,
+        db_session: Session,
+        store: LocalObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+        error: str,
     ) -> None:
+        """Whatever the judgment raises -- a database error that leaves the
+        session needing a rollback included -- that image fails, alone."""
         objs = sorted((_seed(db_session, store, n) for n in range(1, 4)), key=lambda o: o.sha256)
         real = mask_job.judged_origins
 
         def judged(db: Session, sha256: str) -> object:
             if sha256 == objs[1].sha256:
-                raise RuntimeError("s3://bucket/key exploded")
+                if error == "RuntimeError":
+                    raise RuntimeError("s3://bucket/key exploded")
+                _break_the_session(db)
             return real(db, sha256)
 
         monkeypatch.setattr(mask_job, "judged_origins", judged)
         report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert [(i.status, i.reason) for i in report.items] == [
             ("ok", None),
-            ("failed", "RuntimeError"),
+            ("failed", error),
             ("ok", None),
         ]
         assert [(r.status, r.reason) for r in _masks(db_session)] == [
             ("ok", None),
-            ("failed", "RuntimeError"),
+            ("failed", error),
             ("ok", None),
         ]
 
@@ -760,6 +769,23 @@ def pixel_digest(original: bytes) -> str:
     from app.workers.mask_seed import pixel_digest as digest
 
     return digest(original)
+
+
+def _break_the_session(db: Session) -> None:
+    """Fail a flush, which leaves the session refusing every statement until
+    it is rolled back -- what a database error mid-judgment does."""
+    db.add(
+        PublicObject(
+            sha256="e" * 64,
+            kind="original",
+            mime="x",
+            bytes=1,
+            width=1,
+            height=1,
+            storage_key="x",
+        )
+    )
+    db.flush()
 
 
 class TestPixelDigest:
@@ -1146,6 +1172,7 @@ class TestReevaluate:
         db_session.refresh(first)
         assert (first.status, first.reason) == ("withdrawn", "deleted")
 
+    @pytest.mark.parametrize("error", ["RuntimeError", "IntegrityError"])
     @pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "apply"])
     def test_a_judgment_that_raises_withdraws_that_row_and_the_rest_are_judged(
         self,
@@ -1153,6 +1180,7 @@ class TestReevaluate:
         store: LocalObjectStore,
         monkeypatch: pytest.MonkeyPatch,
         dry_run: bool,
+        error: str,
     ) -> None:
         """Fail closed, one row at a time: a row whose judgment raises is
         withdrawn (reason: the exception's class), and the batch goes on."""
@@ -1163,7 +1191,9 @@ class TestReevaluate:
 
         def refusal(db: Session, sha256: str, *args: object, **kwargs: object) -> object:
             if sha256 == first.source_sha256:
-                raise RuntimeError("boom")
+                if error == "RuntimeError":
+                    raise RuntimeError("boom")
+                _break_the_session(db)
             return real(db, sha256, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(mask_job, "mask_refusal", refusal)
@@ -1171,7 +1201,7 @@ class TestReevaluate:
         assert (report["withdrawn"], report["unchanged"]) == ([first.source_sha256], 1)
         db_session.refresh(first)
         db_session.refresh(second)
-        expected = ("ok", None) if dry_run else ("withdrawn", "RuntimeError")
+        expected = ("ok", None) if dry_run else ("withdrawn", error)
         assert (first.status, first.reason) == expected
         assert (second.status, second.reason) == ("ok", None)
 
