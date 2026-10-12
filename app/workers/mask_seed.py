@@ -31,15 +31,18 @@ PUBLIC_KINDS = ("sanitized", "matted", "mask")
 
 def _picture(original: bytes) -> Image.Image:
     """The pixels ``original`` shows -- EXIF orientation baked in, RGBA when
-    it has any transparency, else RGB -- as a fresh image (no EXIF, XMP, ICC
-    or text chunks): exactly what its clean copy encodes."""
+    some pixel IS transparent, else RGB -- as a fresh image (no EXIF, XMP,
+    ICC or text chunks): exactly what its clean copy encodes. An alpha
+    channel whose every pixel is opaque, or a colour key no pixel has, is no
+    transparency: such a file shows the same picture as its RGB twin."""
     with Image.open(io.BytesIO(original)) as src:
         src.load()
         oriented = ImageOps.exif_transpose(src) or src
-        has_alpha = oriented.mode in ("RGBA", "LA", "PA") or "transparency" in oriented.info
-        mode = "RGBA" if has_alpha else "RGB"
-        pixels = oriented.convert(mode)
-        return Image.frombytes(mode, pixels.size, pixels.tobytes())
+        may_have_alpha = oriented.mode in ("RGBA", "LA", "PA") or "transparency" in oriented.info
+        pixels = oriented.convert("RGBA" if may_have_alpha else "RGB")
+        if pixels.mode == "RGBA" and pixels.getchannel("A").getextrema()[0] == 255:
+            pixels = pixels.convert("RGB")
+        return Image.frombytes(pixels.mode, pixels.size, pixels.tobytes())
 
 
 def _digest(picture: Image.Image) -> str:
