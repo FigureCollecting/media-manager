@@ -10,9 +10,10 @@ capture of the same picture linked to it by its pixel digest
   behind it are not soft-deleted. A row with no version is never served.
 - a mask is served while some ``ok`` image_masks row names it whose clean
   copy is live (as above) and still mask-eligible from the CURRENT origins
-  of every image behind it (app.workers.mask_policy). A mask shared by
-  several clean copies (different pictures, the same mask) stays while any
-  of them qualifies.
+  of every image behind it (app.workers.mask_policy); an image behind it
+  with no live origin refuses it (``no_origin``), as it would on its own.
+  A mask shared by several clean copies (different pictures, the same mask)
+  stays while any of them qualifies.
 - a ``matted`` cut-out is our derivative work on the picture, like a mask,
   so it is judged like a mask's clean copy: live AND mask-eligible. Nothing
   registers one yet; the rule is here so that whatever does cannot skip the
@@ -84,11 +85,19 @@ def images_behind(db: Session, sha256: str) -> list[int] | None:
 
 def judged_origins(db: Session, sha256: str) -> list[ImageOrigin] | None:
     """The current origins of every image behind ``sha256``, in image order;
-    None while it is not live (images_behind)."""
+    None while it is not live (images_behind).
+
+    POOLED, BUT FAILING CLOSED: an image behind it with no live origin at
+    all (no gallery row, or every row soft-deleted) stands in as an origin
+    with no URL, so it refuses the mask as ``no_origin`` -- exactly as it
+    would on its own."""
     ids = images_behind(db, sha256)
     if ids is None:
         return None
-    return [origin for image_id in ids for origin in gallery_origins(db, image_id)]
+    judged: list[ImageOrigin] = []
+    for image_id in ids:
+        judged.extend(gallery_origins(db, image_id) or [ImageOrigin(url=None)])
+    return judged
 
 
 def mask_refusal(
