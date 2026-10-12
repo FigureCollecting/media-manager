@@ -5,10 +5,12 @@ file and a local object directory), so a sample run needs no services."""
 from __future__ import annotations
 
 import json
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
 from app.cli import masks as cli
+from app.config import get_settings
 from app.workers.matting import StubMattingBackend
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -40,6 +42,20 @@ def model(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "make_backend", lambda *a: _Model())
 
 
+@pytest.fixture(autouse=True)
+def _fresh_settings() -> Generator[None, None, None]:
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture()
+def store_granted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sample's one store listing (sample:4) is masked only under a grant."""
+    monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"example-store": ["example-store.test"]}))
+    get_settings.cache_clear()
+
+
 def _rows(sandbox: str, model: type) -> list:  # type: ignore[type-arg]
     engine = create_engine(f"sqlite:///{sandbox}/masks.db")
     with Session(engine) as db:
@@ -48,7 +64,7 @@ def _rows(sandbox: str, model: type) -> list:  # type: ignore[type-arg]
 
 class TestSampleRun:
     def test_seed_then_dry_run_then_apply_then_nothing_left(
-        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None, store_granted: None
     ) -> None:
         from app.models import ImageMask, PublicObject
 
@@ -88,6 +104,19 @@ class TestSampleRun:
         assert code == 0
         assert report["status"] == "done"
         assert report["counts"] == applied["counts"]
+
+    def test_without_a_grant_the_store_listing_gets_no_mask(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        code, dry = _run(capsys, "--sandbox", sandbox, "run")
+        assert code == 0
+        by_figure = {i["figure_ids"][0]: i for i in dry["items"]}
+        assert (by_figure["sample:4"]["status"], by_figure["sample:4"]["reason"]) == (
+            "ineligible",
+            "not_granted",
+        )
+        assert dry["counts"]["ineligible"] == 2
 
     def test_the_full_report_can_be_written_to_a_file(
         self, sandbox: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]

@@ -58,7 +58,7 @@ def _seed(db: Session, store: LocalObjectStore, n: int, *, url: str = ITEM) -> P
         db,
         store,
         _photo((31 + 10 * n, 30, 90), seed=n),
-        origins=[ImageOrigin(url=url.format(n=n), source="mfc", role="gallery")],
+        origins=[ImageOrigin(url=url.format(n=n), source="mfc")],
         figure_id=f"mfc:{n}",
     )
 
@@ -314,6 +314,36 @@ class TestApply:
         assert row.mask_sha256 is None
         assert report.counts["ineligible"] == 1
         assert _public(db_session, "mask") == []
+
+    def test_a_store_listing_is_masked_only_under_a_grant(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from app.config import get_settings
+
+        _seed(db_session, store, 1, url="https://img.shop.example/p/{n}.jpg")
+        seed_clean_image(
+            db_session,
+            store,
+            _photo((90, 30, 31), seed=2),
+            origins=[ImageOrigin(url="https://i.imgur.com/2.jpg", source="shop")],
+            figure_id="shop:2",
+        )
+        for row in db_session.execute(select(FigureGallery)).scalars():
+            row.source = "shop"
+        db_session.commit()
+        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"shop": ["shop.example"]}))
+        get_settings.cache_clear()
+        try:
+            run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        finally:
+            get_settings.cache_clear()
+        by_class = sorted((r.origin_class, r.status, r.reason) for r in _masks(db_session))
+        assert by_class == [
+            ("not_granted", "ineligible", "not_granted"),
+            ("store_listing", "ok", None),
+        ]
 
     def test_a_held_mask_is_kept_privately_and_never_published(
         self, db_session: Session, store: LocalObjectStore

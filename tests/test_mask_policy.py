@@ -1,16 +1,27 @@
-"""MASK-1 per-source permission split, keyed on ORIGIN.
+"""MASK-1 per-source permission split, keyed on ORIGIN, fail closed.
 
 Measured 2026-10-09 (SIZE-MEASURE): every captured MFC image row carries role
 'gallery' whether it came from /upload/items/ (the item's own main images) or
-would come from /upload/pictures/ (collectors' photos), so the role cannot
-tell them apart. Item-main images are eligible for a mask; user photos are
-not -- they stay displayable, unmasked. Anything the rules cannot place is
-refused (fail closed).
+would come from /upload/pictures/ (collectors' photos), so only the URL tells
+them apart. Item-main images are eligible for a mask; user photos are not --
+they stay displayable, unmasked.
+
+A store's listing photo gets a mask only when its source holds a MASK GRANT
+for the host the bytes came from (Settings.mask_store_grants, env
+MASK_STORE_GRANTS = {"<source>": ["<domain>", ...]}); none is granted by
+default. Everything else is refused: an ungranted source or host, a host
+that does not match the recorded source, a URL carrying credentials or a
+backslash, an IP literal. media-manager records an origin as (source, url)
+only, so nothing else about the image is consulted.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Generator
+
 import pytest
+from app.config import get_settings
 from app.workers.mask_policy import ImageOrigin, classify_origin, mask_eligibility
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/1154594-1a2b3.jpg"
@@ -18,9 +29,27 @@ ITEM_ENDPOINT = (
     "https://myfigurecollection.net/?_tb=commit&commit=nsp&objectType=item&objectId=1154594&size=1"
 )
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/123456.jpeg"
+AMIAMI = "https://img.amiami.com/images/product/main/241/FIGURE-123456.jpg"
 
 
-class TestClassifyOrigin:
+def _grant(monkeypatch: pytest.MonkeyPatch, grants: dict[str, list[str]]) -> None:
+    monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps(grants))
+    get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings() -> Generator[None, None, None]:
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture()
+def granted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _grant(monkeypatch, {"amiami": ["amiami.com"], "shop": ["shop.example"]})
+
+
+class TestMfc:
     @pytest.mark.parametrize(
         ("url", "expected"),
         [
@@ -43,7 +72,7 @@ class TestClassifyOrigin:
         ],
     )
     def test_mfc_is_classified_by_path(self, url: str, expected: str) -> None:
-        assert classify_origin(ImageOrigin(url=url, source="mfc", role="gallery")) == expected
+        assert classify_origin(ImageOrigin(url=url, source="mfc")) == expected
 
     @pytest.mark.parametrize(
         "url",
@@ -56,53 +85,123 @@ class TestClassifyOrigin:
     def test_a_path_that_climbs_out_of_items_is_judged_where_it_lands(self, url: str) -> None:
         assert classify_origin(ImageOrigin(url=url, source="mfc")) == "user_photo"
 
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            ("static.myfigurecollection.net.", "user_photo"),
+            ("myfigurecollection.net..", "user_photo"),
+        ],
+    )
+    def test_a_trailing_dot_host_is_still_mfc(self, host: str, expected: str) -> None:
+        url = f"https://{host}/upload/pictures/2024/01/02/1.jpeg"
+        assert classify_origin(ImageOrigin(url=url, source="mfc")) == expected
+
+    def test_an_mfc_host_recorded_under_another_source_is_unknown(self) -> None:
+        assert classify_origin(ImageOrigin(url=ITEM, source="amiami")) == "unknown_origin"
+
+    def test_an_mfc_row_on_a_host_that_is_not_mfc_is_unknown(self) -> None:
+        url = "https://cdn.example-cdn.com/upload/items/2/1154594-1a2b3.jpg"
+        assert classify_origin(ImageOrigin(url=url, source="mfc")) == "unknown_origin"
+
     def test_a_lookalike_host_is_not_mfc(self) -> None:
-        url = "https://evilmyfigurecollection.net/upload/pictures/1.jpg"
-        assert classify_origin(ImageOrigin(url=url, source="other")) == "store_listing"
-
-    def test_a_store_listing_image_is_eligible_kind(self) -> None:
-        url = "https://img.amiami.com/images/product/main/241/FIGURE-123456.jpg"
-        assert classify_origin(ImageOrigin(url=url, source="amiami")) == "store_listing"
-
-    def test_a_user_class_wins_over_an_item_path(self) -> None:
-        o = ImageOrigin(url=ITEM, source="mfc", role="gallery", source_class="user_photo")
-        assert classify_origin(o) == "user_photo"
-
-    def test_a_user_role_wins_over_any_host(self) -> None:
-        url = "https://www.hpoi.net/gallery/user/1.jpg"
-        assert classify_origin(ImageOrigin(url=url, source="hpoi", role="user")) == "user_photo"
+        url = "https://evilmyfigurecollection.net/upload/items/1/1.jpg"
+        assert classify_origin(ImageOrigin(url=url, source="mfc")) == "unknown_origin"
 
     def test_no_url_is_no_origin(self) -> None:
-        assert classify_origin(ImageOrigin(url=None, source="mfc", role="gallery")) == "no_origin"
+        assert classify_origin(ImageOrigin(url=None, source="mfc")) == "no_origin"
         assert classify_origin(ImageOrigin(url="", source="mfc")) == "no_origin"
-
-    def test_no_url_but_a_user_class_is_still_a_user_photo(self) -> None:
-        o = ImageOrigin(url=None, source_class="user_photo")
-        assert classify_origin(o) == "user_photo"
 
     @pytest.mark.parametrize(
         "url",
         [
             "not a url",
             "ftp://static.myfigurecollection.net/upload/items/0/9-9.jpg",
-            "ftp://shop.example/p/1.jpg",
+            "https:///upload/items/0/9-9.jpg",
         ],
     )
     def test_an_unreadable_or_non_http_url_is_unknown(self, url: str) -> None:
         assert classify_origin(ImageOrigin(url=url, source="mfc")) == "unknown_origin"
 
 
+class TestStores:
+    def test_a_granted_store_host_is_a_store_listing(self, granted: None) -> None:
+        assert classify_origin(ImageOrigin(url=AMIAMI, source="amiami")) == "store_listing"
+
+    def test_the_granted_domain_itself_is_a_store_listing(self, granted: None) -> None:
+        url = "https://amiami.com/p/1.jpg"
+        assert classify_origin(ImageOrigin(url=url, source="amiami")) == "store_listing"
+
+    def test_a_trailing_dot_granted_host_is_normalised(self, granted: None) -> None:
+        url = "https://img.amiami.com./images/product/main/1.jpg"
+        assert classify_origin(ImageOrigin(url=url, source="amiami")) == "store_listing"
+
+    def test_with_no_grant_a_store_listing_gets_no_mask(self) -> None:
+        assert classify_origin(ImageOrigin(url=AMIAMI, source="amiami")) == "not_granted"
+
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            ("https://i.imgur.com/abc.jpg", "amiami"),
+            ("https://evilamiami.com/p/1.jpg", "amiami"),
+            ("https://amiami.com.evil.test/p/1.jpg", "amiami"),
+            ("https://img.amiami.com/p/1.jpg", "shop"),
+            ("https://r.hpoi.net/gk/user/album/1.jpg", "hpoi"),
+            ("https://i.imgur.com/abc.jpg", "imgur"),
+            ("https://pbs.twimg.com/media/abc.jpg", "twitter"),
+            ("http://203.0.113.7/p/1.jpg", "shop"),
+            ("http://[2001:db8::1]/p/1.jpg", "shop"),
+            ("https://shop.example/p/1.jpg", None),
+        ],
+    )
+    def test_anything_not_granted_gets_no_mask(
+        self, granted: None, url: str, source: str | None
+    ) -> None:
+        assert classify_origin(ImageOrigin(url=url, source=source)) == "not_granted"
+
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            ("https://evil.test@shop.example/p/1.jpg", "shop"),
+            ("https://user:pw@shop.example/p/1.jpg", "shop"),
+            ("https://evil.test\\@static.myfigurecollection.net/upload/items/1/1-a.jpg", "mfc"),
+            ("https://shop.example\\.evil.test/p/1.jpg", "shop"),
+        ],
+    )
+    def test_credentials_or_a_backslash_make_the_host_ambiguous(
+        self, granted: None, url: str, source: str
+    ) -> None:
+        assert classify_origin(ImageOrigin(url=url, source=source)) == "unknown_origin"
+
+    def test_grants_are_normalised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _grant(monkeypatch, {"shop": ["Shop.Example.", ""]})
+        url = "https://cdn.shop.example/p/1.jpg"
+        assert classify_origin(ImageOrigin(url=url, source="shop")) == "store_listing"
+        other = "https://shop.examplex/p/1.jpg"
+        assert classify_origin(ImageOrigin(url=other, source="shop")) == "not_granted"
+
+    def test_explicit_grants_override_the_settings(self, granted: None) -> None:
+        o = ImageOrigin(url="https://x.example/p.jpg", source="x")
+        assert classify_origin(o, store_grants={"x": ["x.example"]}) == "store_listing"
+        assert classify_origin(ImageOrigin(url=AMIAMI, source="amiami"), store_grants={}) == (
+            "not_granted"
+        )
+
+
 class TestMaskEligibility:
     def test_item_main_is_eligible(self) -> None:
-        e = mask_eligibility([ImageOrigin(url=ITEM, source="mfc", role="gallery")])
+        e = mask_eligibility([ImageOrigin(url=ITEM, source="mfc")])
         assert (e.eligible, e.origin_class, e.reason) == (True, "item_main", "eligible")
 
-    def test_store_listing_is_eligible(self) -> None:
+    def test_a_granted_store_listing_is_eligible(self, granted: None) -> None:
         e = mask_eligibility([ImageOrigin(url="https://shop.example/p/1.jpg", source="shop")])
         assert (e.eligible, e.origin_class) == (True, "store_listing")
 
+    def test_an_ungranted_store_listing_is_refused_by_name(self) -> None:
+        e = mask_eligibility([ImageOrigin(url="https://shop.example/p/1.jpg", source="shop")])
+        assert (e.eligible, e.origin_class, e.reason) == (False, "not_granted", "not_granted")
+
     def test_user_photo_is_not(self) -> None:
-        e = mask_eligibility([ImageOrigin(url=PICTURE, source="mfc", role="gallery")])
+        e = mask_eligibility([ImageOrigin(url=PICTURE, source="mfc")])
         assert (e.eligible, e.origin_class, e.reason) == (False, "user_photo", "user_photo")
 
     def test_no_origins_at_all_is_refused(self) -> None:
@@ -124,7 +223,7 @@ class TestMaskEligibility:
         e = mask_eligibility([ImageOrigin(url="https://myfigurecollection.net/x", source="mfc")])
         assert (e.eligible, e.reason) == (False, "unknown_origin")
 
-    def test_two_eligible_origins_report_the_first(self) -> None:
+    def test_two_eligible_origins_report_the_first(self, granted: None) -> None:
         e = mask_eligibility(
             [
                 ImageOrigin(url=ITEM, source="mfc"),
