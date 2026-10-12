@@ -3,7 +3,8 @@
 ``public_objects`` registers what is ever addressable at ``/d/<sha256>``;
 this module decides, on every request, whether it still is. A clean copy is
 judged over EVERY image behind it: the image its version belongs to and each
-pixel-identical capture linked to it (``public_object_images``):
+capture of the same picture linked to it by its pixel digest
+(``public_object_images``; app.workers.mask_seed), whatever its bytes:
 
 - a clean copy (``sanitized``) is served while its version and every image
   behind it are not soft-deleted. A row with no version is never served.
@@ -19,10 +20,11 @@ pixel-identical capture linked to it (``public_object_images``):
 
 ALL, NOT ANY, for the images behind one clean copy: the address names the
 pixels, so a soft delete (a takedown) under any capture of a picture
-reaches the copy every capture shares, and the same picture captured as an
-item image and as a collector's photo is a collector's photo somewhere --
-whichever was seeded first. The cost is deliberate: soft-deleting a
-pixel-identical duplicate takes the shared copy offline for the capture
+reaches the copy every capture shares -- including a capture whose bytes ARE
+the copy (our clean copy captured again) -- and the same picture captured as
+an item image and as a collector's photo is a collector's photo somewhere,
+in whichever order the two were seeded. The cost is deliberate: soft-deleting
+a pixel-identical duplicate takes the shared copy offline for the capture
 that remains.
 
 So soft-deleting an image or a version revokes its derivative and its masks;

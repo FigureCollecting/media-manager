@@ -270,23 +270,31 @@ class PublicObject(Base):
     image_version_id: Mapped[int | None] = mapped_column(
         ForeignKey("image_versions.id", ondelete="CASCADE")
     )
+    #: A clean copy's PIXEL DIGEST (``mask_seed.pixel_digest``): the key every
+    #: capture of the same picture is linked by, whatever its bytes. Set on
+    #: ``sanitized`` objects and only on them; one clean copy per picture.
+    pixel_sha256: Mapped[str | None] = mapped_column(String(64), unique=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
     )
 
     __table_args__ = (
         CheckConstraint("kind in ('sanitized','matted','mask')", name="ck_public_object_kind"),
+        CheckConstraint(
+            "(kind = 'sanitized') = (pixel_sha256 IS NOT NULL)", name="ck_public_object_pixels"
+        ),
     )
 
 
 class PublicObjectImage(Base):
     """Every image a clean public object is the clean copy of.
 
-    Clean copies are content-addressed, so two originals with the same
-    pixels and different bytes (an EXIF or text chunk apart: two crawls, a
-    re-save) are two images with ONE clean copy -- one row each here. The
-    copy, and any mask made from it, is judged over all of them
-    (app.publication), whichever was seeded first.
+    Captures are linked by their PIXELS (``public_objects.pixel_sha256``),
+    so two originals with the same pixels and different bytes (an EXIF or
+    text chunk apart, a re-save, our own clean copy captured again) are two
+    images with ONE clean copy -- one row each here. The copy, and any mask
+    made from it, is judged over all of them (app.publication), in whichever
+    order they were seeded.
     """
 
     __tablename__ = "public_object_images"

@@ -31,8 +31,12 @@ def upgrade() -> None:
             sa.ForeignKey("image_versions.id", ondelete="CASCADE"),
             nullable=True,
         ),
+        sa.Column("pixel_sha256", sa.String(64), nullable=True, unique=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("kind in ('sanitized','matted','mask')", name="ck_public_object_kind"),
+        sa.CheckConstraint(
+            "(kind = 'sanitized') = (pixel_sha256 IS NOT NULL)", name="ck_public_object_pixels"
+        ),
     )
     op.create_table(
         "public_object_images",

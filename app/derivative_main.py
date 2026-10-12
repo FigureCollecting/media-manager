@@ -12,8 +12,11 @@ This app mounts exactly ``/healthz`` and ``/d/{sha256}``; anything else,
 including any other method on ``/d/``, is a bodiless 404.
 
 THE ADDRESS IS THE CAPABILITY. Only rows of ``public_objects`` are served --
-our clean derivatives and our masks -- so an original, a held mask or any
-other stored object has no address here. A registered object is served
+our clean derivatives and our masks -- and an original's bytes are never
+registered, so an original, a held mask or any other stored object has no
+address here. The one overlap is an original whose bytes ARE one of our
+clean copies (that copy captured again): it is linked behind the copy by its
+pixels and judged with it. A registered object is served
 only while app.publication.servable says so: a soft-deleted image or
 version, a withdrawn mask, or a mask whose image is no longer
 mask-eligible is a 404. The bytes are re-hashed before they

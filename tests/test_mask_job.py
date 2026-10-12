@@ -468,7 +468,7 @@ class TestApply:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         obj = _seed(db_session, store, 1)
-        obj.kind = "matted"
+        obj.kind, obj.pixel_sha256 = "matted", None  # only a clean copy carries a digest
         db_session.commit()
         report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
@@ -675,6 +675,35 @@ class TestPixelDigest:
     def test_other_pixels_have_another_digest(self) -> None:
         assert pixel_digest(_photo((31, 30, 90))) != pixel_digest(_photo((41, 30, 90)))
 
+    def test_the_digest_names_the_size(self) -> None:
+        """Same decoded bytes, another shape: another picture."""
+
+        def png(size: tuple[int, int]) -> bytes:
+            buf = io.BytesIO()
+            Image.new("RGB", size, (9, 9, 9)).save(buf, format="PNG")
+            return buf.getvalue()
+
+        assert pixel_digest(png((2, 3))) != pixel_digest(png((3, 2)))
+
+    def test_one_clean_copy_per_picture_is_a_constraint(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from sqlalchemy.exc import IntegrityError
+
+        clean = _seed(db_session, store, 1)
+        with pytest.raises(IntegrityError):
+            register_public_object(
+                db_session,
+                sha256="b" * 64,
+                kind="sanitized",
+                mime="image/png",
+                size=1,
+                width=1,
+                height=1,
+                storage_key="derived/b",
+                pixel_sha256=clean.pixel_sha256,
+            )
+
     def test_the_digest_is_taken_after_exif_orientation(self) -> None:
         arr = np.zeros((20, 10, 3), dtype=np.uint8)
         arr[:5] = (200, 10, 10)
@@ -693,19 +722,21 @@ class TestPixelDigest:
         clean = _seed(db_session, store, 1)
         assert clean.pixel_sha256 == pixel_digest(_photo((41, 30, 90), seed=1))
 
-    def test_a_clean_copy_cannot_be_registered_without_its_digest(
-        self, db_session: Session
+    @pytest.mark.parametrize(("kind", "digest"), [("sanitized", None), ("mask", "d" * 64)])
+    def test_only_a_clean_copy_carries_a_digest(
+        self, db_session: Session, kind: str, digest: str | None
     ) -> None:
         with pytest.raises(ValueError, match="pixel digest"):
             register_public_object(
                 db_session,
                 sha256="a" * 64,
-                kind="sanitized",
+                kind=kind,
                 mime="image/png",
                 size=1,
                 width=1,
                 height=1,
                 storage_key="derived/x",
+                pixel_sha256=digest,
             )
 
 

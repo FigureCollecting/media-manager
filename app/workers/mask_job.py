@@ -11,8 +11,9 @@ IDEMPOTENT. A clean image is selected only while it has no image_masks row
 at the current MASK_PIPELINE_VERSION, so a re-run is a no-op and a version
 bump selects everything again (the old masks stay addressable). Mask bytes
 are content-addressed, so two images with the same mask share one object.
-So are clean copies: one shared by pixel-identical captures is judged over
-every image behind it (app.publication) and waits while any is soft-deleted.
+Clean copies are keyed on their pixels: one shared by every capture of a
+picture is judged over every image behind it (app.publication) and waits
+while any is soft-deleted.
 
 RESUMABLE. Each clean image is settled in its own transaction -- its object
 written first, then its row, its public registration and the batch's cursor
