@@ -44,14 +44,6 @@ class Settings(BaseSettings):
         "https://figurecollecting.com",
     ]
 
-    # The public derivative origin (app.derivative_main): the app origins
-    # that may read /d/<sha256> bytes cross-origin (the service worker caches
-    # them; the case view composites a mask over its derivative). fc-infra
-    # edge README "The public image address (ADDR-1)". Env MEDIA_CORS_ORIGINS
-    # as a JSON list; a canary origin is added by its deployment's env, never
-    # by default.
-    media_cors_origins: list[str] = ["https://figurecollecting.com"]
-
     # MASK-1 store masks (app.workers.mask_policy). MASK-G, Ross 2026-10-12
     # (option b): cut-out masks for EVERY store's listing photos, revocable
     # per store. MASK_STORE_GRANTS registers the store sources: per source,
