@@ -1,5 +1,4 @@
-"""MASK-1: the public object registry (and the images behind each clean copy),
-mask results and mask batches.
+"""MASK-1: public objects and the images behind them, mask results, mask batches.
 
 Revision ID: 0004_add_mask_lane
 Revises: 0003_add_matte_grounding_fields
