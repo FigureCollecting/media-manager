@@ -532,16 +532,17 @@ class TestNotFound:
         store: LocalObjectStore,
         image_id: int,
         derived_from: int | None,
+        version_no: int = 3,
     ) -> str:
         out = io.BytesIO()
-        Image.new("RGBA", (40, 60), (31, 30, 90, 255)).save(out, format="PNG")
+        Image.new("RGBA", (40, 60), (31, 30, 90, version_no)).save(out, format="PNG")
         data = out.getvalue()
         sha = hashlib.sha256(data).hexdigest()
         key = derived_key(sha, "image/png")
         store.put(key, data, "image/png")
         version = ImageVersion(
             image_id=image_id,
-            version_no=3,
+            version_no=version_no,
             derived_from_version=derived_from,
             transform_spec={"derive_kind": "matted"},
             mime="image/png",
@@ -630,6 +631,45 @@ class TestNotFound:
         )
         image = _source_image(db_session, clean.sha256)
         sha = self._register_matted(db_session, store, image.id, derived_from)
+        self._assert_404(client.get(f"/d/{sha}"))
+
+    def test_a_cut_out_of_a_cut_out_is_not_served(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        clean = seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=ITEM.format(n=7), source="mfc")],
+            figure_id="mfc:7",
+        )
+        image = _source_image(db_session, clean.sha256)
+        first = self._register_matted(db_session, store, image.id, 2)
+        assert client.get(f"/d/{first}").status_code == 200
+        second = self._register_matted(db_session, store, image.id, 3, version_no=4)
+        self._assert_404(client.get(f"/d/{second}"))
+
+    def test_a_cut_out_is_judged_over_its_own_images_clean_copy(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Two pictures, each with its version 2 clean copy: a cut-out of the
+        collector's photo is judged over the photo's copy, not the item's."""
+        seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=ITEM.format(n=7), source="mfc")],
+            figure_id="mfc:7",
+        )
+        photo = seed_clean_image(
+            db_session,
+            store,
+            _photo(8),
+            origins=[ImageOrigin(url=PICTURE, source="mfc")],
+            figure_id="mfc:8",
+        )
+        image = _source_image(db_session, photo.sha256)
+        sha = self._register_matted(db_session, store, image.id, 2)
         self._assert_404(client.get(f"/d/{sha}"))
 
     @pytest.mark.parametrize("deleted", ["matted", "clean"])

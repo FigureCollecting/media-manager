@@ -15,7 +15,10 @@ capture of the same picture linked to it by its pixel digest
   A mask shared by several clean copies (different pictures, the same mask)
   stays while any of them qualifies.
 - a ``matted`` cut-out is our derivative work on the picture, like a mask,
-  so it is judged like a mask's clean copy: live AND mask-eligible. Nothing
+  so it is judged over the clean copy it was cut from (its version's
+  ``derived_from_version``): served while its own version is live and that
+  copy may carry a mask -- live AND mask-eligible over every image behind
+  it. One not cut from a registered clean copy is never served. Nothing
   registers one yet; the rule is here so that whatever does cannot skip the
   per-source permission split.
 
@@ -112,6 +115,28 @@ def mask_refusal(
     return None if verdict.eligible else verdict.reason
 
 
+def cut_from(db: Session, sha256: str) -> str | None:
+    """The clean copy the derivative ``sha256`` was cut from: the registered
+    clean copy of the version its own version derives from (same image).
+    None while its version is soft-deleted or derives from no clean copy."""
+    own = db.execute(
+        select(ImageVersion.image_id, ImageVersion.derived_from_version)
+        .join(PublicObject, PublicObject.image_version_id == ImageVersion.id)
+        .where(PublicObject.sha256 == sha256, ImageVersion.deleted_at.is_(None))
+    ).one_or_none()
+    if own is None:
+        return None
+    return db.execute(
+        select(PublicObject.sha256)
+        .join(ImageVersion, ImageVersion.id == PublicObject.image_version_id)
+        .where(
+            ImageVersion.image_id == own.image_id,
+            ImageVersion.version_no == own.derived_from_version,
+            PublicObject.kind == "sanitized",
+        )
+    ).scalar_one_or_none()
+
+
 def servable(db: Session, obj: PublicObject, store_grants: StoreGrants | None = None) -> bool:
     if obj.kind == "mask":
         sources = db.execute(
@@ -122,6 +147,8 @@ def servable(db: Session, obj: PublicObject, store_grants: StoreGrants | None = 
         return any(mask_refusal(db, s, store_grants) is None for s in sources)
     if obj.kind == "sanitized":
         return images_behind(db, obj.sha256) is not None
-    # 'matted' -- and any kind not named above -- is derivative work: live
-    # and mask-eligible, like a mask's clean copy.
-    return mask_refusal(db, obj.sha256, store_grants) is None
+    # 'matted' -- and any kind not named above -- is derivative work cut from
+    # a clean copy: served while its own version is live and that copy may
+    # carry a mask, judged over every image behind it.
+    source = cut_from(db, obj.sha256)
+    return source is not None and mask_refusal(db, source, store_grants) is None
