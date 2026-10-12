@@ -14,8 +14,11 @@ confident base pixels BiRefNet missed is used. Finally any blob not connected
 to the figure is dropped -- from BiRefNet's own answer too.
 
 THE BLACK-DRESS CASE. A pass like this can keep a dark studio floor along
-with a dark base; the mask lane's quality gate (app.workers.mask:
-bottom_edge_bleed, full_frame) holds such a mask instead of publishing it.
+with a dark base. The mask lane's quality gate (app.workers.mask) holds a
+mask that kept such a floor ALONG THE BOTTOM EDGE (a row of the bottom band
+at least 85 % opaque, ``bottom_edge_bleed``) or that covers the frame
+(``full_frame``); a kept floor that stops short of the bottom edge, or is
+patchier than that, is not detected and would be published.
 """
 
 from __future__ import annotations

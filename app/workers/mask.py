@@ -22,11 +22,17 @@ coordinator must describe the image "as THIS caller is shown it" and a
 ``no_mask`` display restriction withholds the mask (catalog.proto DISPLAY
 RESTRICTIONS). The lane never decides who sees what; it only stores both.
 
-THE QUALITY GATE. A mask that removed (almost) nothing, or that kept the
-backdrop's floor edge to edge -- the July black-dress-on-black-marble failure
-(fc-design-assets/madoka-matte-basekept.png) -- is HELD: computed and kept
-for review, never published. A mask with nothing opaque is EMPTY and nothing
-is stored. Only an ``ok`` mask is ever addressable.
+THE QUALITY GATE. A mask that removed (almost) nothing (``full_frame``), or
+that kept the backdrop's floor (``bottom_edge_bleed``: see _kept_floor) is
+HELD: computed and kept for review, never published. The floor case is the
+black-dress-on-black-marble failure the base-keep pass can produce; it is
+reproduced synthetically by the sample's ``madoka-black-dress`` entry. (The
+July file fc-design-assets/madoka-matte-basekept.png is NOT that failure:
+measured 2026-10-11 its alpha covers 34 % of the frame and its lowest row is
+41 rows above the bottom edge.) The gate catches a floor kept ALONG THE
+BOTTOM EDGE; a floor that stops short of the edge, or that is under 85 %
+opaque on every row of the band, is not detected. A mask with nothing opaque
+is EMPTY and nothing is stored. Only an ``ok`` mask is ever addressable.
 """
 
 from __future__ import annotations
@@ -40,7 +46,12 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .derivatives import compute_dominant_color, compute_thumbhash
-from .grounding import ALPHA_THRESHOLD, AlphaGrounding, measure_alpha_grounding
+from .grounding import (
+    ALPHA_THRESHOLD,
+    AlphaGrounding,
+    _round_half_up,
+    measure_alpha_grounding,
+)
 from .matting import MattingBackend, get_matting_backend
 
 #: Bump when the mask algorithm or its encoding changes: a new version mints
@@ -54,9 +65,18 @@ MASK_MIME = "image/png"
 #: nothing: held for review rather than published.
 FULL_FRAME_COVERAGE = 0.97
 
-#: A mask that reaches the image's last row with a contact band at least
-#: this wide kept the floor edge to edge (the black-dress failure): held.
-BOTTOM_BLEED_WIDTH_FRAC = 0.98
+#: The floor band: the last FLOOR_BAND_FRAC of the image's rows (at least
+#: FLOOR_MIN_ROWS) ending at the mask's lowest opaque row.
+FLOOR_BAND_FRAC = 0.02
+#: The band counts as on the bottom edge when its lowest row is within
+#: FLOOR_EDGE_FRAC of the height (at least FLOOR_MIN_ROWS rows) of the edge:
+#: a JPEG edge or a vignette may leave the last rows clear.
+FLOOR_EDGE_FRAC = 0.01
+FLOOR_MIN_ROWS = 2
+#: A band row at least this opaque (as a share of the image width) is floor.
+#: Measured 2026-10-11 on the seven July figures: the real masks reaching the
+#: bottom edge are at most 73 % opaque on any row of the band.
+FLOOR_ROW_COVERAGE = 0.85
 
 MaskStatus = Literal["ok", "held", "empty"]
 
@@ -130,19 +150,34 @@ def composite_with_mask(clean: Image.Image, alpha: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, mode="RGBA")
 
 
+def _rows(height: int, frac: float) -> int:
+    return max(FLOOR_MIN_ROWS, _round_half_up(height * frac))
+
+
+def _kept_floor(opaque: np.ndarray) -> bool:
+    """Whether the mask kept a floor: its lowest opaque row is on (or within
+    the edge tolerance of) the bottom edge, and some row of the band ending
+    there is at least FLOOR_ROW_COVERAGE opaque. Coverage, not the opaque
+    extent, so a floor short of the side edges and a narrow image are judged
+    alike; a figure's base reaching the edge is much narrower than its frame."""
+    height = opaque.shape[0]
+    last = int(np.nonzero(opaque.any(axis=1))[0][-1])
+    if height - 1 - last > _rows(height, FLOOR_EDGE_FRAC):
+        return False
+    band = opaque[max(0, last - _rows(height, FLOOR_BAND_FRAC) + 1) : last + 1]
+    return float(band.mean(axis=1).max()) >= FLOOR_ROW_COVERAGE
+
+
 def assess_mask_quality(
     alpha: np.ndarray, grounding: AlphaGrounding | None
 ) -> tuple[MaskStatus, str | None]:
     """``("ok", None)``, ``("held", reason)`` or ``("empty", reason)``."""
     if grounding is None:
         return "empty", "no_opaque_pixels"
-    coverage = float(np.mean(alpha > ALPHA_THRESHOLD))
-    if coverage >= FULL_FRAME_COVERAGE:
+    opaque = alpha > ALPHA_THRESHOLD
+    if float(np.mean(opaque)) >= FULL_FRAME_COVERAGE:
         return "held", "full_frame"
-    if (
-        grounding.bottom_margin_frac == 0
-        and grounding.contact_band_width_frac >= BOTTOM_BLEED_WIDTH_FRAC
-    ):
+    if _kept_floor(opaque):
         return "held", "bottom_edge_bleed"
     return "ok", None
 

@@ -348,9 +348,10 @@ class TestAssessMaskQuality:
         assert assess_mask_quality(alpha, g) == ("held", "full_frame")
 
     def test_coverage_just_under_the_full_frame_line_is_not_held_for_it(self) -> None:
-        alpha = np.zeros((10, 100), dtype=np.uint8)
-        alpha[:, : int(FULL_FRAME_COVERAGE * 100) - 1] = 255
-        alpha[-1, :] = 0  # lift it off the bottom edge so no bleed either
+        alpha = np.zeros((100, 100), dtype=np.uint8)
+        alpha[: int(FULL_FRAME_COVERAGE * 100), :] = 255
+        alpha[0, 0] = 0  # one pixel under the line
+        # three clear rows below it (the edge tolerance is two): no floor either
         g = measure_alpha_grounding(alpha)
         assert assess_mask_quality(alpha, g) == ("ok", None)
 
@@ -455,6 +456,11 @@ class TestAKeptFloorIsHeld:
         # h=40: the last row is 60 % opaque, the one above it 95 %
         alpha = _with_floor(_standing(40, 40), rows=1, clear_below=1, cols=slice(0, 38))
         alpha = _with_floor(alpha, rows=1, cols=slice(0, 24))
+        assert _gate(alpha) == ("held", "bottom_edge_bleed")
+
+    def test_the_band_of_a_three_row_image_stops_at_its_top_edge(self) -> None:
+        alpha = np.zeros((3, 10), dtype=np.uint8)
+        alpha[0, :] = 255  # within two rows of the bottom edge, band rows 0..0
         assert _gate(alpha) == ("held", "bottom_edge_bleed")
 
     def test_a_base_reaching_the_bottom_edge_is_not_a_floor(self) -> None:
