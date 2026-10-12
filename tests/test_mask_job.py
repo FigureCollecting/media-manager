@@ -1836,7 +1836,8 @@ class TestStoreRevocation:
         assert sorted(report["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
 
     @pytest.mark.parametrize(
-        ("value", "revoked"), [('["shop"]', ["shop"]), ('["shop", "other"]', ["shop", "other"])]
+        ("value", "revoked"),
+        [('["shop"]', ["shop"]), ('["shop", "other"]', ["shop", "other"]), ("[]", [])],
     )
     def test_the_runbooks_environment_form_is_a_json_list(
         self, monkeypatch: pytest.MonkeyPatch, value: str, revoked: list[str]
@@ -1846,12 +1847,13 @@ class TestStoreRevocation:
         monkeypatch.setenv("MASK_STORE_REVOKED", value)
         assert Settings().mask_store_revoked == revoked
 
-    @pytest.mark.parametrize("value", ["shop", "shop,other"])
-    def test_a_bare_or_comma_separated_revocation_stops_the_service_loudly(
+    @pytest.mark.parametrize("value", ["shop", "shop,other", ""])
+    def test_a_bare_comma_separated_or_empty_revocation_stops_the_service_loudly(
         self, monkeypatch: pytest.MonkeyPatch, value: str
     ) -> None:
         """Never read as an empty or a wrong deny list: the settings refuse to
-        load (README runbook)."""
+        load (README runbook). An empty value is no way to lift the last
+        revocation: remove the variable or write '[]'."""
         from app.config import Settings
         from pydantic_settings import SettingsError
 
