@@ -18,8 +18,9 @@ address here. The one overlap is an original whose bytes ARE one of our
 clean copies (that copy captured again): it is linked behind the copy by its
 pixels and judged with it. A registered object is served
 only while app.publication.servable says so: a soft-deleted image or
-version, a withdrawn mask, or a mask whose image is no longer
-mask-eligible is a 404. The bytes are re-hashed before they
+version, a withdrawn mask, a mask whose image is no longer mask-eligible,
+or a mask of a revoked store (MASK-G, from the moment the revocation is
+committed) is a 404. The bytes are re-hashed before they
 are sent: content cached forever on phones must be exactly what its address
 names, and a store that returns anything else is a 500 that is never cached.
 
@@ -53,7 +54,7 @@ from .config import Settings, get_settings
 from .db import get_db
 from .models import PublicObject
 from .object_store import ObjectStore, S3ObjectStore
-from .publication import servable
+from .publication import servable, store_revocations
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,12 @@ def derivative(
 ) -> Response:
     try:
         obj = db.get(PublicObject, sha256)
-        live = obj is not None and servable(db, obj, settings.mask_store_grants)
+        live = obj is not None and servable(
+            db,
+            obj,
+            settings.mask_store_grants,
+            store_revocations(db, settings.mask_store_revoked),
+        )
     except Exception as exc:
         logger.error("derivative_unjudged", extra={"sha256": sha256, "error": type(exc).__name__})
         return _bare(500)

@@ -744,10 +744,14 @@ class TestNotFound:
             origins=[ImageOrigin(url="https://img.shop.example/p/3.jpg", source="shop")],
             figure_id="shop:3",
         )
+        arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
+        arr[5:55, 6:34] = (20, 120, 30)  # another silhouette: another mask
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
         item = seed_clean_image(
             db,
             store,
-            _photo(4),
+            buf.getvalue(),
             origins=[ImageOrigin(url=ITEM.format(n=4), source="mfc")],
             figure_id="mfc:4",
         )

@@ -14,6 +14,7 @@ import hashlib
 import io
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -949,6 +950,22 @@ class TestCapturesKeyedOnPixels:
         assert (row.status, row.reason) == ("withdrawn", "deleted")
 
 
+def _image_of(db: Session, clean_sha: str) -> int:
+    from app.models import ImageVersion
+
+    clean = db.get(PublicObject, clean_sha)
+    assert clean is not None
+    version = db.get(ImageVersion, clean.image_version_id)
+    assert version is not None
+    return version.image_id
+
+
+def revoke_store_applied(db: Session, source: str) -> dict[str, Any]:
+    from app.workers.mask_job import revoke_store
+
+    return revoke_store(db, source, dry_run=False)
+
+
 SHOP = "https://img.shop.example/p/{n}.jpg"
 OTHER = "https://cdn.other.example/p/{n}.jpg"
 
@@ -1068,6 +1085,76 @@ class TestStoreRevocation:
         assert report["reevaluate"]["withdrawn"] == [row.source_sha256]
         assert self._status(db_session)[row.source_sha256] == ("withdrawn", "store_revoked")
 
+    def test_revoke_judges_only_live_origins_of_the_source(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """A copy whose ``shop`` origin was soft-deleted is no longer a shop
+        mask: revoke-store leaves its row alone, even though a full
+        re-evaluation would withdraw it (it also gained a collector's photo)."""
+        import datetime as dt
+
+        shas = self._settle_all(db_session, store)
+        image_id = _image_of(db_session, shas["other"])
+        db_session.add_all(
+            [
+                FigureGallery(
+                    figure_id="shop:7",
+                    source_url=SHOP.format(n=7),
+                    image_id=image_id,
+                    source="shop",
+                    deleted_at=dt.datetime.now(dt.UTC),
+                ),
+                FigureGallery(figure_id="mfc:7", source_url=PICTURE.format(n=7), image_id=image_id),
+            ]
+        )
+        db_session.commit()
+        report = revoke_store_applied(db_session, "shop")
+        assert shas["other"] not in report["reevaluate"]["withdrawn"]
+        assert self._status(db_session)[shas["other"]] == ("ok", None)
+
+    def test_revoke_finds_a_copy_by_its_own_image_without_a_link_row(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        shas = self._settle_all(db_session, store)
+        link = db_session.get(
+            PublicObjectImage, (shas["shop1"], _image_of(db_session, shas["shop1"]))
+        )
+        assert link is not None
+        db_session.delete(link)
+        db_session.commit()
+        report = revoke_store_applied(db_session, "shop")
+        assert shas["shop1"] in report["reevaluate"]["withdrawn"]
+
+    def test_revoke_matches_the_source_as_the_policy_does(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A source registered and recorded as ``SHOP`` is the source
+        ``revoke-store shop`` names: the origin refuses it, and its row is
+        withdrawn too."""
+        import json
+
+        from app.config import get_settings
+
+        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"SHOP": ["shop.example"]}))
+        get_settings.cache_clear()
+        sha = self._seed(db_session, store, 1, SHOP, "SHOP")
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert self._status(db_session)[sha] == ("ok", None)
+        report = revoke_store_applied(db_session, "shop")
+        assert report["reevaluate"]["withdrawn"] == [sha]
+
+    def test_a_plain_reevaluation_honours_a_persisted_revocation(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import MaskStoreRevocation
+        from app.workers.mask_job import reevaluate_masks
+
+        shas = self._settle_all(db_session, store)
+        db_session.add(MaskStoreRevocation(source="shop"))
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False)
+        assert sorted(report["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+
     def test_a_revoked_store_gets_no_new_masks(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
@@ -1125,6 +1212,18 @@ class TestStoreRevocation:
             next(r.batch_id for r in _masks(db_session) if r.source_sha256 == shas["photo"])
             == photo_batch
         )
+
+    def test_restoring_a_store_that_was_never_revoked_changes_nothing(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import restore_store
+
+        shas = self._settle_all(db_session, store)
+        before = self._status(db_session)
+        report = restore_store(db_session, store, "shop", dry_run=False, backend=_Model())
+        assert (report["reevaluate"]["restored"], report["batch"]["items"]) == ([], [])
+        assert self._status(db_session) == before
+        assert before[shas["shop1"]] == ("ok", None)
 
     def test_restore_refuses_a_backend_that_is_not_a_mask_model_before_changing_anything(
         self, db_session: Session, store: LocalObjectStore

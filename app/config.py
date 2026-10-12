@@ -52,12 +52,20 @@ class Settings(BaseSettings):
     # by default.
     media_cors_origins: list[str] = ["https://figurecollecting.com"]
 
-    # MASK-1 per-source mask grants (app.workers.mask_policy): per source, the
-    # domains (subdomains included) whose listing photos may get a mask. Env
-    # MASK_STORE_GRANTS as a JSON object, e.g. {"amiami": ["amiami.com"]}.
-    # None by default: MFC item-main images are the only maskable origin
-    # until a store is granted by name.
+    # MASK-1 store masks (app.workers.mask_policy). MASK-G, Ross 2026-10-12
+    # (option b): cut-out masks for EVERY store's listing photos, revocable
+    # per store. MASK_STORE_GRANTS registers the store sources: per source,
+    # the domains (subdomains included) its listing photos come from -- the
+    # spine's source.domains for that retailer. Every registered source is
+    # granted; there is no per-store opt-in. Env as a JSON object, e.g.
+    # {"amiami": ["amiami.com"]}. Empty here: no store's images reach
+    # media-manager yet (gallery ingest records source "mfc" only).
     mask_store_grants: dict[str, list[str]] = {}
+    # The per-source deny list that wins over any grant (MFC included):
+    # MASK_STORE_REVOKED as a JSON list, plus what `masks revoke-store`
+    # persists at run time (mask_store_revocations). README runbook "A store
+    # asks for its cut-outs to be removed".
+    mask_store_revoked: list[str] = []
 
     # Rate limiting
     rate_limit_per_minute: int = 120

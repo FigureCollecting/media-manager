@@ -7,12 +7,15 @@ that represents the ITEM, and only where its source permits it:
   ``/upload/items/`` (or the item image endpoint) get a mask; a collector's
   own photo (``/upload/pictures/``) never does -- it may still be shown,
   unmasked, wherever display allows it.
-- A store's listing photo gets a mask only when its source holds a MASK
-  GRANT for the host the bytes came from (``Settings.mask_store_grants``,
-  env ``MASK_STORE_GRANTS`` = ``{"<source>": ["<domain>", ...]}``, a domain
-  covering its subdomains). None is granted by default: this is the
-  per-source permission split, and granting a store is a decision about that
-  store's imagery, made by name.
+- A store's listing photo gets a mask when its source is a REGISTERED store
+  source and the bytes came from one of its domains
+  (``Settings.mask_store_grants``, env ``MASK_STORE_GRANTS`` =
+  ``{"<source>": ["<domain>", ...]}``, a domain covering its subdomains).
+  MASK-G (Ross 2026-10-12, option b): every registered store source is
+  granted -- cut-outs for every store, no per-store opt-in -- and revocable
+  per store: a source on the deny list (``MASK_STORE_REVOKED`` plus the
+  revocations ``masks revoke-store`` persists) is refused whatever its grant,
+  MFC included (``store_revoked``).
 
 Display itself is not decided here: the spine's rights gate and the
 coordinator's display restrictions own that.
@@ -24,7 +27,8 @@ bytes were captured from separates the two lanes. media-manager records an
 origin as (source, url) only (``figure_galleries``), so that is all this
 policy reads.
 
-FAIL CLOSED. No mask for: an ungranted source or host (``not_granted``); an
+FAIL CLOSED. No mask for: a revoked source (``store_revoked``); an
+unregistered source or a host outside its domains (``not_granted``); an
 MFC URL that matches neither rule, an MFC host recorded under another source
 or an ``mfc`` row on another host, a URL carrying credentials or a
 backslash, a host that is not a plain ASCII name (whitespace, a percent
@@ -47,14 +51,23 @@ from typing import Literal
 from urllib.parse import parse_qs, unquote, urlsplit
 
 OriginClass = Literal[
-    "item_main", "store_listing", "user_photo", "not_granted", "unknown_origin", "no_origin"
+    "item_main",
+    "store_listing",
+    "user_photo",
+    "store_revoked",
+    "not_granted",
+    "unknown_origin",
+    "no_origin",
 ]
 
 #: The origin classes a mask may be made for.
 MASKABLE: frozenset[str] = frozenset({"item_main", "store_listing"})
 
-#: Per source, the domains its listing photos may be masked from.
+#: Per registered store source, the domains its listing photos come from.
 StoreGrants = Mapping[str, Sequence[str]]
+
+#: The revoked sources, as ``source_key`` names.
+Revoked = frozenset[str]
 
 MFC_SOURCE = "mfc"
 _MFC_DOMAIN = "myfigurecollection.net"
@@ -87,6 +100,11 @@ def _domain(name: str) -> str:
     return name.strip().lower().rstrip(".")
 
 
+def source_key(name: str) -> str:
+    """A source as the deny list compares it: stripped, lower-cased."""
+    return name.strip().lower()
+
+
 def _within(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
@@ -112,10 +130,25 @@ def configured_store_grants() -> StoreGrants:
     return get_settings().mask_store_grants
 
 
-def classify_origin(origin: ImageOrigin, store_grants: StoreGrants | None = None) -> OriginClass:
-    """``store_grants`` defaults to the configured grants."""
+def configured_revocations() -> Revoked:
+    """MASK_STORE_REVOKED alone; app.publication.store_revocations adds the
+    persisted revocations."""
+    from ..config import get_settings
+
+    return frozenset(source_key(s) for s in get_settings().mask_store_revoked)
+
+
+def classify_origin(
+    origin: ImageOrigin, store_grants: StoreGrants | None = None, revoked: Revoked | None = None
+) -> OriginClass:
+    """``store_grants`` defaults to the configured grants and ``revoked`` to
+    the configured deny list."""
     if not origin.url:
         return "no_origin"
+    if source_key(origin.source or "") in (
+        configured_revocations() if revoked is None else revoked
+    ):
+        return "store_revoked"
     try:
         parts = urlsplit(origin.url)
         parts.port  # noqa: B018 -- raises on a port that is not one
@@ -144,11 +177,13 @@ def classify_origin(origin: ImageOrigin, store_grants: StoreGrants | None = None
 
 
 def mask_eligibility(
-    origins: Sequence[ImageOrigin], store_grants: StoreGrants | None = None
+    origins: Sequence[ImageOrigin],
+    store_grants: StoreGrants | None = None,
+    revoked: Revoked | None = None,
 ) -> MaskEligibility:
     if not origins:
         return MaskEligibility(eligible=False, origin_class="no_origin", reason="no_origin")
-    classes = [classify_origin(o, store_grants) for o in origins]
+    classes = [classify_origin(o, store_grants, revoked) for o in origins]
     for cls in classes:
         if cls not in MASKABLE:
             return MaskEligibility(eligible=False, origin_class=cls, reason=cls)

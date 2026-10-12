@@ -33,8 +33,11 @@ that remains.
 
 So soft-deleting an image or a version revokes its derivative and its masks;
 a mask also goes offline the moment any image behind it gains an ineligible
-origin (a collector's photo) or every origin is gone, and stays offline
-until ``reevaluate_masks`` restores its row (app.workers.mask_job).
+origin (a collector's photo) or every origin is gone, or a source of one of
+its origins is revoked (MASK-G: ``store_revocations``, read on every
+request), and stays offline until ``reevaluate_masks`` restores its row
+(app.workers.mask_job). A revocation never touches a clean copy: display is
+not decided here.
 
 What a phone already cached under the immutable address cannot be recalled.
 Nor, yet, can an edge copy: a 200 is ``public, max-age=31536000, immutable``
@@ -46,12 +49,38 @@ follow-up, not done here.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import FigureGallery, ImageMask, ImageVersion, PublicObject, PublicObjectImage
+from .models import (
+    FigureGallery,
+    ImageMask,
+    ImageVersion,
+    MaskStoreRevocation,
+    PublicObject,
+    PublicObjectImage,
+)
 from .models import Image as ImageModel
-from .workers.mask_policy import ImageOrigin, StoreGrants, mask_eligibility
+from .workers.mask_policy import (
+    ImageOrigin,
+    Revoked,
+    StoreGrants,
+    configured_revocations,
+    mask_eligibility,
+    source_key,
+)
+
+
+def store_revocations(db: Session, configured: Iterable[str] | None = None) -> Revoked:
+    """Every revoked source (MASK-G): MASK_STORE_REVOKED -- or ``configured``,
+    the origin's own settings -- plus every revocation ``masks revoke-store``
+    persisted. Read on every judgment, so a revocation takes effect at the
+    origin the moment it is committed."""
+    names = configured_revocations() if configured is None else frozenset(configured)
+    persisted = db.execute(select(MaskStoreRevocation.source)).scalars()
+    return frozenset(source_key(s) for s in (*names, *persisted))
 
 
 def gallery_origins(db: Session, image_id: int) -> list[ImageOrigin]:
@@ -104,14 +133,20 @@ def judged_origins(db: Session, sha256: str) -> list[ImageOrigin] | None:
 
 
 def mask_refusal(
-    db: Session, source_sha256: str, store_grants: StoreGrants | None = None
+    db: Session,
+    source_sha256: str,
+    store_grants: StoreGrants | None = None,
+    revoked: Revoked | None = None,
 ) -> str | None:
     """None while the clean copy ``source_sha256`` may carry a published
-    mask; otherwise why not: ``deleted`` or the eligibility refusal."""
+    mask; otherwise why not: ``deleted`` or the eligibility refusal.
+    ``revoked`` defaults to ``store_revocations(db)``."""
     origins = judged_origins(db, source_sha256)
     if origins is None:
         return "deleted"
-    verdict = mask_eligibility(origins, store_grants)
+    if revoked is None:
+        revoked = store_revocations(db)
+    verdict = mask_eligibility(origins, store_grants, revoked)
     return None if verdict.eligible else verdict.reason
 
 
@@ -137,18 +172,25 @@ def cut_from(db: Session, sha256: str) -> str | None:
     ).scalar_one_or_none()
 
 
-def servable(db: Session, obj: PublicObject, store_grants: StoreGrants | None = None) -> bool:
+def servable(
+    db: Session,
+    obj: PublicObject,
+    store_grants: StoreGrants | None = None,
+    revoked: Revoked | None = None,
+) -> bool:
+    """Whether ``obj`` may be served now. ``revoked`` defaults to
+    ``store_revocations(db)``, read per judgment."""
+    if obj.kind == "sanitized":
+        return images_behind(db, obj.sha256) is not None
     if obj.kind == "mask":
         sources = db.execute(
             select(ImageMask.source_sha256).where(
                 ImageMask.mask_sha256 == obj.sha256, ImageMask.status == "ok"
             )
         ).scalars()
-        return any(mask_refusal(db, s, store_grants) is None for s in sources)
-    if obj.kind == "sanitized":
-        return images_behind(db, obj.sha256) is not None
+        return any(mask_refusal(db, s, store_grants, revoked) is None for s in sources)
     # 'matted' -- and any kind not named above -- is derivative work cut from
     # a clean copy: served while its own version is live and that copy may
     # carry a mask, judged over every image behind it.
     source = cut_from(db, obj.sha256)
-    return source is not None and mask_refusal(db, source, store_grants) is None
+    return source is not None and mask_refusal(db, source, store_grants, revoked) is None

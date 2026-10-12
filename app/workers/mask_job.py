@@ -45,16 +45,24 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, func, select, union
 from sqlalchemy.orm import Session
 
+from ..models import (
+    FigureGallery,
+    ImageMask,
+    ImageVersion,
+    MaskBatch,
+    MaskStoreRevocation,
+    PublicObject,
+    PublicObjectImage,
+)
 from ..models import Image as ImageModel
-from ..models import ImageMask, ImageVersion, MaskBatch, PublicObject, PublicObjectImage
 from ..object_store import ObjectStore, derived_key
-from ..publication import judged_origins, mask_refusal
+from ..publication import judged_origins, mask_refusal, store_revocations
 from .grounding import AlphaGrounding
 from .mask import MASK_MIME, MASK_PIPELINE_VERSION, MaskOutcome, build_mask_artifact
-from .mask_policy import StoreGrants, mask_eligibility
+from .mask_policy import Revoked, StoreGrants, configured_revocations, mask_eligibility, source_key
 from .mask_seed import register_public_object
 from .matting import MattingBackend, get_matting_backend
 
@@ -100,8 +108,34 @@ class _Refused(Exception):
     """A per-image refusal whose reason is safe to record verbatim."""
 
 
+def _of_source(source: str) -> Select[tuple[str]]:
+    """The clean copies with an image behind them -- its own or a linked
+    capture -- that holds a live origin of ``source`` (as ``source_key``)."""
+    of_source = (
+        func.lower(func.trim(FigureGallery.source)) == source,
+        FigureGallery.deleted_at.is_(None),
+    )
+    linked = (
+        select(PublicObjectImage.sha256)
+        .join(FigureGallery, FigureGallery.image_id == PublicObjectImage.image_id)
+        .where(*of_source)
+    )
+    owned = (
+        select(PublicObject.sha256)
+        .join(ImageVersion, ImageVersion.id == PublicObject.image_version_id)
+        .join(FigureGallery, FigureGallery.image_id == ImageVersion.image_id)
+        .where(*of_source)
+    )
+    return select(union(linked, owned).subquery().c[0])
+
+
 def _candidates(
-    db: Session, *, after: str | None, page_size: int, redrive: tuple[str, ...]
+    db: Session,
+    *,
+    after: str | None,
+    page_size: int,
+    redrive: tuple[str, ...],
+    source: str | None = None,
 ) -> list[PublicObject]:
     settled = select(ImageMask.source_sha256).where(
         ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
@@ -130,6 +164,8 @@ def _candidates(
     )
     if after is not None:
         query = query.where(PublicObject.sha256 > after)
+    if source is not None:
+        query = query.where(PublicObject.sha256.in_(_of_source(source)))
     return list(db.execute(query).scalars())
 
 
@@ -209,9 +245,11 @@ def _settle(
     obj: PublicObject,
     backend: MattingBackend,
     batch: MaskBatch | None,
+    revoked: Revoked | None = None,
 ) -> ItemReport:
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
-    written then, the report is the whole result."""
+    written then, the report is the whole result. ``revoked`` defaults to
+    the revocations as they stand when this image is judged."""
     sha = obj.sha256
     try:
         # Judged over every image behind the clean copy (app.publication).
@@ -221,7 +259,9 @@ def _settle(
             # as when it is deleted before selection, so a restore makes it
             # a candidate again for a plain batch.
             return ItemReport(sha, "skipped", "deleted", None)
-        eligibility = mask_eligibility(origins)
+        eligibility = mask_eligibility(
+            origins, revoked=store_revocations(db) if revoked is None else revoked
+        )
     except Exception as exc:
         # A judgment that raises is this image's failure, never the batch's.
         db.rollback()
@@ -344,11 +384,15 @@ def run_mask_batch(
     resume_batch_id: int | None = None,
     retry_failed: bool = False,
     recheck_ineligible: bool = False,
+    source: str | None = None,
+    revoked: Revoked | None = None,
 ) -> BatchReport:
     """Settle up to ``limit`` clean images that have no mask result yet --
     plus, on request, those whose result was ``failed`` (``retry_failed``) or
-    ``ineligible`` (``recheck_ineligible``: after a store is granted, or an
-    image's origins changed)."""
+    ``ineligible`` (``recheck_ineligible``: after a store is granted or
+    restored, or an image's origins changed). ``source`` limits the batch to
+    clean copies with a live origin of that source; ``revoked`` overrides
+    the revocations (``restore_store``'s dry run judges without its own)."""
     if resume_batch_id is not None and dry_run:
         raise ValueError("a dry run cannot resume a batch: it records nothing to resume")
     active = backend or get_matting_backend()
@@ -363,16 +407,17 @@ def run_mask_batch(
             limit = max(0, batch.item_limit - sum(batch.counts.values()))
 
     redrive = ("failed",) * retry_failed + ("ineligible",) * recheck_ineligible
+    key = None if source is None else source_key(source)
     report = BatchReport(batch_id=batch.id if batch else None, dry_run=dry_run)
     cursor = batch.cursor_sha256 if batch else None
     remaining = limit
     while remaining is None or remaining > 0:
         size = page_size if remaining is None else min(page_size, remaining)
-        page = _candidates(db, after=cursor, page_size=size, redrive=redrive)
+        page = _candidates(db, after=cursor, page_size=size, redrive=redrive, source=key)
         if not page:
             break
         for obj in page:
-            item = _settle(db, store, obj, active, batch)
+            item = _settle(db, store, obj, active, batch, revoked)
             report.items.append(item)
             report.counts[item.status] += 1
             cursor = obj.sha256
@@ -387,7 +432,12 @@ def run_mask_batch(
 
 
 def reevaluate_masks(
-    db: Session, *, dry_run: bool = True, store_grants: StoreGrants | None = None
+    db: Session,
+    *,
+    dry_run: bool = True,
+    store_grants: StoreGrants | None = None,
+    source: str | None = None,
+    revoked: Revoked | None = None,
 ) -> dict[str, Any]:
     """Withdraw every ``ok`` row whose clean image is deleted or no longer
     mask-eligible (reason: the refusal) and restore every ``withdrawn`` row
@@ -396,10 +446,13 @@ def reevaluate_masks(
     ``dry_run=False``; held, empty, ineligible and failed rows are never
     touched. Each change is committed on its own, and a row whose judgment
     raises is judged refused (reason: the exception's class) -- one bad row
-    never stops the rest."""
-    rows = db.execute(
-        select(ImageMask).where(ImageMask.status.in_(("ok", "withdrawn"))).order_by(ImageMask.id)
-    ).scalars()
+    never stops the rest. ``source`` judges only the rows of clean copies
+    with a live origin of that source -- nothing else is touched -- and
+    ``revoked`` overrides the revocations, as in ``run_mask_batch``."""
+    query = select(ImageMask).where(ImageMask.status.in_(("ok", "withdrawn")))
+    if source is not None:
+        query = query.where(ImageMask.source_sha256.in_(_of_source(source_key(source))))
+    rows = db.execute(query.order_by(ImageMask.id)).scalars()
     withdrawn: list[str] = []
     restored: list[str] = []
     unchanged = 0
@@ -407,7 +460,7 @@ def reevaluate_masks(
     for row in list(rows):
         sha = row.source_sha256
         try:
-            refusal = mask_refusal(db, sha, store_grants)
+            refusal = mask_refusal(db, sha, store_grants, revoked)
         except Exception as exc:
             db.rollback()
             refusal = type(exc).__name__
@@ -432,3 +485,68 @@ def reevaluate_masks(
         "restored": restored,
         "unchanged": unchanged,
     }
+
+
+def _named(source: str) -> str:
+    key = source_key(source)
+    if not key:
+        raise ValueError("no source named")
+    return key
+
+
+def revoke_store(db: Session, source: str, *, dry_run: bool = True) -> dict[str, Any]:
+    """MASK-G: revoke every mask of ``source`` (a store asks for its cut-outs
+    to be removed). Applied, the revocation is persisted and committed FIRST
+    -- from then on the origin refuses every mask of that source on every
+    request and no batch makes a new one -- and then every ``ok`` row of a
+    clean copy with a live origin of that source is withdrawn (reason
+    ``store_revoked``); no other row is judged. Idempotent. Dry run unless
+    ``dry_run=False``: it reports what would be withdrawn and writes nothing."""
+    key = _named(source)
+    if not dry_run and db.get(MaskStoreRevocation, key) is None:
+        db.add(MaskStoreRevocation(source=key))
+        db.commit()
+    revoked = store_revocations(db) | {key}
+    report = reevaluate_masks(db, dry_run=dry_run, source=key, revoked=revoked)
+    return {"source": key, "dry_run": dry_run, "reevaluate": report}
+
+
+def restore_store(
+    db: Session,
+    store: ObjectStore,
+    source: str,
+    *,
+    dry_run: bool = True,
+    backend: MattingBackend | None = None,
+) -> dict[str, Any]:
+    """MASK-G: lift a ``revoke_store``. Applied, the persisted revocation is
+    deleted, every withdrawn row of that source that qualifies again is
+    restored (``reevaluate_masks``), and that source's refused images are
+    re-checked (``run_mask_batch`` with ``recheck_ineligible``), so what was
+    captured while it was revoked gets its mask. Re-run it if interrupted.
+    Refused before anything changes: a backend that is not a mask model (on
+    apply), or a source revoked by MASK_STORE_REVOKED, which only the
+    deployment's environment lifts. Dry run unless ``dry_run=False``."""
+    key = _named(source)
+    if key in configured_revocations():
+        raise ValueError(f"{key!r} is revoked by MASK_STORE_REVOKED: lift it in the environment")
+    active = backend or get_matting_backend()
+    if not dry_run and not active.publishes_masks:
+        raise ValueError(f"backend {active.name!r} is not a mask model: dry run only")
+    if not dry_run:
+        revocation = db.get(MaskStoreRevocation, key)
+        if revocation is not None:
+            db.delete(revocation)
+            db.commit()
+    revoked = store_revocations(db) - {key}
+    report = reevaluate_masks(db, dry_run=dry_run, source=key, revoked=revoked)
+    batch = run_mask_batch(
+        db,
+        store,
+        backend=active,
+        dry_run=dry_run,
+        recheck_ineligible=True,
+        source=key,
+        revoked=revoked,
+    )
+    return {"source": key, "dry_run": dry_run, "reevaluate": report, "batch": batch.as_dict()}

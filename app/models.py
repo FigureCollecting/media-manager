@@ -307,6 +307,21 @@ class PublicObjectImage(Base):
     )
 
 
+class MaskStoreRevocation(Base):
+    """A source whose masks are revoked (MASK-G), persisted by
+    ``masks revoke-store``. With MASK_STORE_REVOKED it wins over any grant:
+    no mask of an image with an origin of that source is made or served
+    (app.workers.mask_policy, app.publication)."""
+
+    __tablename__ = "mask_store_revocations"
+
+    #: The source, lower-cased and stripped (``mask_policy.source_key``).
+    source: Mapped[str] = mapped_column(String(50), primary_key=True)
+    revoked_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+
 class MaskBatch(Base):
     """One applied run of the MASK-1 batch job (dry runs are never stored).
     ``cursor_sha256`` is the last clean image settled, so a killed run

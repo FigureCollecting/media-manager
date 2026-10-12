@@ -21,7 +21,7 @@ from ..url_guard import _validate_ingest_url
 from . import celery_app
 from .derivatives import compute_dominant_color, compute_thumbhash
 from .grounding import compute_bottom_margin_frac, compute_contact_band
-from .mask_job import reevaluate_masks, run_mask_batch
+from .mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
 from .watermark import apply_watermark, strip_exif
 
 if TYPE_CHECKING:
@@ -544,3 +544,19 @@ def reevaluate_published_masks(apply: bool = False) -> dict[str, Any]:
     unless ``apply=True``."""
     with worker_session() as db:
         return reevaluate_masks(db, dry_run=not apply)
+
+
+@celery_app.task(name="revoke_mask_store")
+def revoke_mask_store(source: str, apply: bool = False) -> dict[str, Any]:
+    """MASK-G: revoke every mask of ``source`` (README runbook "A store asks
+    for its cut-outs to be removed"). DRY RUN unless ``apply=True``."""
+    with worker_session() as db:
+        return revoke_store(db, source, dry_run=not apply)
+
+
+@celery_app.task(name="restore_mask_store")
+def restore_mask_store(source: str, apply: bool = False) -> dict[str, Any]:
+    """MASK-G: lift a store's revocation, restore its masks and re-check its
+    refused images (needs the mask model). DRY RUN unless ``apply=True``."""
+    with worker_session() as db:
+        return restore_store(db, S3ObjectStore(), source, dry_run=not apply)

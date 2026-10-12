@@ -3,13 +3,15 @@
     python -m app.cli.masks [--sandbox DIR] seed --sample DIR
     python -m app.cli.masks [--sandbox DIR] run [--apply] [--limit N] [--page-size N]
                                                 [--resume BATCH] [--retry-failed]
-                                                [--recheck-ineligible]
+                                                [--recheck-ineligible] [--source SOURCE]
                                                 [--backend stub|birefnet|birefnet-basekept]
                                                 [--model PATH] [--isnet-general PATH]
                                                 [--isnet-anime PATH]
                                                 [--report FILE]
     python -m app.cli.masks [--sandbox DIR] report --batch ID
     python -m app.cli.masks [--sandbox DIR] reevaluate [--apply]
+    python -m app.cli.masks [--sandbox DIR] revoke-store SOURCE [--apply]
+    python -m app.cli.masks [--sandbox DIR] restore-store SOURCE [--apply] [--backend ...]
 
 ``run`` is a DRY RUN unless ``--apply``: it computes and prints every mask's
 outcome and grounding, and writes nothing. ``--apply`` needs a mask model
@@ -18,6 +20,10 @@ lane in DIR (``masks.db`` SQLite + ``objects/``), so a seeded sample runs with
 no Postgres or bucket; without it the configured DATABASE_URL and S3 bucket
 are used. ``--backend birefnet --model PATH`` runs the real model (CUDA
 required, see app.workers.matting); the default is the configured backend.
+``revoke-store`` / ``restore-store`` (MASK-G) withdraw or bring back every
+mask of one source; dry runs unless ``--apply`` (README runbook "A store
+asks for its cut-outs to be removed"). ``restore-store --apply`` needs a mask
+model, like ``run --apply``.
 Exit status: 0 done, 2 refused (nothing was changed by the refused step).
 """
 
@@ -39,7 +45,7 @@ from sqlalchemy.orm import Session
 from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
 from ..workers.basekept import BaseKeptMattingBackend
-from ..workers.mask_job import reevaluate_masks, run_mask_batch
+from ..workers.mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
 from ..workers.matting import (
@@ -165,6 +171,7 @@ def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str,
             resume_batch_id=args.resume,
             retry_failed=args.retry_failed,
             recheck_ineligible=args.recheck_ineligible,
+            source=args.source,
         )
     except ValueError as exc:
         raise Refused(str(exc)) from exc
@@ -180,6 +187,16 @@ def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str,
     if args.report:
         Path(args.report).write_text(json.dumps(summary, indent=1, sort_keys=True, default=str))
     return summary
+
+
+def _store_command(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        if args.command == "revoke-store":
+            return revoke_store(db, args.source, dry_run=not args.apply)
+        backend = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
+        return restore_store(db, store, args.source, dry_run=not args.apply, backend=backend)
+    except ValueError as exc:
+        raise Refused(str(exc)) from exc
 
 
 def _report(db: Session, batch_id: int) -> dict[str, Any]:
@@ -216,10 +233,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--recheck-ineligible", action="store_true", help="re-judge images refused a mask"
     )
-    run.add_argument("--backend", choices=["stub", "birefnet", "birefnet-basekept"])
-    run.add_argument("--model", help="BiRefNet ONNX weights (birefnet, birefnet-basekept)")
-    run.add_argument("--isnet-general", help="IS-Net general-use ONNX weights (birefnet-basekept)")
-    run.add_argument("--isnet-anime", help="IS-Net anime ONNX weights (birefnet-basekept)")
+    run.add_argument("--source", help="only clean copies with a live origin of this source")
+    _backend_options(run)
     run.add_argument("--report", help="also write the full JSON report here")
 
     rep = sub.add_parser("report", help="show one applied batch")
@@ -229,13 +244,35 @@ def _parser() -> argparse.ArgumentParser:
         "reevaluate", help="withdraw or restore published masks (dry run by default)"
     )
     ree.add_argument("--apply", action="store_true", help="store the changes (default: dry run)")
+
+    revoke = sub.add_parser(
+        "revoke-store", help="withdraw every mask of one source (dry run by default)"
+    )
+    revoke.add_argument("source")
+    revoke.add_argument("--apply", action="store_true", help="store the change (default: dry run)")
+
+    restore = sub.add_parser(
+        "restore-store", help="lift a revoke-store and mask what it refused (dry run by default)"
+    )
+    restore.add_argument("source")
+    restore.add_argument("--apply", action="store_true", help="store the change (default: dry run)")
+    _backend_options(restore)
     return p
+
+
+def _backend_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--backend", choices=["stub", "birefnet", "birefnet-basekept"])
+    parser.add_argument("--model", help="BiRefNet ONNX weights (birefnet, birefnet-basekept)")
+    parser.add_argument(
+        "--isnet-general", help="IS-Net general-use ONNX weights (birefnet-basekept)"
+    )
+    parser.add_argument("--isnet-anime", help="IS-Net anime ONNX weights (birefnet-basekept)")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "run":
+        if args.command in ("run", "restore-store"):
             # refuse before touching any store
             chosen = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
             active = chosen or get_matting_backend()
@@ -249,6 +286,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(_run(db, store, args))
             elif args.command == "reevaluate":
                 _print(reevaluate_masks(db, dry_run=not args.apply))
+            elif args.command in ("revoke-store", "restore-store"):
+                _print(_store_command(db, store, args))
             else:
                 _print(_report(db, args.batch))
         finally:

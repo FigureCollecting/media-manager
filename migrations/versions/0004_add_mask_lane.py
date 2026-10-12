@@ -1,4 +1,4 @@
-"""MASK-1: public objects and the images behind them, mask results, mask batches.
+"""MASK-1: public objects and the images behind them, mask results, batches, store revocations.
 
 Revision ID: 0004_add_mask_lane
 Revises: 0003_add_matte_grounding_fields
@@ -52,6 +52,11 @@ def upgrade() -> None:
             sa.ForeignKey("images.id", ondelete="CASCADE"),
             primary_key=True,
         ),
+    )
+    op.create_table(
+        "mask_store_revocations",
+        sa.Column("source", sa.String(50), primary_key=True),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_table(
         "mask_batches",
@@ -120,5 +125,6 @@ def downgrade() -> None:
     op.drop_index("ix_image_masks_mask_sha256", table_name="image_masks")
     op.drop_table("image_masks")
     op.drop_table("mask_batches")
+    op.drop_table("mask_store_revocations")
     op.drop_table("public_object_images")
     op.drop_table("public_objects")
