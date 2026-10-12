@@ -21,7 +21,7 @@ import json
 from collections.abc import Generator
 
 import pytest
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.workers.mask_policy import ImageOrigin, classify_origin, mask_eligibility
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/1154594-1a2b3.jpg"
@@ -307,3 +307,57 @@ class TestMaskEligibility:
             ]
         )
         assert (e.eligible, e.origin_class) == (True, "item_main")
+
+
+def _revoke(monkeypatch: pytest.MonkeyPatch, sources: list[str]) -> None:
+    monkeypatch.setenv("MASK_STORE_REVOKED", json.dumps(sources))
+    get_settings.cache_clear()
+
+
+class TestStoreRevocation:
+    """MASK-G (Ross 2026-10-12, option b): every REGISTERED store source --
+    one named in MASK_STORE_GRANTS with the domains its listing photos come
+    from -- is granted, with no per-store opt-in; a per-source deny list
+    (MASK_STORE_REVOKED, plus the revocations ``masks revoke-store``
+    persists) wins over any grant."""
+
+    def test_nothing_is_revoked_by_default(self) -> None:
+        assert Settings(environment="test").mask_store_revoked == []
+
+    def test_every_registered_store_source_is_granted(self) -> None:
+        grants = {"amiami": ["amiami.com"], "shop": ["shop.example"]}
+        for url, source in ((AMIAMI, "amiami"), ("https://cdn.shop.example/p.jpg", "shop")):
+            assert classify_origin(ImageOrigin(url=url, source=source), grants) == "store_listing"
+
+    def test_a_revoked_source_is_refused_whatever_its_grant(self, granted: None) -> None:
+        o = ImageOrigin(url=AMIAMI, source="amiami")
+        assert classify_origin(o, revoked=frozenset({"amiami"})) == "store_revoked"
+        e = mask_eligibility([o], revoked=frozenset({"amiami"}))
+        assert (e.eligible, e.origin_class, e.reason) == (False, "store_revoked", "store_revoked")
+
+    def test_revoking_one_source_leaves_the_others_granted(self, granted: None) -> None:
+        o = ImageOrigin(url="https://shop.example/p/1.jpg", source="shop")
+        assert classify_origin(o, revoked=frozenset({"amiami"})) == "store_listing"
+        item = ImageOrigin(url=ITEM, source="mfc")
+        assert classify_origin(item, revoked=frozenset({"amiami"})) == "item_main"
+
+    def test_the_deny_list_is_per_source_mfc_included(self) -> None:
+        item = ImageOrigin(url=ITEM, source="mfc")
+        assert classify_origin(item, revoked=frozenset({"mfc"})) == "store_revoked"
+
+    def test_the_configured_deny_list_is_read_normalised(
+        self, granted: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MASK_STORE_REVOKED is hand-written JSON: case and surrounding
+        whitespace never let a revoked source through."""
+        _revoke(monkeypatch, [" AmiAmi\n"])
+        assert classify_origin(ImageOrigin(url=AMIAMI, source="amiami")) == "store_revoked"
+        upper = ImageOrigin(url=AMIAMI, source="AMIAMI ")
+        assert classify_origin(upper, revoked=frozenset({"amiami"})) == "store_revoked"
+
+    def test_an_explicit_deny_list_overrides_the_configured_one(
+        self, granted: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _revoke(monkeypatch, ["amiami"])
+        o = ImageOrigin(url=AMIAMI, source="amiami")
+        assert classify_origin(o, revoked=frozenset()) == "store_listing"

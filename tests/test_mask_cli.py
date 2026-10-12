@@ -155,6 +155,81 @@ class TestSampleRun:
         assert json.loads(target.read_text()) == summary
 
 
+class TestStoreRevocation:
+    """``revoke-store`` / ``restore-store``: the single commands for a store
+    that asks for its cut-outs to be removed (README runbook)."""
+
+    def test_revoke_then_restore_a_store(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None, store_granted: None
+    ) -> None:
+        from app.models import ImageMask
+
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _, applied = _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        store_sha = next(
+            i["source_sha256"] for i in applied["items"] if i["figure_ids"] == ["sample:4"]
+        )
+        ok_before = sorted(r.source_sha256 for r in _rows(sandbox, ImageMask) if r.status == "ok")
+        assert store_sha in ok_before
+
+        code, dry = _run(capsys, "--sandbox", sandbox, "revoke-store", "example-store")
+        assert (code, dry["dry_run"], dry["reevaluate"]["withdrawn"]) == (0, True, [store_sha])
+        code, revoked = _run(
+            capsys, "--sandbox", sandbox, "revoke-store", "example-store", "--apply"
+        )
+        assert (code, revoked["reevaluate"]["withdrawn"]) == (0, [store_sha])
+        rows = {r.source_sha256: (r.status, r.reason) for r in _rows(sandbox, ImageMask)}
+        assert rows[store_sha] == ("withdrawn", "store_revoked")
+        assert sorted(s for s, (st, _) in rows.items() if st == "ok") == sorted(
+            s for s in ok_before if s != store_sha
+        )
+
+        code, restored = _run(
+            capsys, "--sandbox", sandbox, "restore-store", "example-store", "--apply"
+        )
+        assert (code, restored["reevaluate"]["restored"]) == (0, [store_sha])
+        rows = {r.source_sha256: (r.status, r.reason) for r in _rows(sandbox, ImageMask)}
+        assert rows[store_sha] == ("ok", None)
+
+    def test_a_batch_run_can_target_one_source(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], store_granted: None
+    ) -> None:
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        code, dry = _run(capsys, "--sandbox", sandbox, "run", "--source", "example-store")
+        assert code == 0
+        assert [i["figure_ids"] for i in dry["items"]] == [["sample:4"]]
+
+    @pytest.mark.parametrize("backend", [[], ["--backend", "stub"]])
+    def test_restoring_with_the_stub_is_refused_before_any_work(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], backend: list[str]
+    ) -> None:
+        code = cli.main(
+            ["--sandbox", sandbox, "restore-store", "example-store", "--apply", *backend]
+        )
+        assert code == 2
+        assert "dry run only" in capsys.readouterr().err
+        assert not Path(sandbox).exists()
+
+    def test_a_configured_revocation_is_refused_with_its_reason(
+        self,
+        sandbox: str,
+        capsys: pytest.CaptureFixture[str],
+        model: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MASK_STORE_REVOKED", '["example-store"]')
+        get_settings.cache_clear()
+        code = cli.main(["--sandbox", sandbox, "restore-store", "example-store", "--apply"])
+        assert code == 2
+        assert "MASK_STORE_REVOKED" in capsys.readouterr().err
+
+    def test_a_blank_source_is_refused(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cli.main(["--sandbox", sandbox, "revoke-store", " ", "--apply"]) == 2
+        assert "source" in capsys.readouterr().err
+
+
 class TestRefusals:
     def test_resuming_an_unknown_batch_is_an_error(
         self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None

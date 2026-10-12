@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Generator
 from pathlib import Path
 
 import numpy as np
@@ -946,6 +947,242 @@ class TestCapturesKeyedOnPixels:
         (row,) = _masks(db_session)
         assert report["withdrawn"] == [row.source_sha256]
         assert (row.status, row.reason) == ("withdrawn", "deleted")
+
+
+SHOP = "https://img.shop.example/p/{n}.jpg"
+OTHER = "https://cdn.other.example/p/{n}.jpg"
+
+
+@pytest.fixture()
+def stores_registered(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Two registered store sources: each is granted (MASK-G), no opt-in."""
+    import json
+
+    from app.config import get_settings
+
+    grants = {"shop": ["shop.example"], "other": ["other.example"]}
+    monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps(grants))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.mark.usefixtures("stores_registered")
+class TestStoreRevocation:
+    """MASK-G (Ross 2026-10-12): cut-out masks for every store, revocable per
+    store. ``revoke_store`` persists the revocation, then withdraws every
+    mask of that source -- and judges nothing else; ``restore_store`` lifts
+    it, restores the withdrawn masks and re-checks that source's refused
+    images (``recheck_ineligible``). Both are dry runs by default."""
+
+    def _seed(self, db: Session, store: LocalObjectStore, n: int, url: str, source: str) -> str:
+        obj = seed_clean_image(
+            db,
+            store,
+            _photo((31 + 10 * n, 30, 90), seed=n),
+            origins=[ImageOrigin(url=url.format(n=n), source=source)],
+            figure_id=f"{source}:{n}",
+        )
+        return obj.sha256
+
+    def _settle_all(self, db: Session, store: LocalObjectStore) -> dict[str, str]:
+        shas = {
+            "shop1": self._seed(db, store, 1, SHOP, "shop"),
+            "shop2": self._seed(db, store, 2, SHOP, "shop"),
+            "other": self._seed(db, store, 3, OTHER, "other"),
+            "item": self._seed(db, store, 4, ITEM, "mfc"),
+        }
+        run_mask_batch(db, store, backend=_Model(), dry_run=False)
+        assert {r.status for r in _masks(db)} == {"ok"}
+        return shas
+
+    def _status(self, db: Session) -> dict[str, tuple[str, str | None]]:
+        db.expire_all()
+        return {r.source_sha256: (r.status, r.reason) for r in _masks(db)}
+
+    def _revoked(self, db: Session) -> list[str]:
+        from app.models import MaskStoreRevocation
+
+        return list(db.execute(select(MaskStoreRevocation.source)).scalars())
+
+    def test_revoke_is_a_dry_run_unless_applied(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import revoke_store
+
+        shas = self._settle_all(db_session, store)
+        report = revoke_store(db_session, "shop")
+        assert (report["source"], report["dry_run"]) == ("shop", True)
+        assert sorted(report["reevaluate"]["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+        assert self._revoked(db_session) == []
+        assert set(self._status(db_session).values()) == {("ok", None)}
+
+    def test_revoke_withdraws_every_mask_of_the_source_and_nothing_else(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import ImageVersion
+        from app.workers.mask_job import revoke_store
+
+        shas = self._settle_all(db_session, store)
+        # The MFC mask would fall to a FULL re-evaluation (its image gained a
+        # collector's photo origin); a store revocation must not touch it.
+        clean = db_session.get(PublicObject, shas["item"])
+        assert clean is not None
+        version = db_session.get(ImageVersion, clean.image_version_id)
+        assert version is not None
+        db_session.add(
+            FigureGallery(
+                figure_id="mfc:9", source_url=PICTURE.format(n=9), image_id=version.image_id
+            )
+        )
+        db_session.commit()
+        report = revoke_store(db_session, " Shop ", dry_run=False)
+        assert report["source"] == "shop"
+        assert sorted(report["reevaluate"]["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+        assert report["reevaluate"]["unchanged"] == 0
+        assert self._revoked(db_session) == ["shop"]
+        status = self._status(db_session)
+        assert status[shas["shop1"]] == status[shas["shop2"]] == ("withdrawn", "store_revoked")
+        assert status[shas["other"]] == status[shas["item"]] == ("ok", None)
+        again = revoke_store(db_session, "shop", dry_run=False)
+        assert again["reevaluate"]["withdrawn"] == []
+        assert self._revoked(db_session) == ["shop"]
+
+    def test_revoke_reaches_a_copy_the_store_shares_with_another_source(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import revoke_store
+
+        for i, (url, source) in enumerate(((ITEM.format(n=1), "mfc"), (SHOP.format(n=1), "shop"))):
+            seed_clean_image(
+                db_session,
+                store,
+                _capture(f"capture {i}"),
+                origins=[ImageOrigin(url=url, source=source)],
+                figure_id=f"{source}:capture",
+            )
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        (row,) = _masks(db_session)
+        assert row.status == "ok"
+        report = revoke_store(db_session, "shop", dry_run=False)
+        assert report["reevaluate"]["withdrawn"] == [row.source_sha256]
+        assert self._status(db_session)[row.source_sha256] == ("withdrawn", "store_revoked")
+
+    def test_a_revoked_store_gets_no_new_masks(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import revoke_store
+
+        revoke_store(db_session, "shop", dry_run=False)
+        self._seed(db_session, store, 1, SHOP, "shop")
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason) for i in report.items] == [("ineligible", "store_revoked")]
+        assert _public(db_session, "mask") == []
+
+    def test_a_blank_source_is_refused(self, db_session: Session, store: LocalObjectStore) -> None:
+        from app.workers.mask_job import restore_store, revoke_store
+
+        with pytest.raises(ValueError, match="source"):
+            revoke_store(db_session, "  ", dry_run=False)
+        with pytest.raises(ValueError, match="source"):
+            restore_store(db_session, store, "", dry_run=False, backend=_Model())
+        assert self._revoked(db_session) == []
+
+    def test_restore_lifts_the_revocation_restores_and_masks_what_was_refused(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import restore_store, revoke_store
+
+        shas = self._settle_all(db_session, store)
+        revoke_store(db_session, "shop", dry_run=False)
+        shas["shop5"] = self._seed(db_session, store, 5, SHOP, "shop")
+        shas["photo"] = self._seed(db_session, store, 6, PICTURE, "mfc")
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        status = self._status(db_session)
+        assert status[shas["shop5"]] == ("ineligible", "store_revoked")
+        assert status[shas["photo"]] == ("ineligible", "user_photo")
+        photo_batch = next(
+            r.batch_id for r in _masks(db_session) if r.source_sha256 == shas["photo"]
+        )
+
+        dry = restore_store(db_session, store, "shop", backend=_Model())
+        assert (dry["source"], dry["dry_run"]) == ("shop", True)
+        assert sorted(dry["reevaluate"]["restored"]) == sorted([shas["shop1"], shas["shop2"]])
+        assert [(i["source_sha256"], i["status"]) for i in dry["batch"]["items"]] == [
+            (shas["shop5"], "ok")
+        ]
+        assert self._revoked(db_session) == ["shop"]
+        assert self._status(db_session) == status
+
+        applied = restore_store(db_session, store, "shop", dry_run=False, backend=_Model())
+        assert applied["dry_run"] is False
+        assert self._revoked(db_session) == []
+        after = self._status(db_session)
+        for name in ("shop1", "shop2", "shop5", "other", "item"):
+            assert after[shas[name]] == ("ok", None), name
+        assert after[shas["photo"]] == ("ineligible", "user_photo")
+        assert (
+            next(r.batch_id for r in _masks(db_session) if r.source_sha256 == shas["photo"])
+            == photo_batch
+        )
+
+    def test_restore_refuses_a_backend_that_is_not_a_mask_model_before_changing_anything(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import restore_store, revoke_store
+
+        shas = self._settle_all(db_session, store)
+        revoke_store(db_session, "shop", dry_run=False)
+        with pytest.raises(ValueError, match="dry run only"):
+            restore_store(db_session, store, "shop", dry_run=False, backend=StubMattingBackend())
+        assert self._revoked(db_session) == ["shop"]
+        assert self._status(db_session)[shas["shop1"]] == ("withdrawn", "store_revoked")
+
+    def test_a_source_revoked_by_configuration_is_not_restored_here(
+        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import get_settings
+        from app.workers.mask_job import restore_store
+
+        shas = self._settle_all(db_session, store)
+        monkeypatch.setenv("MASK_STORE_REVOKED", '["Shop"]')
+        get_settings.cache_clear()
+        with pytest.raises(ValueError, match="MASK_STORE_REVOKED"):
+            restore_store(db_session, store, "shop", dry_run=False, backend=_Model())
+        assert self._status(db_session)[shas["shop1"]] == ("ok", None)
+
+    def test_a_batch_can_be_limited_to_one_source(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        shop = self._seed(db_session, store, 1, SHOP, "shop")
+        self._seed(db_session, store, 3, OTHER, "other")
+        self._seed(db_session, store, 4, ITEM, "mfc")
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False, source="SHOP")
+        assert [(i.source_sha256, i.status) for i in report.items] == [(shop, "ok")]
+
+    def test_the_store_tasks_default_to_a_dry_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.workers import tasks
+
+        seen: dict[str, object] = {}
+
+        def _revoke(db: object, source: str, **kw: object) -> dict[str, object]:
+            seen["revoke"] = (source, kw["dry_run"])
+            return {}
+
+        def _restore(db: object, store: object, source: str, **kw: object) -> dict[str, object]:
+            seen["restore"] = (source, kw["dry_run"])
+            return {}
+
+        monkeypatch.setattr(tasks, "revoke_store", _revoke)
+        monkeypatch.setattr(tasks, "restore_store", _restore)
+        monkeypatch.setattr(tasks, "worker_session", _NullSession)
+        monkeypatch.setattr(tasks, "S3ObjectStore", lambda: object())
+        tasks.revoke_mask_store("shop")
+        tasks.restore_mask_store("shop")
+        assert seen == {"revoke": ("shop", True), "restore": ("shop", True)}
+        tasks.revoke_mask_store("shop", apply=True)
+        tasks.restore_mask_store("shop", apply=True)
+        assert seen == {"revoke": ("shop", False), "restore": ("shop", False)}
 
 
 class TestOnlyAMaskModelPublishes:

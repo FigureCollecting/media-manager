@@ -149,6 +149,17 @@ def seeded(db_session: Session, store: LocalObjectStore) -> dict[str, str]:
 
 
 @pytest.fixture()
+def shop_registered(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """One registered store source, ``shop`` (granted: MASK-G), for the batch."""
+    import json
+
+    monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"shop": ["shop.example"]}))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture()
 def client(db_session: Session, store: LocalObjectStore) -> Generator[TestClient, None, None]:
     def _db() -> Generator[Session, None, None]:
         yield db_session
@@ -723,6 +734,76 @@ class TestNotFound:
         assert client.get(f"/d/{mask}").status_code == 200
         origin_app.dependency_overrides[get_settings] = lambda: Settings(environment="test")
         self._assert_404(client.get(f"/d/{mask}"))
+
+    def _store_and_item_masks(self, db: Session, store: LocalObjectStore) -> dict[str, str]:
+        grants = {"shop": ["shop.example"]}
+        shop = seed_clean_image(
+            db,
+            store,
+            _photo(3),
+            origins=[ImageOrigin(url="https://img.shop.example/p/3.jpg", source="shop")],
+            figure_id="shop:3",
+        )
+        item = seed_clean_image(
+            db,
+            store,
+            _photo(4),
+            origins=[ImageOrigin(url=ITEM.format(n=4), source="mfc")],
+            figure_id="mfc:4",
+        )
+        run_mask_batch(db, store, backend=_Model(), dry_run=False)
+        rows = {r.source_sha256: r.mask_sha256 for r in db.execute(select(ImageMask)).scalars()}
+        settings = Settings(environment="test", mask_store_grants=grants)
+        origin_app.dependency_overrides[get_settings] = lambda: settings
+        return {
+            "shop_clean": shop.sha256,
+            "shop_mask": rows[shop.sha256] or "",
+            "item_mask": rows[item.sha256] or "",
+        }
+
+    @pytest.mark.usefixtures("shop_registered")
+    def test_a_store_mask_is_a_404_the_moment_its_store_is_revoked(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """The persisted revocation alone takes the store's masks offline --
+        before any row is withdrawn -- and leaves its clean copies and every
+        other source's masks alone."""
+        from app.models import MaskStoreRevocation
+
+        shas = self._store_and_item_masks(db_session, store)
+        assert shas["shop_mask"] != shas["item_mask"]
+        assert client.get(f"/d/{shas['shop_mask']}").status_code == 200
+        db_session.add(MaskStoreRevocation(source="shop"))
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{shas['shop_mask']}"))
+        assert client.get(f"/d/{shas['item_mask']}").status_code == 200
+        assert client.get(f"/d/{shas['shop_clean']}").status_code == 200
+
+    @pytest.mark.usefixtures("shop_registered")
+    def test_a_configured_revocation_is_a_404(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        shas = self._store_and_item_masks(db_session, store)
+        revoked = Settings(
+            environment="test",
+            mask_store_grants={"shop": ["shop.example"]},
+            mask_store_revoked=["shop"],
+        )
+        origin_app.dependency_overrides[get_settings] = lambda: revoked
+        self._assert_404(client.get(f"/d/{shas['shop_mask']}"))
+        assert client.get(f"/d/{shas['item_mask']}").status_code == 200
+
+    @pytest.mark.usefixtures("shop_registered")
+    def test_revoke_store_takes_the_masks_offline_and_restore_store_brings_them_back(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import restore_store, revoke_store
+
+        shas = self._store_and_item_masks(db_session, store)
+        revoke_store(db_session, "shop", dry_run=False)
+        self._assert_404(client.get(f"/d/{shas['shop_mask']}"))
+        restore_store(db_session, store, "shop", dry_run=False, backend=_Model())
+        assert client.get(f"/d/{shas['shop_mask']}").status_code == 200
 
     def test_an_unknown_address(self, client: TestClient, seeded: dict[str, str]) -> None:
         self._assert_404(client.get("/d/" + "0" * 64))
