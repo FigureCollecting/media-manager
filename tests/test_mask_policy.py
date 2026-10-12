@@ -190,6 +190,49 @@ class TestStores:
         grants = {"shop": ["shop.example"]}
         assert classify_origin(ImageOrigin(url=url, source=source), grants) == "unknown_origin"
 
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            ("http://[::1/p/1.jpg", "shop"),
+            ("https://[::1]evil/p/1.jpg", "shop"),
+            ("http://[evil]/p/1.jpg", "shop"),
+            ("https://ex\uff0fample.shop.example/p/1.jpg", "shop"),
+            ("http://[::1/upload/items/1/1-a.jpg", "mfc"),
+        ],
+    )
+    def test_a_url_the_parser_rejects_is_unknown_not_an_error(self, url: str, source: str) -> None:
+        """urlsplit raises on these; the policy fails closed instead, so one
+        such row can never abort a batch or a re-evaluation."""
+        grants = {"shop": ["shop.example"]}
+        assert classify_origin(ImageOrigin(url=url, source=source), grants) == "unknown_origin"
+        assert mask_eligibility([ImageOrigin(url=url, source=source)], grants).reason == (
+            "unknown_origin"
+        )
+
+    @pytest.mark.parametrize(
+        ("url", "source"),
+        [
+            ("https://img.shop.example:1.evil.test/p/1.jpg", "shop"),
+            ("https://img.shop.example:99999/p/1.jpg", "shop"),
+            ("https://static.myfigurecollection.net:x.evil.test/upload/items/1/1-a.jpg", "mfc"),
+        ],
+    )
+    def test_a_port_that_is_not_a_port_makes_the_host_ambiguous(
+        self, url: str, source: str
+    ) -> None:
+        grants = {"shop": ["shop.example"]}
+        assert classify_origin(ImageOrigin(url=url, source=source), grants) == "unknown_origin"
+
+    def test_a_real_port_is_still_the_host(self) -> None:
+        o = ImageOrigin(url="https://img.shop.example:8443/p/1.jpg", source="shop")
+        assert classify_origin(o, {"shop": ["shop.example"]}) == "store_listing"
+
+    def test_a_non_ascii_host_is_ambiguous_even_when_granted(self) -> None:
+        """A fetcher reaches an IDN host by its punycode; the letters alone are
+        ambiguous (and a lookalike), so even a grant naming them gives no mask."""
+        o = ImageOrigin(url="https://img.sh\u00f6p.example/p/1.jpg", source="shop")
+        assert classify_origin(o, {"shop": ["sh\u00f6p.example"]}) == "unknown_origin"
+
     def test_a_schemeless_url_is_unknown_even_on_a_granted_host(self) -> None:
         o = ImageOrigin(url="//cdn.shop.example/p/1.jpg", source="shop")
         assert classify_origin(o, store_grants={"shop": ["shop.example"]}) == "unknown_origin"
