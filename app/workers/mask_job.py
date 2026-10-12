@@ -11,6 +11,8 @@ IDEMPOTENT. A clean image is selected only while it has no image_masks row
 at the current MASK_PIPELINE_VERSION, so a re-run is a no-op and a version
 bump selects everything again (the old masks stay addressable). Mask bytes
 are content-addressed, so two images with the same mask share one object.
+So are clean copies: one shared by pixel-identical captures is judged over
+every image behind it (app.publication) and waits while any is soft-deleted.
 
 RESUMABLE. Each clean image is settled in its own transaction -- its object
 written first, then its row, its public registration and the batch's cursor
@@ -43,9 +45,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import Image as ImageModel
-from ..models import ImageMask, ImageVersion, MaskBatch, PublicObject
+from ..models import ImageMask, ImageVersion, MaskBatch, PublicObject, PublicObjectImage
 from ..object_store import ObjectStore, derived_key
-from ..publication import gallery_origins, mask_refusal
+from ..publication import judged_origins, mask_refusal
 from .grounding import AlphaGrounding
 from .mask import MASK_MIME, MASK_PIPELINE_VERSION, MaskOutcome, build_mask_artifact
 from .mask_policy import StoreGrants, mask_eligibility
@@ -101,6 +103,13 @@ def _candidates(
         ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
         ImageMask.status.not_in(redrive),
     )
+    # A clean copy shared by pixel-identical captures waits while ANY of them
+    # is soft-deleted (app.publication would not serve it).
+    dead_capture = (
+        select(PublicObjectImage.sha256)
+        .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
+        .where(ImageModel.deleted_at.is_not(None))
+    )
     query = (
         select(PublicObject)
         .join(ImageVersion, ImageVersion.id == PublicObject.image_version_id)
@@ -110,6 +119,7 @@ def _candidates(
             ImageVersion.deleted_at.is_(None),
             ImageModel.deleted_at.is_(None),
             PublicObject.sha256.not_in(settled),
+            PublicObject.sha256.not_in(dead_capture),
         )
         .order_by(PublicObject.sha256)
         .limit(page_size)
@@ -199,9 +209,9 @@ def _settle(
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
     written then, the report is the whole result."""
     sha = obj.sha256
-    version = db.get(ImageVersion, obj.image_version_id)
-    assert version is not None  # the candidate query joined it
-    eligibility = mask_eligibility(gallery_origins(db, version.image_id))
+    # Judged over every image behind the clean copy (app.publication); None
+    # -- soft-deleted since it was selected -- is judged as no origin at all.
+    eligibility = mask_eligibility(judged_origins(db, sha) or [])
     if not eligibility.eligible:
         if batch is not None:
             _write_row(

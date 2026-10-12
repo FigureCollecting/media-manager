@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..hashing import compute_phash, detect_mime
-from ..models import FigureGallery, ImageVersion, PublicObject
+from ..models import FigureGallery, ImageVersion, PublicObject, PublicObjectImage
 from ..models import Image as ImageModel
 from ..object_store import ObjectStore, derived_key
 from .mask_policy import ImageOrigin
@@ -109,7 +109,10 @@ def seed_clean_image(
     figure_id: str,
 ) -> PublicObject:
     """Register ``original`` (stored, never public), its clean copy (public,
-    kind ``sanitized``) and one gallery link per origin. Idempotent."""
+    kind ``sanitized``), the image as one behind that copy, and one gallery
+    link per origin. Idempotent. An original whose pixels another original
+    already has (different bytes, same picture) is a second image behind the
+    SAME clean copy (``public_object_images``), never a copy of its own."""
     orig_sha = hashlib.sha256(original).hexdigest()
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
     if image is None:
@@ -177,6 +180,9 @@ def seed_clean_image(
             storage_key=key,
             image_version_id=version.id,
         )
+
+    if db.get(PublicObjectImage, (clean_sha, image.id)) is None:
+        db.add(PublicObjectImage(sha256=clean_sha, image_id=image.id))
 
     for origin in origins:
         url = origin.url or ""

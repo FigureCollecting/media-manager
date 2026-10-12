@@ -1,4 +1,5 @@
-"""MASK-1: the public object registry, mask results and mask batches.
+"""MASK-1: the public object registry (and the images behind each clean copy),
+mask results and mask batches.
 
 Revision ID: 0004_add_mask_lane
 Revises: 0003_add_matte_grounding_fields
@@ -33,6 +34,21 @@ def upgrade() -> None:
         ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("kind in ('sanitized','matted','mask')", name="ck_public_object_kind"),
+    )
+    op.create_table(
+        "public_object_images",
+        sa.Column(
+            "sha256",
+            sa.String(64),
+            sa.ForeignKey("public_objects.sha256", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "image_id",
+            sa.Integer,
+            sa.ForeignKey("images.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
     )
     op.create_table(
         "mask_batches",
@@ -101,4 +117,5 @@ def downgrade() -> None:
     op.drop_index("ix_image_masks_mask_sha256", table_name="image_masks")
     op.drop_table("image_masks")
     op.drop_table("mask_batches")
+    op.drop_table("public_object_images")
     op.drop_table("public_objects")

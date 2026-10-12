@@ -279,6 +279,26 @@ class PublicObject(Base):
     )
 
 
+class PublicObjectImage(Base):
+    """Every image a clean public object is the clean copy of.
+
+    Clean copies are content-addressed, so two originals with the same
+    pixels and different bytes (an EXIF or text chunk apart: two crawls, a
+    re-save) are two images with ONE clean copy -- one row each here. The
+    copy, and any mask made from it, is judged over all of them
+    (app.publication), whichever was seeded first.
+    """
+
+    __tablename__ = "public_object_images"
+
+    sha256: Mapped[str] = mapped_column(
+        ForeignKey("public_objects.sha256", ondelete="CASCADE"), primary_key=True
+    )
+    image_id: Mapped[int] = mapped_column(
+        ForeignKey("images.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
 class MaskBatch(Base):
     """One applied run of the MASK-1 batch job (dry runs are never stored).
     ``cursor_sha256`` is the last clean image settled, so a killed run
