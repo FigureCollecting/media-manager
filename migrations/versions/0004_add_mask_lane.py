@@ -43,9 +43,7 @@ def upgrade() -> None:
             name="ck_public_object_own_pixels",
         ),
     )
-    op.create_index(
-        "ix_public_objects_own_pixel_sha256", "public_objects", ["own_pixel_sha256"]
-    )
+    op.create_index("ix_public_objects_own_pixel_sha256", "public_objects", ["own_pixel_sha256"])
     op.create_table(
         "public_object_images",
         sa.Column(
@@ -124,7 +122,8 @@ def upgrade() -> None:
             "source_sha256", "pipeline_version", name="uq_image_mask_source_version"
         ),
         sa.CheckConstraint(
-            "status in ('ok','held','empty','ineligible','failed','withdrawn')", name="ck_image_mask_status"
+            "status in ('ok','held','empty','ineligible','failed','withdrawn')",
+            name="ck_image_mask_status",
         ),
     )
     op.create_index("ix_image_masks_mask_sha256", "image_masks", ["mask_sha256"])
