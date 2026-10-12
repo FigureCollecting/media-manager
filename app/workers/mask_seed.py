@@ -57,7 +57,7 @@ def pixel_digest(original: bytes) -> str:
     pixels share it whatever their bytes (metadata, a lossless re-save, our
     own lossless PNG copy captured again). Our JPEG copy decodes to other
     pixels than its original, so it has a digest of its own, recorded on the
-    copy (``own_pixel_sha256``). ``seed_clean_image`` links captures by
+    copy (``own_pixel_sha256``). ``link_capture`` links captures by
     both."""
     return _digest(_picture(original))
 
@@ -178,7 +178,7 @@ def _join_picture(db: Session, copies: set[str], images: set[int]) -> None:
     ``copies`` and ``images`` through the links already recorded (a copy's
     images, an image's copies) until nothing is added, then link them all.
     So a copy is judged over every capture of its picture whichever order
-    they were seeded in -- a capture linked to two copies joins them."""
+    they were captured in -- a capture linked to two copies joins them."""
     while True:
         more_images = set(
             db.execute(
@@ -194,6 +194,33 @@ def _join_picture(db: Session, copies: set[str], images: set[int]) -> None:
             break
         images, copies = images | more_images, copies | more_copies
     _link(db, copies, images)
+
+
+def _captures_showing(db: Session, *digests: str) -> set[int]:
+    """The images whose recorded pixel digest is one of ``digests``."""
+    return set(
+        db.execute(select(ImageModel.id).where(ImageModel.pixel_sha256.in_(digests))).scalars()
+    )
+
+
+def link_capture(db: Session, image: ImageModel, digest: str) -> list[PublicObject]:
+    """ONE PICTURE, EVERY CAPTURE, for one capture of a picture whatever
+    route captured it -- ``seed_clean_image`` or the gallery ingest
+    (app.workers.tasks.ingest_gallery_images), each calling this for every
+    image it records. ``digest`` is the capture's pixel digest
+    (``pixel_digest``).
+
+    Records the digest on the image -- the key a clean copy minted LATER
+    finds it by (``seed_clean_image``, photo first) -- and links the image
+    behind every registered clean copy of its picture: minted from those
+    pixels (``pixel_sha256``), decoding to them (``own_pixel_sha256``), or
+    whose very bytes it has. Then every capture of the picture is behind
+    every copy of it (``_join_picture``). Returns those copies, the one
+    minted from these pixels first; none while the picture has no copy."""
+    image.pixel_sha256 = digest
+    copies = _copies_showing(db, digest, image.sha256)
+    _join_picture(db, {c.sha256 for c in copies}, {image.id})
+    return copies
 
 
 def _original_key(sha256: str, mime: str) -> str:
@@ -221,12 +248,13 @@ def seed_clean_image(
     metadata added), or the copy's very bytes (whatever a decoder makes of
     them). Such an original gets no copy of its own. When none matches, a
     clean copy is minted, and any original whose bytes it turns out to be,
-    or whose pixels it shows, is a capture of it too (photo first). Every
-    capture of a picture is then linked behind every clean copy of it
-    (``public_object_images``), in whichever order they arrive, so each copy
-    and its mask are judged over all of them: a soft delete or an ineligible
-    origin under any capture -- the one whose bytes ARE the copy included --
-    reaches every copy (app.publication)."""
+    or whose pixels it shows, is a capture of it too (photo first) -- one
+    the gallery ingest recorded included, by the pixel digest it recorded
+    (``link_capture``). Every capture of a picture is then linked behind
+    every clean copy of it (``public_object_images``), in whichever order
+    they arrive, so each copy and its mask are judged over all of them: a
+    soft delete or an ineligible origin under any capture -- the one whose
+    bytes ARE the copy included -- reaches every copy (app.publication)."""
     orig_sha = hashlib.sha256(original).hexdigest()
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
     if image is None:
@@ -264,7 +292,7 @@ def seed_clean_image(
 
     picture = _picture(original)
     digest = _digest(picture)
-    copies = _copies_showing(db, digest, orig_sha)
+    copies = link_capture(db, image, digest)
     if copies:
         obj = copies[0]
     else:
@@ -302,8 +330,9 @@ def seed_clean_image(
             pixel_sha256=digest,
             own_pixel_sha256=own,
         )
-        copies = [obj, *_copies_showing(db, own)]
-    _join_picture(db, {c.sha256 for c in copies}, {image.id})
+        # Photo first: every capture recorded earlier with these pixels or
+        # the copy's own, whatever route recorded it, joins the new copy.
+        _join_picture(db, {obj.sha256}, {image.id, *_captures_showing(db, digest, own)})
 
     for origin in origins:
         url = origin.url or ""

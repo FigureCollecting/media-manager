@@ -1,5 +1,8 @@
 """MASK-1: public objects and the images behind them, mask results, batches, store revocations.
 
+Also each image's pixel digest (``images.pixel_sha256``), the key a clean
+copy minted later finds an earlier capture of its picture by.
+
 Revision ID: 0004_add_mask_lane
 Revises: 0003_add_matte_grounding_fields
 """
@@ -16,6 +19,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    op.add_column("images", sa.Column("pixel_sha256", sa.String(64), nullable=True))
+    op.create_index("ix_images_pixel_sha256", "images", ["pixel_sha256"])
     op.create_table(
         "public_objects",
         sa.Column("sha256", sa.String(64), primary_key=True),
@@ -137,3 +142,5 @@ def downgrade() -> None:
     op.drop_table("public_object_images")
     op.drop_index("ix_public_objects_own_pixel_sha256", table_name="public_objects")
     op.drop_table("public_objects")
+    op.drop_index("ix_images_pixel_sha256", table_name="images")
+    op.drop_column("images", "pixel_sha256")

@@ -5,8 +5,8 @@ this module decides, on every request, whether it still is. A clean copy is
 judged over EVERY image behind it: the image its version belongs to and each
 other capture of the same picture (``public_object_images``), linked by the
 pixels the copy was minted from, by the pixels the copy itself decodes to,
-or by the copy's very bytes, in either seeding order
-(app.workers.mask_seed.seed_clean_image):
+or by the copy's very bytes, in either order and whichever route captured
+it -- the seed or the gallery ingest (app.workers.mask_seed.link_capture):
 
 - a clean copy (``sanitized``) is served while its version and every image
   behind it are not soft-deleted. A row with no version is never served.
@@ -30,7 +30,7 @@ reaches every clean copy of it -- including a capture whose bytes ARE the
 copy (our clean copy captured again, a lossy JPEG one included, before or
 after it was minted) -- and the same picture captured as an item image and
 as a collector's photo is a collector's photo somewhere, in whichever order
-the two were seeded. The cost is deliberate: soft-deleting a duplicate
+the two were captured. The cost is deliberate: soft-deleting a duplicate
 capture takes the shared copy offline for the capture that remains.
 
 So soft-deleting an image or a version revokes its derivative and its masks;

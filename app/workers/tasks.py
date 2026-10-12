@@ -22,6 +22,7 @@ from . import celery_app
 from .derivatives import compute_dominant_color, compute_thumbhash
 from .grounding import compute_bottom_margin_frac, compute_contact_band
 from .mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
+from .mask_seed import link_capture, pixel_digest
 from .watermark import apply_watermark, strip_exif
 
 if TYPE_CHECKING:
@@ -368,7 +369,7 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
             ).scalar_one_or_none()
 
             if existing_img:
-                image_id = existing_img.id
+                image = existing_img
             else:
                 # Upload to S3 and create Image record. detect_mime sniffs
                 # the real bytes rather than assuming one -- a wrong
@@ -401,7 +402,8 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
                 )
                 db.add(new_img)
                 db.flush()
-                image_id = new_img.id
+                image = new_img
+                image_id = image.id
 
                 v1 = ImageVersion(
                     image_id=image_id,
@@ -429,11 +431,16 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
                     family=source,
                 )
 
+            # Every capture -- a new image or one another route recorded --
+            # is linked behind every clean copy of its picture, whichever
+            # came first (MASK-1: its masks are judged over all of them).
+            link_capture(db, image, pixel_digest(data))
+
             # Create FigureGallery record
             gallery_entry = FigureGallery(
                 figure_id=figure_id,
                 source_url=url,
-                image_id=image_id,
+                image_id=image.id,
                 position=position,
                 caption=caption,
                 source=source,

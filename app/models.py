@@ -38,6 +38,12 @@ class Image(Base):
     height: Mapped[int | None] = mapped_column(Integer)
     bytes: Mapped[int | None] = mapped_column(BigInteger)
     storage_key: Mapped[str | None] = mapped_column(String(512), unique=True)
+    #: The PIXEL DIGEST of this capture (``mask_seed.pixel_digest``), recorded
+    #: by every capture route (the seed, the gallery ingest) through
+    #: ``mask_seed.link_capture``: the key a clean copy minted LATER finds
+    #: this capture by, so it is linked behind that copy whichever came
+    #: first. NULL for an image no capture route has recorded (an upload).
+    pixel_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
     )
@@ -307,10 +313,11 @@ class PublicObjectImage(Base):
     A capture belongs to a picture by its pixels (the copy's
     ``pixel_sha256``), by the copy's own decoded pixels
     (``own_pixel_sha256``: our JPEG copy captured again, re-saved or with
-    metadata added) or by the copy's very bytes. ``mask_seed.seed_clean_image``
+    metadata added) or by the copy's very bytes. ``mask_seed.link_capture``
     links every capture of a picture behind every clean copy of it, in
-    whichever order they were seeded, so each copy, and any mask made from
-    it, is judged over all of them (app.publication).
+    whichever order they arrive and whichever route captured them (the seed,
+    the gallery ingest), so each copy, and any mask made from it, is judged
+    over all of them (app.publication).
     """
 
     __tablename__ = "public_object_images"
