@@ -25,10 +25,10 @@ from app.derivative_main import app as origin_app
 from app.derivative_main import get_object_store
 from app.models import FigureGallery, ImageMask, ImageVersion, PublicObject
 from app.models import Image as ImageModel
-from app.object_store import LocalObjectStore
+from app.object_store import LocalObjectStore, derived_key
 from app.workers.mask_job import run_mask_batch
 from app.workers.mask_policy import ImageOrigin
-from app.workers.mask_seed import seed_clean_image
+from app.workers.mask_seed import register_public_object, seed_clean_image
 from app.workers.matting import MattingBackend, StubMattingBackend
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -442,6 +442,67 @@ class TestNotFound:
         self._seed_capture(db_session, store, 1, PICTURE)
         self._assert_404(client.get(f"/d/{row.mask_sha256}"))
         assert client.get(f"/d/{row.source_sha256}").status_code == 200
+
+    @pytest.mark.parametrize(
+        ("url", "status"),
+        [(ITEM.format(n=7), 200), (PICTURE, 404)],
+        ids=["item-image", "collector-photo"],
+    )
+    def test_a_matted_cut_out_is_judged_like_a_mask(
+        self,
+        client: TestClient,
+        db_session: Session,
+        store: LocalObjectStore,
+        url: str,
+        status: int,
+    ) -> None:
+        """A matted cut-out is our derivative work on the picture, like a mask:
+        served only while its image is live AND mask-eligible. Nothing
+        registers one yet; whatever does cannot skip the permission split."""
+        clean = seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=url, source="mfc")],
+            figure_id="mfc:7",
+        )
+        clean_version = db_session.get(ImageVersion, clean.image_version_id)
+        assert clean_version is not None
+        out = io.BytesIO()
+        Image.new("RGBA", (40, 60), (31, 30, 90, 255)).save(out, format="PNG")
+        data = out.getvalue()
+        sha = hashlib.sha256(data).hexdigest()
+        key = derived_key(sha, "image/png")
+        store.put(key, data, "image/png")
+        version = ImageVersion(
+            image_id=clean_version.image_id,
+            version_no=3,
+            derived_from_version=2,
+            transform_spec={"derive_kind": "matted"},
+            mime="image/png",
+            width=40,
+            height=60,
+            bytes=len(data),
+            storage_key=key,
+            visibility="public",
+            age_rating=0,
+            matted=True,
+        )
+        db_session.add(version)
+        db_session.flush()
+        register_public_object(
+            db_session,
+            sha256=sha,
+            kind="matted",
+            mime="image/png",
+            size=len(data),
+            width=40,
+            height=60,
+            storage_key=key,
+            image_version_id=version.id,
+        )
+        db_session.commit()
+        assert client.get(f"/d/{sha}").status_code == status
 
     def test_a_store_mask_is_judged_by_the_origins_own_grants(
         self,
