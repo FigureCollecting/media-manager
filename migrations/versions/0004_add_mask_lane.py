@@ -91,7 +91,7 @@ def upgrade() -> None:
             "source_sha256", "pipeline_version", name="uq_image_mask_source_version"
         ),
         sa.CheckConstraint(
-            "status in ('ok','held','empty','ineligible','failed')", name="ck_image_mask_status"
+            "status in ('ok','held','empty','ineligible','failed','withdrawn')", name="ck_image_mask_status"
         ),
     )
     op.create_index("ix_image_masks_mask_sha256", "image_masks", ["mask_sha256"])

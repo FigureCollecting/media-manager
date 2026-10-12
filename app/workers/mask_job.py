@@ -22,6 +22,11 @@ offset, so nothing is skipped or seen twice).
 FAILURES are per image: recorded as ``failed`` with the exception's CLASS
 only (never a message, which can carry a bucket or key), and re-driven with
 ``retry_failed=True``.
+
+RE-EVALUATION. ``reevaluate_masks`` re-judges every published (``ok``) and
+``withdrawn`` row against its image's current state (app.publication): the
+origin already refuses such a mask on every request; this keeps the lane's
+own record in line and restores a mask whose image qualifies again.
 """
 
 from __future__ import annotations
@@ -36,12 +41,13 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import FigureGallery, ImageMask, ImageVersion, MaskBatch, PublicObject
 from ..models import Image as ImageModel
+from ..models import ImageMask, ImageVersion, MaskBatch, PublicObject
 from ..object_store import ObjectStore, derived_key
+from ..publication import gallery_origins, mask_refusal
 from .grounding import AlphaGrounding
 from .mask import MASK_MIME, MASK_PIPELINE_VERSION, MaskOutcome, build_mask_artifact
-from .mask_policy import ImageOrigin, mask_eligibility
+from .mask_policy import StoreGrants, mask_eligibility
 from .mask_seed import register_public_object
 from .matting import MattingBackend, get_matting_backend
 
@@ -111,15 +117,6 @@ def _candidates(
     if after is not None:
         query = query.where(PublicObject.sha256 > after)
     return list(db.execute(query).scalars())
-
-
-def _origins(db: Session, image_id: int) -> list[ImageOrigin]:
-    rows = db.execute(
-        select(FigureGallery)
-        .where(FigureGallery.image_id == image_id, FigureGallery.deleted_at.is_(None))
-        .order_by(FigureGallery.id)
-    ).scalars()
-    return [ImageOrigin(url=g.source_url, source=g.source) for g in rows]
 
 
 def _row_fields(outcome: MaskOutcome) -> dict[str, Any]:
@@ -204,7 +201,7 @@ def _settle(
     sha = obj.sha256
     version = db.get(ImageVersion, obj.image_version_id)
     assert version is not None  # the candidate query joined it
-    eligibility = mask_eligibility(_origins(db, version.image_id))
+    eligibility = mask_eligibility(gallery_origins(db, version.image_id))
     if not eligibility.eligible:
         if batch is not None:
             _write_row(
@@ -347,3 +344,42 @@ def run_mask_batch(
         batch.finished_at = dt.datetime.now(dt.UTC)
         db.commit()
     return report
+
+
+def reevaluate_masks(
+    db: Session, *, dry_run: bool = True, store_grants: StoreGrants | None = None
+) -> dict[str, Any]:
+    """Withdraw every ``ok`` row whose clean image is deleted or no longer
+    mask-eligible (reason: the refusal) and restore every ``withdrawn`` row
+    whose image qualifies again. Every pipeline version is judged: an old
+    version's mask is as addressable as the current one's. Dry run unless
+    ``dry_run=False``; held, empty, ineligible and failed rows are never
+    touched."""
+    rows = db.execute(
+        select(ImageMask).where(ImageMask.status.in_(("ok", "withdrawn"))).order_by(ImageMask.id)
+    ).scalars()
+    withdrawn: list[str] = []
+    restored: list[str] = []
+    unchanged = 0
+    now = dt.datetime.now(dt.UTC)
+    for row in list(rows):
+        refusal = mask_refusal(db, row.source_sha256, store_grants)
+        if row.status == "ok" and refusal is not None:
+            withdrawn.append(row.source_sha256)
+            status, reason = "withdrawn", refusal
+        elif row.status == "withdrawn" and refusal is None:
+            restored.append(row.source_sha256)
+            status, reason = "ok", None
+        else:
+            unchanged += 1
+            continue
+        if not dry_run:
+            row.status, row.reason, row.updated_at = status, reason, now
+    if not dry_run:
+        db.commit()
+    return {
+        "dry_run": dry_run,
+        "withdrawn": withdrawn,
+        "restored": restored,
+        "unchanged": unchanged,
+    }

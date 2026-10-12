@@ -171,7 +171,16 @@ def _schema_snapshot(engine) -> tuple[dict[str, object], dict[str, set[tuple[str
         uniques = sorted(
             tuple(sorted(uc["column_names"])) for uc in insp.get_unique_constraints(table_name)
         )
-        tables[table_name] = {"columns": columns, "pk": pk, "fks": fks, "uniques": uniques}
+        checks = sorted(
+            (cc["name"], cc["sqltext"]) for cc in insp.get_check_constraints(table_name)
+        )
+        tables[table_name] = {
+            "columns": columns,
+            "pk": pk,
+            "fks": fks,
+            "uniques": uniques,
+            "checks": checks,
+        }
         indexes[table_name] = {
             tuple(sorted(ix["column_names"])) for ix in insp.get_indexes(table_name)
         }

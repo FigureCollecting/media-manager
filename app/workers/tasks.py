@@ -21,7 +21,7 @@ from ..url_guard import _validate_ingest_url
 from . import celery_app
 from .derivatives import compute_dominant_color, compute_thumbhash
 from .grounding import compute_bottom_margin_frac, compute_contact_band
-from .mask_job import run_mask_batch
+from .mask_job import reevaluate_masks, run_mask_batch
 from .watermark import apply_watermark, strip_exif
 
 if TYPE_CHECKING:
@@ -535,3 +535,12 @@ def generate_masks(limit: int | None = None, apply: bool = False) -> dict[str, A
     with worker_session() as db:
         report = run_mask_batch(db, S3ObjectStore(), dry_run=not apply, limit=limit)
     return report.as_dict()
+
+
+@celery_app.task(name="reevaluate_masks")
+def reevaluate_published_masks(apply: bool = False) -> dict[str, Any]:
+    """MASK-1: withdraw published masks whose image was deleted or is no
+    longer eligible, restore withdrawn ones that qualify again. DRY RUN
+    unless ``apply=True``."""
+    with worker_session() as db:
+        return reevaluate_masks(db, dry_run=not apply)

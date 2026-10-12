@@ -651,11 +651,13 @@ class TestReevaluate:
             "restored": [],
             "unchanged": 1,
         }
+        db_session.commit()  # a dry run left nothing behind to commit
         db_session.refresh(first)
         assert first.status == "ok"
 
         applied = reevaluate_masks(db_session, dry_run=False)
         assert applied["withdrawn"] == [first.source_sha256]
+        db_session.rollback()  # ... and an applied one committed its changes
         db_session.refresh(first)
         db_session.refresh(second)
         assert (first.status, first.reason) == ("withdrawn", "user_photo")

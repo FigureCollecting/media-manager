@@ -13,7 +13,10 @@ including any other method on ``/d/``, is a bodiless 404.
 
 THE ADDRESS IS THE CAPABILITY. Only rows of ``public_objects`` are served --
 our clean derivatives and our masks -- so an original, a held mask or any
-other stored object has no address here. The bytes are re-hashed before they
+other stored object has no address here. A registered object is served
+only while app.publication.servable says so: a soft-deleted image or
+version, a withdrawn mask, or a mask whose image is no longer
+mask-eligible is a 404. The bytes are re-hashed before they
 are sent: content cached forever on phones must be exactly what its address
 names, and a store that returns anything else is a 500 that is never cached.
 
@@ -47,6 +50,7 @@ from .config import Settings, get_settings
 from .db import get_db
 from .models import PublicObject
 from .object_store import ObjectStore, S3ObjectStore
+from .publication import servable
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +117,7 @@ def derivative(
     settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> Response:
     obj = db.get(PublicObject, sha256)
-    if obj is None:
+    if obj is None or not servable(db, obj, settings.mask_store_grants):
         return _bare(404)
     try:
         data = store.get(obj.storage_key)

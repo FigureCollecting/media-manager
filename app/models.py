@@ -306,7 +306,9 @@ class ImageMask(Base):
     """MASK-1's answer for one clean image at one mask pipeline version --
     the idempotency key of the batch job. ``ok`` rows carry a mask that is
     registered in public_objects; ``held`` rows keep their mask privately
-    for review; ``empty``/``ineligible``/``failed`` rows carry no mask.
+    for review; ``empty``/``ineligible``/``failed`` rows carry no mask; a
+    ``withdrawn`` row's mask stays registered but is not served (its image
+    was deleted or is no longer eligible; ``reevaluate_masks``).
 
     Grounding is measured on the mask's alpha (contract ProductImage:
     bottom_margin_frac, contact_band) plus the CONTRACT-1 follow-up fields
@@ -356,7 +358,8 @@ class ImageMask(Base):
     __table_args__ = (
         UniqueConstraint("source_sha256", "pipeline_version", name="uq_image_mask_source_version"),
         CheckConstraint(
-            "status in ('ok','held','empty','ineligible','failed')", name="ck_image_mask_status"
+            "status in ('ok','held','empty','ineligible','failed','withdrawn')",
+            name="ck_image_mask_status",
         ),
         Index("ix_image_masks_mask_sha256", "mask_sha256"),
     )

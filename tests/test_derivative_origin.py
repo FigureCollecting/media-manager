@@ -51,10 +51,9 @@ def _source_image(db: Session, clean_sha: str) -> ImageModel:
     return image
 
 
-def _photo(n: int, variant: int = 0) -> bytes:
+def _photo(n: int) -> bytes:
     arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
     arr[10:50, 12:28] = (31 + 10 * n, 30, 90)
-    arr[0, 0] = (250, 250, 248 - variant)  # distinct bytes, the same mask
     buf = io.BytesIO()
     Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -335,7 +334,7 @@ class TestNotFound:
             seed_clean_image(
                 db_session,
                 store,
-                _photo(1, variant=n),
+                _photo(n),  # distinct clean copies, the same mask
                 origins=[ImageOrigin(url=ITEM.format(n=n), source="mfc")],
                 figure_id=f"mfc:{n}",
             )
@@ -348,6 +347,36 @@ class TestNotFound:
         assert client.get(f"/d/{mask}").status_code == 200
         _source_image(db_session, rows[1].source_sha256).deleted_at = dt.datetime.now(dt.UTC)
         db_session.commit()
+        self._assert_404(client.get(f"/d/{mask}"))
+
+    def test_a_store_mask_is_judged_by_the_origins_own_grants(
+        self,
+        client: TestClient,
+        db_session: Session,
+        store: LocalObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+
+        seed_clean_image(
+            db_session,
+            store,
+            _photo(3),
+            origins=[ImageOrigin(url="https://img.shop.example/p/3.jpg", source="shop")],
+            figure_id="shop:3",
+        )
+        monkeypatch.setenv("MASK_STORE_GRANTS", json.dumps({"shop": ["shop.example"]}))
+        get_settings.cache_clear()
+        try:
+            run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        finally:
+            monkeypatch.delenv("MASK_STORE_GRANTS")
+            get_settings.cache_clear()
+        mask = db_session.execute(select(ImageMask)).scalar_one().mask_sha256
+        granted = Settings(environment="test", mask_store_grants={"shop": ["shop.example"]})
+        origin_app.dependency_overrides[get_settings] = lambda: granted
+        assert client.get(f"/d/{mask}").status_code == 200
+        origin_app.dependency_overrides[get_settings] = lambda: Settings(environment="test")
         self._assert_404(client.get(f"/d/{mask}"))
 
     def test_an_unknown_address(self, client: TestClient, seeded: dict[str, str]) -> None:

@@ -8,6 +8,7 @@
                                                 [--isnet-anime PATH]
                                                 [--report FILE]
     python -m app.cli.masks [--sandbox DIR] report --batch ID
+    python -m app.cli.masks [--sandbox DIR] reevaluate [--apply]
 
 ``run`` is a DRY RUN unless ``--apply``: it computes and prints every mask's
 outcome and grounding, and writes nothing. ``--apply`` needs a mask model
@@ -37,7 +38,7 @@ from sqlalchemy.orm import Session
 from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
 from ..workers.basekept import BaseKeptMattingBackend
-from ..workers.mask_job import run_mask_batch
+from ..workers.mask_job import reevaluate_masks, run_mask_batch
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
 from ..workers.matting import (
@@ -218,6 +219,11 @@ def _parser() -> argparse.ArgumentParser:
 
     rep = sub.add_parser("report", help="show one applied batch")
     rep.add_argument("--batch", required=True, type=int)
+
+    ree = sub.add_parser(
+        "reevaluate", help="withdraw or restore published masks (dry run by default)"
+    )
+    ree.add_argument("--apply", action="store_true", help="store the changes (default: dry run)")
     return p
 
 
@@ -236,6 +242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print(_seed(db, store, args.sample))
             elif args.command == "run":
                 _print(_run(db, store, args))
+            elif args.command == "reevaluate":
+                _print(reevaluate_masks(db, dry_run=not args.apply))
             else:
                 _print(_report(db, args.batch))
         finally:
