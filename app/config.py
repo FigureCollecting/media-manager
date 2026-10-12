@@ -48,11 +48,9 @@ class Settings(BaseSettings):
     # that may read /d/<sha256> bytes cross-origin (the service worker caches
     # them; the case view composites a mask over its derivative). fc-infra
     # edge README "The public image address (ADDR-1)". Env MEDIA_CORS_ORIGINS
-    # as a JSON list.
-    media_cors_origins: list[str] = [
-        "https://figurecollecting.com",
-        "https://fc-api-canary.mindsignals1.com",
-    ]
+    # as a JSON list; a canary origin is added by its deployment's env, never
+    # by default.
+    media_cors_origins: list[str] = ["https://figurecollecting.com"]
 
     # MASK-1 per-source mask grants (app.workers.mask_policy): per source, the
     # domains (subdomains included) whose listing photos may get a mask. Env

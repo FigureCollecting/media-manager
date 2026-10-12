@@ -431,6 +431,38 @@ class TestNotFound:
         url = path.format(sha=sha, hex0=format(ord(sha[0]), "02x"), rest=sha[1:])
         self._assert_404(client.get(url))
 
+    @pytest.mark.parametrize(("path", "status"), [("/d/{sha}", 200), ("/d/{sha}/x", 404)])
+    def test_without_a_raw_path_the_decoded_path_is_judged(
+        self, client: TestClient, seeded: dict[str, str], path: str, status: int
+    ) -> None:
+        """ASGI makes ``raw_path`` optional; a server that omits it is judged
+        on the decoded path, by the same grammar."""
+        import anyio
+
+        sent: list[dict[str, object]] = []
+
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path.format(sha=seeded["mask"]),
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 1),
+            "server": ("testserver", 80),
+            "root_path": "",
+        }
+        anyio.run(origin_app, scope, receive, send)
+        assert sent[0]["status"] == status
+
     @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     def test_any_other_method(
         self, client: TestClient, seeded: dict[str, str], method: str

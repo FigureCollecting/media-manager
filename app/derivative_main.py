@@ -54,7 +54,9 @@ from .publication import servable
 
 logger = logging.getLogger(__name__)
 
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+#: The whole grammar, matched on the path AS SENT (ASGI ``raw_path``), so a
+#: percent-encoded alias (``/d%2F<sha>``, ``/d/%62...``) is not the address.
+_DERIVATIVE_PATH = re.compile(rb"/d/[0-9a-f]{64}")
 
 IMMUTABLE = "public, max-age=31536000, immutable"
 
@@ -84,17 +86,13 @@ async def only_the_grammar(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
     """Everything that is not GET/HEAD /d/<64 lowercase hex> (no query) or
-    GET /healthz is a 404 -- decided before any route, database or store."""
-    path = request.url.path
+    GET /healthz, exactly as sent, is a 404 -- decided before any route,
+    database or store."""
+    raw = request.scope.get("raw_path") or request.url.path.encode()
     method = request.method
-    if method == "GET" and path == "/healthz":
+    if method == "GET" and raw == b"/healthz":
         return await call_next(request)
-    if (
-        method in ("GET", "HEAD")
-        and path.startswith("/d/")
-        and _SHA256_HEX.fullmatch(path[3:])
-        and not request.url.query
-    ):
+    if method in ("GET", "HEAD") and _DERIVATIVE_PATH.fullmatch(raw) and not request.url.query:
         return await call_next(request)
     return _bare(404)
 
