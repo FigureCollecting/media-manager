@@ -79,6 +79,20 @@ def _capture(text: str) -> bytes:
     return buf.getvalue()
 
 
+def _rgba_capture(text: str) -> bytes:
+    """An RGBA picture (one transparent pixel: a lossless PNG clean copy) with a text chunk."""
+    from PIL import PngImagePlugin
+
+    arr = np.full((60, 40, 4), (245, 245, 245, 255), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30, 255)
+    arr[0, 0, 3] = 0
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Comment", text)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGBA").save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
 class _Model(StubMattingBackend):
     """The stub's arithmetic standing in for a mask model (the real stub never publishes)."""
 
@@ -442,6 +456,60 @@ class TestNotFound:
         self._seed_capture(db_session, store, 1, PICTURE)
         self._assert_404(client.get(f"/d/{row.mask_sha256}"))
         assert client.get(f"/d/{row.source_sha256}").status_code == 200
+
+    @pytest.mark.parametrize(
+        ("second_url", "mask_served"),
+        [(ITEM.format(n=2), True), (PICTURE, False)],
+        ids=["item-capture", "collector-photo"],
+    )
+    def test_soft_deleting_the_capture_whose_bytes_are_the_copy_takes_it_offline(
+        self,
+        client: TestClient,
+        db_session: Session,
+        store: LocalObjectStore,
+        second_url: str,
+        mask_served: bool,
+    ) -> None:
+        """Challenger i3 D2: the second capture's bytes ARE the first one's
+        canonical clean copy. It is linked behind that copy by its pixels, so
+        it is judged with it, and its soft delete takes the copy (and any
+        mask) offline."""
+        from app.workers.mask_seed import make_clean_copy
+
+        first = _rgba_capture("crawl 1")
+        again = make_clean_copy(first)[0]
+        clean = seed_clean_image(
+            db_session,
+            store,
+            first,
+            origins=[ImageOrigin(url=ITEM.format(n=1), source="mfc")],
+            figure_id="mfc:1",
+        )
+        seed_clean_image(
+            db_session,
+            store,
+            again,
+            origins=[ImageOrigin(url=second_url, source="mfc")],
+            figure_id="mfc:2",
+        )
+        assert clean.sha256 == hashlib.sha256(again).hexdigest()
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        masks = [
+            m.mask_sha256
+            for m in db_session.execute(select(ImageMask).where(ImageMask.status == "ok")).scalars()
+        ]
+        assert len(masks) == (1 if mask_served else 0)
+        assert client.get(f"/d/{clean.sha256}").status_code == 200
+        for mask in masks:
+            assert client.get(f"/d/{mask}").status_code == 200
+        captured = db_session.execute(
+            select(ImageModel).where(ImageModel.sha256 == clean.sha256)
+        ).scalar_one()
+        captured.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{clean.sha256}"))
+        for mask in masks:
+            self._assert_404(client.get(f"/d/{mask}"))
 
     @pytest.mark.parametrize(
         ("url", "status"),

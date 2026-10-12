@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from app.models import FigureGallery, ImageMask, MaskBatch, PublicObject
+from app.models import FigureGallery, ImageMask, MaskBatch, PublicObject, PublicObjectImage
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore, S3ObjectStore, derived_key
 from app.workers import mask_job
@@ -626,6 +626,171 @@ class TestPixelIdenticalCaptures:
         (row,) = _masks(db_session)
         assert report["withdrawn"] == [row.source_sha256]
         assert (row.status, row.reason) == ("withdrawn", "user_photo")
+
+
+def _rgba_capture(text: str | None) -> bytes:
+    """An RGBA picture (one transparent pixel, so its clean copy is a lossless
+    PNG), with a text chunk unless ``text`` is None."""
+    from PIL import PngImagePlugin
+
+    arr = np.full((60, 40, 4), (245, 245, 245, 255), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30, 255)
+    arr[0, 0, 3] = 0
+    info = None
+    if text is not None:
+        info = PngImagePlugin.PngInfo()
+        info.add_text("Comment", text)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGBA").save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+def _canonical_pair() -> tuple[bytes, bytes]:
+    """Challenger i3's D2 pair: a capture with a text chunk, and a capture
+    whose bytes ARE that picture's canonical clean encoding (our own clean
+    copy captured again). The same pixels, different bytes -- and their
+    clean copies do not coincide, because the encoder falls back to another
+    setting when the first one reproduces its input."""
+    first = _rgba_capture("crawl 1")
+    again = make_clean_copy(first)[0]
+    assert again != first
+    assert make_clean_copy(again)[0] != again
+    return first, again
+
+
+def pixel_digest(original: bytes) -> str:
+    from app.workers.mask_seed import pixel_digest as digest
+
+    return digest(original)
+
+
+class TestPixelDigest:
+    """The link between captures keys on the PIXELS: the sha-256 of the mode,
+    the size and the decoded bytes after EXIF orientation."""
+
+    def test_the_canonical_pair_has_one_digest(self) -> None:
+        first, again = _canonical_pair()
+        assert pixel_digest(first) == pixel_digest(again)
+
+    def test_other_pixels_have_another_digest(self) -> None:
+        assert pixel_digest(_photo((31, 30, 90))) != pixel_digest(_photo((41, 30, 90)))
+
+    def test_the_digest_is_taken_after_exif_orientation(self) -> None:
+        arr = np.zeros((20, 10, 3), dtype=np.uint8)
+        arr[:5] = (200, 10, 10)
+        upright = Image.fromarray(arr, mode="RGB")
+        exif = Image.Exif()
+        exif[0x0112] = 6  # stored rotated: rotate 90 degrees clockwise to view
+        tagged = io.BytesIO()
+        upright.transpose(Image.Transpose.ROTATE_90).save(tagged, format="PNG", exif=exif)
+        plain = io.BytesIO()
+        upright.save(plain, format="PNG")
+        assert pixel_digest(tagged.getvalue()) == pixel_digest(plain.getvalue())
+
+    def test_a_seeded_clean_copy_carries_the_digest(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        clean = _seed(db_session, store, 1)
+        assert clean.pixel_sha256 == pixel_digest(_photo((41, 30, 90), seed=1))
+
+    def test_a_clean_copy_cannot_be_registered_without_its_digest(
+        self, db_session: Session
+    ) -> None:
+        with pytest.raises(ValueError, match="pixel digest"):
+            register_public_object(
+                db_session,
+                sha256="a" * 64,
+                kind="sanitized",
+                mime="image/png",
+                size=1,
+                width=1,
+                height=1,
+                storage_key="derived/x",
+            )
+
+
+class TestCapturesKeyedOnPixels:
+    """Challenger i3 D2: two captures of one picture whose clean copies would
+    NOT coincide -- one of them is the canonical clean encoding itself -- still
+    share ONE clean copy, in either seeding order, because the link keys on
+    the pixel digest and not on the minted clean sha."""
+
+    def _seed_pair(
+        self, db: Session, store: LocalObjectStore, urls: tuple[str, str], *, again_first: bool
+    ) -> tuple[list[PublicObject], dict[str, ImageModel]]:
+        first, again = _canonical_pair()
+        order = [("again", again, urls[1]), ("first", first, urls[0])]
+        if not again_first:
+            order.reverse()
+        objs = [
+            seed_clean_image(
+                db,
+                store,
+                data,
+                origins=[ImageOrigin(url=url, source="mfc")],
+                figure_id=f"mfc:{name}",
+            )
+            for name, data, url in order
+        ]
+        images = {
+            name: db.execute(
+                select(ImageModel).where(ImageModel.sha256 == hashlib.sha256(data).hexdigest())
+            ).scalar_one()
+            for name, data, _ in order
+        }
+        return objs, images
+
+    @pytest.mark.parametrize("again_first", [False, True], ids=["item-first", "photo-first"])
+    def test_a_collector_photo_that_is_the_clean_encoding_refuses_the_mask(
+        self, db_session: Session, store: LocalObjectStore, again_first: bool
+    ) -> None:
+        objs, images = self._seed_pair(
+            db_session, store, (ITEM.format(n=1), PICTURE.format(n=1)), again_first=again_first
+        )
+        assert len({o.sha256 for o in objs}) == 1
+        assert len(_public(db_session, "sanitized")) == 1
+        linked = db_session.execute(
+            select(PublicObjectImage.image_id).where(PublicObjectImage.sha256 == objs[0].sha256)
+        ).scalars()
+        assert sorted(linked) == sorted(i.id for i in images.values())
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason, i.origin_class) for i in report.items] == [
+            ("ineligible", "user_photo", "user_photo")
+        ]
+        assert _public(db_session, "mask") == []
+
+    @pytest.mark.parametrize("again_first", [False, True], ids=["first-first", "again-first"])
+    def test_item_captures_one_of_them_the_clean_encoding_share_one_mask(
+        self, db_session: Session, store: LocalObjectStore, again_first: bool
+    ) -> None:
+        self._seed_pair(
+            db_session, store, (ITEM.format(n=1), ITEM.format(n=2)), again_first=again_first
+        )
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [i.status for i in report.items] == ["ok"]
+        assert len(_public(db_session, "sanitized")) == 1
+        assert len(_public(db_session, "mask")) == 1
+
+    def test_soft_deleting_the_capture_whose_bytes_are_the_copy_withdraws_the_mask(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Item first: the shared copy's bytes ARE the second capture's
+        original. A soft delete of that capture reaches the copy and its mask."""
+        import datetime as dt
+
+        from app.workers.mask_job import reevaluate_masks
+
+        objs, images = self._seed_pair(
+            db_session, store, (ITEM.format(n=1), ITEM.format(n=2)), again_first=False
+        )
+        assert images["again"].sha256 == objs[0].sha256
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        images["again"].deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False)
+        (row,) = _masks(db_session)
+        assert report["withdrawn"] == [row.source_sha256]
+        assert (row.status, row.reason) == ("withdrawn", "deleted")
 
 
 class TestOnlyAMaskModelPublishes:
