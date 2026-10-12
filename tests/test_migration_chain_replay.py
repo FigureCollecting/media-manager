@@ -148,6 +148,9 @@ def test_full_chain_downgrade_and_upgrade_again(empty_database_url: str) -> None
 def _schema_snapshot(engine) -> tuple[dict[str, object], dict[str, set[tuple[str, ...]]]]:
     """Reflect tables/columns/keys and, separately, indexes (excludes alembic's own table).
 
+    A foreign key is compared with its ON DELETE rule: a migration that
+    cascades differently from the model is drift too.
+
     Tables/columns/keys are returned as an exact-comparable snapshot. Indexes are
     returned separately (per table, as a set of sorted column-name tuples) because
     the migration chain adds two raw-SQL GIN trigram indexes on top of what
@@ -165,7 +168,12 @@ def _schema_snapshot(engine) -> tuple[dict[str, object], dict[str, set[tuple[str
         }
         pk = sorted(insp.get_pk_constraint(table_name).get("constrained_columns") or [])
         fks = sorted(
-            (fk["constrained_columns"][0], fk["referred_table"], fk["referred_columns"][0])
+            (
+                fk["constrained_columns"][0],
+                fk["referred_table"],
+                fk["referred_columns"][0],
+                str(fk["options"].get("ondelete")),
+            )
             for fk in insp.get_foreign_keys(table_name)
         )
         uniques = sorted(
