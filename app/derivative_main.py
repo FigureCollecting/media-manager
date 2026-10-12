@@ -15,8 +15,11 @@ THE ADDRESS IS THE CAPABILITY. Only rows of ``public_objects`` are served --
 our clean derivatives and our masks -- and an original's bytes are never
 registered, so an original, a held mask or any other stored object has no
 address here. The one overlap is an original whose bytes ARE one of our
-clean copies (that copy captured again, before or after it was minted): it
-is linked behind the copy by those bytes and judged with it. A registered
+objects -- a clean copy captured again, before or after it was minted, or
+a mask or cut-out captured after it was registered (before, the
+registration refuses those bytes): it is linked behind the object by those
+bytes, so a clean copy is judged with it and a mask or cut-out is served
+only while it is live. A registered
 object is served only while app.publication.servable says so: a
 soft-deleted image or version, a withdrawn mask, a mask whose image is no
 longer mask-eligible, or a mask of a revoked store (MASK-G, from the moment

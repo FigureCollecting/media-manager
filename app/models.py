@@ -260,9 +260,11 @@ class PublicObject(Base):
     derivative, a matted fallback, or a MASK-1 mask. An original's bytes are
     never registered (``mask_seed.register_public_object`` refuses an
     ``images.sha256``). The one overlap: an original whose bytes ARE one of
-    our clean copies (that copy captured again, before or after it was
-    minted) is linked behind the copy by those bytes and judged with it
-    (app.publication).
+    our objects -- a clean copy captured again, before or after it was
+    minted, or a mask or cut-out captured after it was registered (before,
+    the registration refuses those bytes) -- is linked behind the object by
+    those bytes: a clean copy is judged with it, a mask or cut-out is served
+    only while it is live (app.publication).
     """
 
     __tablename__ = "public_objects"
@@ -308,7 +310,8 @@ class PublicObject(Base):
 
 class PublicObjectImage(Base):
     """Every image a clean public object is the clean copy of: its own
-    image, and every other capture of the same picture.
+    image, and every other capture of the same picture. For a mask or a
+    cut-out: a capture of its very bytes.
 
     A capture belongs to a picture by its pixels (the copy's
     ``pixel_sha256``), by the copy's own decoded pixels

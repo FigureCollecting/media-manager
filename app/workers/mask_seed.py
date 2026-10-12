@@ -229,8 +229,15 @@ def link_capture(db: Session, image: ImageModel, digest: str) -> list[PublicObje
     pixels (``pixel_sha256``), decoding to them (``own_pixel_sha256``), or
     whose very bytes it has. Then every capture of the picture is behind
     every copy of it (``_join_picture``). Returns those copies, the one
-    minted from these pixels first; none while the picture has no copy."""
+    minted from these pixels first; none while the picture has no copy.
+
+    A capture whose bytes ARE one of our masks or cut-outs (registered
+    before it: the registration refuses an original's bytes) is linked
+    behind that object too, which is served only while it is live
+    (app.publication)."""
     image.pixel_sha256 = digest
+    if db.get(PublicObject, image.sha256) is not None:
+        _link(db, {image.sha256}, {image.id})
     copies = _copies_showing(db, digest, image.sha256)
     _join_picture(db, {c.sha256 for c in copies}, {image.id})
     return copies

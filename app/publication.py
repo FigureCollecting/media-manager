@@ -39,7 +39,9 @@ origin (a collector's photo) or every origin is gone, or a source of one of
 its origins is revoked (MASK-G: ``store_revocations``, read on every
 request), and stays offline until ``reevaluate_masks`` restores its row
 (app.workers.mask_job). A revocation never touches a clean copy: display is
-not decided here.
+not decided here. A mask or a cut-out is also offline while an image whose
+bytes ARE it (our object captured again, linked behind it by
+app.workers.mask_seed.link_capture) is soft-deleted.
 
 What a phone already cached under the immutable address cannot be recalled.
 Nor, yet, can an edge copy: a 200 is ``public, max-age=31536000, immutable``
@@ -174,6 +176,17 @@ def cut_from(db: Session, sha256: str) -> str | None:
     ).scalar_one_or_none()
 
 
+def _captures_live(db: Session, sha256: str) -> bool:
+    """Whether no image linked behind ``sha256`` -- for a mask or a cut-out, a
+    capture of its very bytes -- is soft-deleted."""
+    dead = db.execute(
+        select(PublicObjectImage.image_id)
+        .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
+        .where(PublicObjectImage.sha256 == sha256, ImageModel.deleted_at.is_not(None))
+    ).first()
+    return dead is None
+
+
 def servable(
     db: Session,
     obj: PublicObject,
@@ -184,6 +197,8 @@ def servable(
     ``store_revocations(db)``, read per judgment."""
     if obj.kind == "sanitized":
         return images_behind(db, obj.sha256) is not None
+    if not _captures_live(db, obj.sha256):
+        return False
     if obj.kind == "mask":
         sources = db.execute(
             select(ImageMask.source_sha256).where(

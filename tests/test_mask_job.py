@@ -1466,15 +1466,19 @@ class TestOurLossyCopyCapturedAgain:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         """Only a CLEAN copy's bytes make a capture one of its picture's: a
-        capture of a mask is a picture of its own."""
-        _seed(db_session, store, 1)
+        capture of a mask is a picture of its own, with a clean copy of its
+        own -- and, by its bytes, it is behind the mask (challenger i5 C)."""
+        item = _seed(db_session, store, 1)
         run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         (mask,) = _public(db_session, "mask")
         copy = seed_clean_image(
             db_session, store, store.get(mask.storage_key), origins=[], figure_id="x"
         )
+        captured = _image_of(db_session, copy.sha256)
         assert copy.kind == "sanitized"
-        assert _behind(db_session, mask.sha256) == set()
+        assert copy.sha256 not in (item.sha256, mask.sha256)
+        assert _behind(db_session, mask.sha256) == {captured}
+        assert captured not in _behind(db_session, item.sha256)
 
     def test_a_seeded_copy_carries_its_own_digest(
         self, db_session: Session, store: LocalObjectStore
