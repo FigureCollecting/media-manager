@@ -31,6 +31,11 @@ origin (a collector's photo) or every origin is gone, and stays offline
 until ``reevaluate_masks`` restores its row (app.workers.mask_job).
 
 What a phone already cached under the immutable address cannot be recalled.
+Nor, yet, can an edge copy: a 200 is ``public, max-age=31536000, immutable``
+and the fc-infra ADDR-1 edge caches it (ignoring a request's no-cache), so a
+withdrawal or a soft delete stops at this origin. Once the images tunnel or
+cache rule lands, both must also purge the edge (a purge by URL) -- a
+follow-up, not done here.
 """
 
 from __future__ import annotations
