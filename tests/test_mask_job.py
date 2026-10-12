@@ -511,6 +511,107 @@ class TestApply:
         ]
 
 
+def _capture(text: str) -> bytes:
+    """The same pixels every time; different bytes per ``text`` (a PNG text
+    chunk) -- two captures of one picture, as two crawls or a re-save make."""
+    from PIL import PngImagePlugin
+
+    arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30)
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Comment", text)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGB").save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+def _seed_captures(
+    db: Session, store: LocalObjectStore, urls: list[str]
+) -> tuple[PublicObject, list[ImageModel]]:
+    """One pixel-identical capture per url, seeded in that order; the shared
+    clean copy and the images in seeding order."""
+    objs = [
+        seed_clean_image(
+            db,
+            store,
+            _capture(f"capture {i}"),
+            origins=[ImageOrigin(url=url, source="mfc")],
+            figure_id=f"mfc:capture-{i}",
+        )
+        for i, url in enumerate(urls)
+    ]
+    assert len({o.sha256 for o in objs}) == 1
+    images = list(db.execute(select(ImageModel).order_by(ImageModel.id)).scalars())
+    assert len(images) == len(urls)
+    return objs[0], images
+
+
+class TestPixelIdenticalCaptures:
+    """Two originals with the same pixels and different bytes are two images
+    that share ONE clean copy (content-addressed). The copy and its mask are
+    judged over EVERY image behind it, whichever was seeded first: the same
+    picture captured as an item image and as a collector's photo is a
+    collector's photo somewhere, and a picture soft-deleted under any capture
+    is offline under all of them."""
+
+    def test_two_captures_are_two_images_with_one_clean_copy(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed_captures(db_session, store, [ITEM.format(n=1), ITEM.format(n=2)])
+        assert len(_public(db_session, "sanitized")) == 1
+
+    @pytest.mark.parametrize("photo_first", [False, True], ids=["item-first", "photo-first"])
+    def test_a_collector_photo_with_the_same_pixels_refuses_the_mask_in_either_order(
+        self, db_session: Session, store: LocalObjectStore, photo_first: bool
+    ) -> None:
+        urls = [ITEM.format(n=1), PICTURE.format(n=1)]
+        _seed_captures(db_session, store, urls[::-1] if photo_first else urls)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [(i.status, i.reason, i.origin_class) for i in report.items] == [
+            ("ineligible", "user_photo", "user_photo")
+        ]
+        assert _public(db_session, "mask") == []
+
+    def test_item_captures_of_the_same_pixels_share_one_mask(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed_captures(db_session, store, [ITEM.format(n=1), ITEM.format(n=2)])
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert [i.status for i in report.items] == ["ok"]
+        assert len(_public(db_session, "mask")) == 1
+
+    @pytest.mark.parametrize("deleted", [0, 1], ids=["first-deleted", "second-deleted"])
+    def test_a_soft_deleted_capture_keeps_the_shared_copy_out_of_the_batch(
+        self, db_session: Session, store: LocalObjectStore, deleted: int
+    ) -> None:
+        import datetime as dt
+
+        _, images = _seed_captures(db_session, store, [ITEM.format(n=1), ITEM.format(n=2)])
+        images[deleted].deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert report.items == []
+
+    def test_a_collector_photo_with_the_same_pixels_seeded_later_withdraws_the_mask(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import reevaluate_masks
+
+        _seed_captures(db_session, store, [ITEM.format(n=1)])
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        seed_clean_image(
+            db_session,
+            store,
+            _capture("a collector's re-save"),
+            origins=[ImageOrigin(url=PICTURE.format(n=1), source="mfc")],
+            figure_id="mfc:capture-photo",
+        )
+        report = reevaluate_masks(db_session, dry_run=False)
+        (row,) = _masks(db_session)
+        assert report["withdrawn"] == [row.source_sha256]
+        assert (row.status, row.reason) == ("withdrawn", "user_photo")
+
+
 class TestOnlyAMaskModelPublishes:
     """The stub is a backdrop-distance heuristic, not a mask model: under it
     the black-dress case and white-on-white figures pass the quality gate

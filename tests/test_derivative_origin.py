@@ -66,6 +66,19 @@ def _photo(n: int) -> bytes:
     return buf.getvalue()
 
 
+def _capture(text: str) -> bytes:
+    """The same pixels every time; different bytes per ``text`` (a PNG text chunk)."""
+    from PIL import PngImagePlugin
+
+    arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30)
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Comment", text)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGB").save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
 class _Model(StubMattingBackend):
     """The stub's arithmetic standing in for a mask model (the real stub never publishes)."""
 
@@ -389,6 +402,46 @@ class TestNotFound:
         _source_image(db_session, rows[1].source_sha256).deleted_at = dt.datetime.now(dt.UTC)
         db_session.commit()
         self._assert_404(client.get(f"/d/{mask}"))
+
+    def _seed_capture(self, db: Session, store: LocalObjectStore, i: int, url: str) -> None:
+        seed_clean_image(
+            db,
+            store,
+            _capture(f"capture {i}"),
+            origins=[ImageOrigin(url=url, source="mfc")],
+            figure_id=f"mfc:capture-{i}",
+        )
+
+    @pytest.mark.parametrize("deleted", [0, 1], ids=["first-deleted", "second-deleted"])
+    def test_a_clean_copy_shared_by_pixel_identical_captures_needs_every_one_live(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore, deleted: int
+    ) -> None:
+        """Two originals, one picture: a soft delete under EITHER capture takes
+        the shared clean copy and its mask offline, whichever was seeded first."""
+        for i in (0, 1):
+            self._seed_capture(db_session, store, i, ITEM.format(n=i))
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        row = db_session.execute(select(ImageMask)).scalar_one()
+        assert row.status == "ok"
+        assert client.get(f"/d/{row.source_sha256}").status_code == 200
+        assert client.get(f"/d/{row.mask_sha256}").status_code == 200
+        images = list(db_session.execute(select(ImageModel).order_by(ImageModel.id)).scalars())
+        assert len(images) == 2
+        images[deleted].deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{row.source_sha256}"))
+        self._assert_404(client.get(f"/d/{row.mask_sha256}"))
+
+    def test_a_collector_photo_with_the_same_pixels_takes_the_shared_mask_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        self._seed_capture(db_session, store, 0, ITEM.format(n=0))
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        row = db_session.execute(select(ImageMask)).scalar_one()
+        assert client.get(f"/d/{row.mask_sha256}").status_code == 200
+        self._seed_capture(db_session, store, 1, PICTURE)
+        self._assert_404(client.get(f"/d/{row.mask_sha256}"))
+        assert client.get(f"/d/{row.source_sha256}").status_code == 200
 
     def test_a_store_mask_is_judged_by_the_origins_own_grants(
         self,
