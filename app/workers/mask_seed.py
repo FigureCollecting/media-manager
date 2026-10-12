@@ -17,7 +17,7 @@ import io
 from collections.abc import Sequence
 
 from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..hashing import compute_phash, detect_mime
@@ -50,10 +50,12 @@ def _digest(picture: Image.Image) -> str:
 
 def pixel_digest(original: bytes) -> str:
     """The PIXEL DIGEST of ``original``: the sha-256 of the mode, the size and
-    the decoded bytes after EXIF orientation. Two captures of one picture
-    share it whatever their bytes (metadata, compression, or one of them
-    being our own clean copy captured again); it is the key that links them
-    behind one clean copy (``seed_clean_image``)."""
+    the decoded bytes after EXIF orientation. Two captures with the same
+    pixels share it whatever their bytes (metadata, a lossless re-save, our
+    own lossless PNG copy captured again). Our JPEG copy decodes to other
+    pixels than its original, so it has a digest of its own, recorded on the
+    copy (``own_pixel_sha256``). ``seed_clean_image`` links captures by
+    both."""
     return _digest(_picture(original))
 
 
@@ -96,37 +98,99 @@ def register_public_object(
     storage_key: str,
     image_version_id: int | None = None,
     pixel_sha256: str | None = None,
+    own_pixel_sha256: str | None = None,
 ) -> PublicObject:
     """Make ``sha256`` addressable at ``/d/<sha256>``. Idempotent on the sha.
 
-    Refuses an original's sha outright: the public origin must never be able
-    to name an original, so an original can never be registered here. A
-    clean copy (``sanitized``) needs its pixel digest, the key later captures
-    of the same picture are linked by; no other kind carries one.
+    Refuses an original's bytes: the public origin must never be able to
+    name an original. The one exception is our own clean copy captured
+    BEFORE it was minted: a clean copy (``sanitized``) of one image whose
+    bytes ANOTHER image's original already has. That original is linked
+    behind the copy, as is the copy's own image (``public_object_images``),
+    and both are judged with it (app.publication). A clean copy carries both
+    pixel digests, the keys later captures of the picture are linked by; no
+    other kind carries either.
     """
     if kind not in PUBLIC_KINDS:
         raise ValueError(f"not a public object kind: {kind!r}")
-    if (kind == "sanitized") != (pixel_sha256 is not None):
+    clean = kind == "sanitized"
+    if (pixel_sha256 is not None) != clean or (own_pixel_sha256 is not None) != clean:
         raise ValueError("a clean copy, and only a clean copy, carries a pixel digest")
-    if db.execute(select(ImageModel.id).where(ImageModel.sha256 == sha256)).first():
+    owner = None
+    if clean and image_version_id is not None:
+        owner = db.execute(
+            select(ImageVersion.image_id).where(ImageVersion.id == image_version_id)
+        ).scalar_one_or_none()
+    captured = db.execute(
+        select(ImageModel.id).where(ImageModel.sha256 == sha256)
+    ).scalar_one_or_none()
+    if captured is not None and (owner is None or captured == owner):
         raise ValueError("refusing to publish an original's bytes")
-    existing = db.get(PublicObject, sha256)
-    if existing is not None:
-        return existing
-    obj = PublicObject(
-        sha256=sha256,
-        kind=kind,
-        mime=mime,
-        bytes=size,
-        width=width,
-        height=height,
-        storage_key=storage_key,
-        image_version_id=image_version_id,
-        pixel_sha256=pixel_sha256,
-    )
-    db.add(obj)
-    db.flush()
+    obj = db.get(PublicObject, sha256)
+    if obj is None:
+        obj = PublicObject(
+            sha256=sha256,
+            kind=kind,
+            mime=mime,
+            bytes=size,
+            width=width,
+            height=height,
+            storage_key=storage_key,
+            image_version_id=image_version_id,
+            pixel_sha256=pixel_sha256,
+            own_pixel_sha256=own_pixel_sha256,
+        )
+        db.add(obj)
+        db.flush()
+    _link(db, {sha256}, {i for i in (owner, captured) if i is not None})
     return obj
+
+
+def _link(db: Session, copies: set[str], images: set[int]) -> None:
+    """Every image in ``images`` behind every clean copy in ``copies``."""
+    for sha in sorted(copies):
+        for image_id in sorted(images):
+            if db.get(PublicObjectImage, (sha, image_id)) is None:
+                db.add(PublicObjectImage(sha256=sha, image_id=image_id))
+    db.flush()
+
+
+def _copies_showing(db: Session, digest: str, sha256: str | None = None) -> list[PublicObject]:
+    """The registered clean copies of the picture with pixel digest
+    ``digest``: minted from those pixels (``pixel_sha256``) or showing them
+    (``own_pixel_sha256``) -- plus the clean copy whose bytes are
+    ``sha256``, whatever a decoder makes of them. The copy minted from
+    ``digest`` comes first."""
+    keys = [PublicObject.pixel_sha256 == digest, PublicObject.own_pixel_sha256 == digest]
+    if sha256 is not None:
+        keys.append(PublicObject.sha256 == sha256)
+    found = db.execute(
+        select(PublicObject).where(PublicObject.kind == "sanitized", or_(*keys))
+    ).scalars()
+    return sorted(found, key=lambda c: (c.pixel_sha256 != digest, c.sha256))
+
+
+def _join_picture(db: Session, copies: set[str], images: set[int]) -> None:
+    """Link every capture of the picture behind every clean copy of it: grow
+    ``copies`` and ``images`` through the links already recorded (a copy's
+    images, an image's copies) until nothing is added, then link them all.
+    So a copy is judged over every capture of its picture whichever order
+    they were seeded in -- a capture linked to two copies joins them."""
+    while True:
+        more_images = set(
+            db.execute(
+                select(PublicObjectImage.image_id).where(PublicObjectImage.sha256.in_(copies))
+            ).scalars()
+        )
+        more_copies = set(
+            db.execute(
+                select(PublicObjectImage.sha256).where(PublicObjectImage.image_id.in_(images))
+            ).scalars()
+        )
+        if more_images <= images and more_copies <= copies:
+            break
+        images, copies = images | more_images, copies | more_copies
+    _link(db, copies, images)
 
 
 def _original_key(sha256: str, mime: str) -> str:
@@ -144,15 +208,22 @@ def seed_clean_image(
 ) -> PublicObject:
     """Register ``original`` (stored, never public), its clean copy (public,
     kind ``sanitized``), the image as one behind that copy, and one gallery
-    link per origin. Idempotent.
+    link per origin. Idempotent; returns the clean copy minted from these
+    pixels if there is one, else another clean copy of the picture.
 
-    The link keys on the PIXELS (``pixel_digest``), never on the minted
-    clean sha: an original whose pixels a registered clean copy already has
-    -- whatever its bytes, in whichever order the captures arrive -- is one
-    more image behind THAT copy (``public_object_images``), never a copy of
-    its own. That includes an original whose bytes ARE the copy (our clean
-    copy captured again): it is judged with the copy, so its soft delete
-    takes the copy offline (app.publication)."""
+    ONE PICTURE, EVERY CAPTURE. An original is a capture of a registered
+    clean copy's picture when it has the pixels the copy was minted from
+    (``pixel_sha256``), the pixels the copy itself decodes to
+    (``own_pixel_sha256``: our JPEG copy captured again, re-saved or with
+    metadata added), or the copy's very bytes (whatever a decoder makes of
+    them). Such an original gets no copy of its own. When none matches, a
+    clean copy is minted, and any original whose bytes it turns out to be,
+    or whose pixels it shows, is a capture of it too (photo first). Every
+    capture of a picture is then linked behind every clean copy of it
+    (``public_object_images``), in whichever order they arrive, so each copy
+    and its mask are judged over all of them: a soft delete or an ineligible
+    origin under any capture -- the one whose bytes ARE the copy included --
+    reaches every copy (app.publication)."""
     orig_sha = hashlib.sha256(original).hexdigest()
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
     if image is None:
@@ -190,12 +261,13 @@ def seed_clean_image(
 
     picture = _picture(original)
     digest = _digest(picture)
-    obj = db.execute(
-        select(PublicObject).where(PublicObject.pixel_sha256 == digest)
-    ).scalar_one_or_none()
-    if obj is None:
+    copies = _copies_showing(db, digest, orig_sha)
+    if copies:
+        obj = copies[0]
+    else:
         clean, clean_mime = _encode(picture, original)
         clean_sha = hashlib.sha256(clean).hexdigest()
+        own = pixel_digest(clean)
         cw, ch = picture.width, picture.height
         key = derived_key(clean_sha, clean_mime)
         store.put(key, clean, clean_mime)
@@ -225,10 +297,10 @@ def seed_clean_image(
             storage_key=key,
             image_version_id=version.id,
             pixel_sha256=digest,
+            own_pixel_sha256=own,
         )
-
-    if db.get(PublicObjectImage, (obj.sha256, image.id)) is None:
-        db.add(PublicObjectImage(sha256=obj.sha256, image_id=image.id))
+        copies = [obj, *_copies_showing(db, own)]
+    _join_picture(db, {c.sha256 for c in copies}, {image.id})
 
     for origin in origins:
         url = origin.url or ""

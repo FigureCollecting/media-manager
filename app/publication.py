@@ -3,8 +3,10 @@
 ``public_objects`` registers what is ever addressable at ``/d/<sha256>``;
 this module decides, on every request, whether it still is. A clean copy is
 judged over EVERY image behind it: the image its version belongs to and each
-capture of the same picture linked to it by its pixel digest
-(``public_object_images``; app.workers.mask_seed), whatever its bytes:
+other capture of the same picture (``public_object_images``), linked by the
+pixels the copy was minted from, by the pixels the copy itself decodes to,
+or by the copy's very bytes, in either seeding order
+(app.workers.mask_seed.seed_clean_image):
 
 - a clean copy (``sanitized``) is served while its version and every image
   behind it are not soft-deleted. A row with no version is never served.
@@ -23,13 +25,13 @@ capture of the same picture linked to it by its pixel digest
   per-source permission split.
 
 ALL, NOT ANY, for the images behind one clean copy: the address names the
-pixels, so a soft delete (a takedown) under any capture of a picture
-reaches the copy every capture shares -- including a capture whose bytes ARE
-the copy (our clean copy captured again) -- and the same picture captured as
-an item image and as a collector's photo is a collector's photo somewhere,
-in whichever order the two were seeded. The cost is deliberate: soft-deleting
-a pixel-identical duplicate takes the shared copy offline for the capture
-that remains.
+picture, so a soft delete (a takedown) under any capture of a picture
+reaches every clean copy of it -- including a capture whose bytes ARE the
+copy (our clean copy captured again, a lossy JPEG one included, before or
+after it was minted) -- and the same picture captured as an item image and
+as a collector's photo is a collector's photo somewhere, in whichever order
+the two were seeded. The cost is deliberate: soft-deleting a duplicate
+capture takes the shared copy offline for the capture that remains.
 
 So soft-deleting an image or a version revokes its derivative and its masks;
 a mask also goes offline the moment any image behind it gains an ineligible

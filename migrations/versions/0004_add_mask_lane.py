@@ -32,11 +32,19 @@ def upgrade() -> None:
             nullable=True,
         ),
         sa.Column("pixel_sha256", sa.String(64), nullable=True, unique=True),
+        sa.Column("own_pixel_sha256", sa.String(64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("kind in ('sanitized','matted','mask')", name="ck_public_object_kind"),
         sa.CheckConstraint(
             "(kind = 'sanitized') = (pixel_sha256 IS NOT NULL)", name="ck_public_object_pixels"
         ),
+        sa.CheckConstraint(
+            "(kind = 'sanitized') = (own_pixel_sha256 IS NOT NULL)",
+            name="ck_public_object_own_pixels",
+        ),
+    )
+    op.create_index(
+        "ix_public_objects_own_pixel_sha256", "public_objects", ["own_pixel_sha256"]
     )
     op.create_table(
         "public_object_images",
@@ -127,4 +135,5 @@ def downgrade() -> None:
     op.drop_table("mask_batches")
     op.drop_table("mask_store_revocations")
     op.drop_table("public_object_images")
+    op.drop_index("ix_public_objects_own_pixel_sha256", table_name="public_objects")
     op.drop_table("public_objects")

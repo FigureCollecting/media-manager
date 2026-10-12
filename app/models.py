@@ -254,8 +254,9 @@ class PublicObject(Base):
     derivative, a matted fallback, or a MASK-1 mask. An original's bytes are
     never registered (``mask_seed.register_public_object`` refuses an
     ``images.sha256``). The one overlap: an original whose bytes ARE one of
-    our clean copies (that copy captured again) is linked behind the copy by
-    its pixels and judged with it (app.publication).
+    our clean copies (that copy captured again, before or after it was
+    minted) is linked behind the copy by those bytes and judged with it
+    (app.publication).
     """
 
     __tablename__ = "public_objects"
@@ -272,10 +273,17 @@ class PublicObject(Base):
     image_version_id: Mapped[int | None] = mapped_column(
         ForeignKey("image_versions.id", ondelete="CASCADE")
     )
-    #: A clean copy's PIXEL DIGEST (``mask_seed.pixel_digest``): the key every
-    #: capture of the same picture is linked by, whatever its bytes. Set on
-    #: ``sanitized`` objects and only on them; one clean copy per picture.
+    #: A clean copy's PIXEL DIGEST (``mask_seed.pixel_digest``) of the
+    #: original it was minted from: a capture with those pixels, whatever its
+    #: bytes, is linked behind it. Set on ``sanitized`` objects and only on
+    #: them; one clean copy minted per digest.
     pixel_sha256: Mapped[str | None] = mapped_column(String(64), unique=True)
+    #: The pixel digest of the clean copy's OWN bytes, decoded: the same as
+    #: ``pixel_sha256`` for a lossless (PNG) copy, another for a JPEG copy,
+    #: whose decoded pixels are not its original's. A capture of the copy
+    #: itself -- its bytes, or its pixels under other bytes -- has it, and is
+    #: linked behind it. Set on ``sanitized`` objects and only on them.
+    own_pixel_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
     )
@@ -285,18 +293,24 @@ class PublicObject(Base):
         CheckConstraint(
             "(kind = 'sanitized') = (pixel_sha256 IS NOT NULL)", name="ck_public_object_pixels"
         ),
+        CheckConstraint(
+            "(kind = 'sanitized') = (own_pixel_sha256 IS NOT NULL)",
+            name="ck_public_object_own_pixels",
+        ),
     )
 
 
 class PublicObjectImage(Base):
-    """Every image a clean public object is the clean copy of.
+    """Every image a clean public object is the clean copy of: its own
+    image, and every other capture of the same picture.
 
-    Captures are linked by their PIXELS (``public_objects.pixel_sha256``),
-    so two originals with the same pixels and different bytes (an EXIF or
-    text chunk apart, a re-save, our own clean copy captured again) are two
-    images with ONE clean copy -- one row each here. The copy, and any mask
-    made from it, is judged over all of them (app.publication), in whichever
-    order they were seeded.
+    A capture belongs to a picture by its pixels (the copy's
+    ``pixel_sha256``), by the copy's own decoded pixels
+    (``own_pixel_sha256``: our JPEG copy captured again, re-saved or with
+    metadata added) or by the copy's very bytes. ``mask_seed.seed_clean_image``
+    links every capture of a picture behind every clean copy of it, in
+    whichever order they were seeded, so each copy, and any mask made from
+    it, is judged over all of them (app.publication).
     """
 
     __tablename__ = "public_object_images"

@@ -11,9 +11,9 @@ IDEMPOTENT. A clean image is selected only while it has no image_masks row
 at the current MASK_PIPELINE_VERSION, so a re-run is a no-op and a version
 bump selects everything again (the old masks stay addressable). Mask bytes
 are content-addressed, so two images with the same mask share one object.
-Clean copies are keyed on their pixels: one shared by every capture of a
-picture is judged over every image behind it (app.publication) and waits
-while any is soft-deleted.
+Every capture of a picture is linked behind every clean copy of it
+(app.workers.mask_seed): a copy is judged over every image behind it
+(app.publication) and waits while any is soft-deleted.
 
 RESUMABLE. Each clean image is settled in its own transaction -- its object
 written first, then its row, its public registration and the batch's cursor
@@ -141,7 +141,7 @@ def _candidates(
         ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
         ImageMask.status.not_in(redrive),
     )
-    # A clean copy shared by pixel-identical captures waits while ANY of them
+    # A clean copy shared by several captures of a picture waits while ANY of them
     # is soft-deleted (app.publication would not serve it).
     dead_capture = (
         select(PublicObjectImage.sha256)

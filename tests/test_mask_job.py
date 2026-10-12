@@ -545,7 +545,8 @@ class TestApply:
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
         obj = _seed(db_session, store, 1)
-        obj.kind, obj.pixel_sha256 = "matted", None  # only a clean copy carries a digest
+        # only a clean copy carries the digests
+        obj.kind, obj.pixel_sha256, obj.own_pixel_sha256 = "matted", None, None
         db_session.commit()
         report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
         assert report.items == []
@@ -841,6 +842,7 @@ class TestPixelDigest:
                 height=1,
                 storage_key="derived/b",
                 pixel_sha256=clean.pixel_sha256,
+                own_pixel_sha256="d" * 64,
             )
 
     def test_the_digest_is_taken_after_exif_orientation(self) -> None:
@@ -1203,6 +1205,41 @@ class TestOurLossyCopyCapturedAgain:
             [item_copy.sha256, photo_copy.sha256]
         )
 
+    def test_reseeding_a_capture_returns_the_copy_minted_from_it(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Photo first, the picture has two clean copies; seeding either
+        capture again returns the copy minted from ITS pixels and adds
+        nothing."""
+        first, again = _lossy_pair()
+        photo = [ImageOrigin(url=PICTURE.format(n=1), source="mfc")]
+        item = [ImageOrigin(url=ITEM.format(n=1), source="mfc")]
+        photo_copy = seed_clean_image(db_session, store, again, origins=photo, figure_id="p")
+        item_copy = seed_clean_image(db_session, store, first, origins=item, figure_id="i")
+        links = len(list(db_session.execute(select(PublicObjectImage)).scalars()))
+        assert seed_clean_image(db_session, store, again, origins=photo, figure_id="p") is (
+            photo_copy
+        )
+        assert seed_clean_image(db_session, store, first, origins=item, figure_id="i") is (
+            item_copy
+        )
+        assert len(_public(db_session, "sanitized")) == 2
+        assert len(list(db_session.execute(select(PublicObjectImage)).scalars())) == links
+
+    def test_a_capture_whose_bytes_are_one_of_our_masks_gets_a_clean_copy_of_its_own(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Only a CLEAN copy's bytes make a capture one of its picture's: a
+        capture of a mask is a picture of its own."""
+        _seed(db_session, store, 1)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        (mask,) = _public(db_session, "mask")
+        copy = seed_clean_image(
+            db_session, store, store.get(mask.storage_key), origins=[], figure_id="x"
+        )
+        assert copy.kind == "sanitized"
+        assert _behind(db_session, mask.sha256) == set()
+
     def test_a_seeded_copy_carries_its_own_digest(
         self, db_session: Session, store: LocalObjectStore
     ) -> None:
@@ -1261,7 +1298,11 @@ class TestTheGateLinksOurCopyCapturedFirst:
         assert captured is not None
         version_id = self._version_of_another_image(db_session, store)
         obj = self._register(db_session, captured.sha256, "sanitized", version_id)
-        assert captured.id in _behind(db_session, obj.sha256)
+        from app.models import ImageVersion
+
+        version = db_session.get(ImageVersion, version_id)
+        assert version is not None
+        assert _behind(db_session, obj.sha256) == {captured.id, version.image_id}
 
     @pytest.mark.parametrize(
         ("kind", "versioned"),
