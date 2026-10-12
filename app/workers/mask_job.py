@@ -21,7 +21,8 @@ offset, so nothing is skipped or seen twice).
 
 FAILURES are per image: recorded as ``failed`` with the exception's CLASS
 only (never a message, which can carry a bucket or key), and re-driven with
-``retry_failed=True``.
+``retry_failed=True``. An ``ineligible`` image is re-judged with
+``recheck_ineligible=True`` (a store granted later, origins that changed).
 
 RE-EVALUATION. ``reevaluate_masks`` re-judges every published (``ok``) and
 ``withdrawn`` row against its image's current state (app.publication): the
@@ -94,13 +95,12 @@ class _Refused(Exception):
 
 
 def _candidates(
-    db: Session, *, after: str | None, page_size: int, retry_failed: bool
+    db: Session, *, after: str | None, page_size: int, redrive: tuple[str, ...]
 ) -> list[PublicObject]:
     settled = select(ImageMask.source_sha256).where(
-        ImageMask.pipeline_version == MASK_PIPELINE_VERSION
+        ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
+        ImageMask.status.not_in(redrive),
     )
-    if retry_failed:
-        settled = settled.where(ImageMask.status != "failed")
     query = (
         select(PublicObject)
         .join(ImageVersion, ImageVersion.id == PublicObject.image_version_id)
@@ -308,8 +308,12 @@ def run_mask_batch(
     page_size: int = DEFAULT_PAGE_SIZE,
     resume_batch_id: int | None = None,
     retry_failed: bool = False,
+    recheck_ineligible: bool = False,
 ) -> BatchReport:
-    """Settle up to ``limit`` clean images that have no mask result yet."""
+    """Settle up to ``limit`` clean images that have no mask result yet --
+    plus, on request, those whose result was ``failed`` (``retry_failed``) or
+    ``ineligible`` (``recheck_ineligible``: after a store is granted, or an
+    image's origins changed)."""
     if resume_batch_id is not None and dry_run:
         raise ValueError("a dry run cannot resume a batch: it records nothing to resume")
     active = backend or get_matting_backend()
@@ -323,12 +327,13 @@ def run_mask_batch(
         if resume_batch_id is not None and batch.item_limit is not None:
             limit = max(0, batch.item_limit - sum(batch.counts.values()))
 
+    redrive = ("failed",) * retry_failed + ("ineligible",) * recheck_ineligible
     report = BatchReport(batch_id=batch.id if batch else None, dry_run=dry_run)
     cursor = batch.cursor_sha256 if batch else None
     remaining = limit
     while remaining is None or remaining > 0:
         size = page_size if remaining is None else min(page_size, remaining)
-        page = _candidates(db, after=cursor, page_size=size, retry_failed=retry_failed)
+        page = _candidates(db, after=cursor, page_size=size, redrive=redrive)
         if not page:
             break
         for obj in page:

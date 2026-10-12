@@ -3,6 +3,7 @@
     python -m app.cli.masks [--sandbox DIR] seed --sample DIR
     python -m app.cli.masks [--sandbox DIR] run [--apply] [--limit N] [--page-size N]
                                                 [--resume BATCH] [--retry-failed]
+                                                [--recheck-ineligible]
                                                 [--backend stub|birefnet|birefnet-basekept]
                                                 [--model PATH] [--isnet-general PATH]
                                                 [--isnet-anime PATH]
@@ -163,6 +164,7 @@ def _run(db: Session, store: ObjectStore, args: argparse.Namespace) -> dict[str,
             page_size=args.page_size,
             resume_batch_id=args.resume,
             retry_failed=args.retry_failed,
+            recheck_ineligible=args.recheck_ineligible,
         )
     except ValueError as exc:
         raise Refused(str(exc)) from exc
@@ -211,6 +213,9 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--page-size", type=int, default=50)
     run.add_argument("--resume", type=int, help="continue an unfinished batch")
     run.add_argument("--retry-failed", action="store_true")
+    run.add_argument(
+        "--recheck-ineligible", action="store_true", help="re-judge images refused a mask"
+    )
     run.add_argument("--backend", choices=["stub", "birefnet", "birefnet-basekept"])
     run.add_argument("--model", help="BiRefNet ONNX weights (birefnet, birefnet-basekept)")
     run.add_argument("--isnet-general", help="IS-Net general-use ONNX weights (birefnet-basekept)")
