@@ -118,6 +118,21 @@ class TestSampleRun:
         )
         assert dry["counts"]["ineligible"] == 2
 
+    def test_reevaluate_is_a_dry_run_unless_applied(
+        self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None
+    ) -> None:
+        from app.models import ImageMask
+
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        code, dry = _run(capsys, "--sandbox", sandbox, "reevaluate")
+        assert code == 0
+        assert (dry["dry_run"], dry["withdrawn"], dry["restored"]) == (True, [], [])
+        ok = [r for r in _rows(sandbox, ImageMask) if r.status == "ok"]
+        assert dry["unchanged"] == len(ok) > 0
+        code, applied = _run(capsys, "--sandbox", sandbox, "reevaluate", "--apply")
+        assert (code, applied["dry_run"]) == (0, False)
+
     def test_the_full_report_can_be_written_to_a_file(
         self, sandbox: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

@@ -11,6 +11,7 @@ It is its own ASGI app (image track I11): app.main's routes are never mounted.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import io
 from collections.abc import Generator
@@ -22,8 +23,8 @@ from app.config import Settings, get_settings
 from app.db import get_db
 from app.derivative_main import app as origin_app
 from app.derivative_main import get_object_store
+from app.models import FigureGallery, ImageMask, ImageVersion, PublicObject
 from app.models import Image as ImageModel
-from app.models import ImageMask, PublicObject
 from app.object_store import LocalObjectStore
 from app.workers.mask_job import run_mask_batch
 from app.workers.mask_policy import ImageOrigin
@@ -37,11 +38,23 @@ from sqlalchemy.orm import Session
 APP = "https://figurecollecting.com"
 CANARY = "https://fc-api-canary.mindsignals1.com"
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
+PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/9.jpeg"
 
 
-def _photo(n: int) -> bytes:
+def _source_image(db: Session, clean_sha: str) -> ImageModel:
+    obj = db.get(PublicObject, clean_sha)
+    assert obj is not None
+    version = db.get(ImageVersion, obj.image_version_id)
+    assert version is not None
+    image = db.get(ImageModel, version.image_id)
+    assert image is not None
+    return image
+
+
+def _photo(n: int, variant: int = 0) -> bytes:
     arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
     arr[10:50, 12:28] = (31 + 10 * n, 30, 90)
+    arr[0, 0] = (250, 250, 248 - variant)  # distinct bytes, the same mask
     buf = io.BytesIO()
     Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -253,6 +266,89 @@ class TestNotFound:
 
     def test_a_held_mask_is_not_served(self, client: TestClient, seeded: dict[str, str]) -> None:
         self._assert_404(client.get(f"/d/{seeded['held_mask']}"))
+
+    def test_a_soft_deleted_image_takes_its_derivative_and_mask_offline(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        _source_image(db_session, seeded["clean"]).deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['clean']}"))
+        self._assert_404(client.get(f"/d/{seeded['mask']}"))
+
+    def test_a_soft_deleted_clean_version_takes_it_and_its_mask_offline(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        obj = db_session.get(PublicObject, seeded["clean"])
+        assert obj is not None
+        version = db_session.get(ImageVersion, obj.image_version_id)
+        assert version is not None
+        version.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['clean']}"))
+        self._assert_404(client.get(f"/d/{seeded['mask']}"))
+
+    def test_a_mask_whose_image_gains_a_collector_photo_origin_goes_offline(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        image = _source_image(db_session, seeded["clean"])
+        db_session.add(
+            FigureGallery(figure_id="mfc:9", source_url=PICTURE, image_id=image.id, source="mfc")
+        )
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['mask']}"))
+        assert client.get(f"/d/{seeded['clean']}").status_code == 200
+
+    def test_a_mask_whose_origins_are_all_gone_goes_offline(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        image = _source_image(db_session, seeded["clean"])
+        for link in db_session.execute(
+            select(FigureGallery).where(FigureGallery.image_id == image.id)
+        ).scalars():
+            link.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['mask']}"))
+
+    def test_a_withdrawn_mask_row_is_not_served(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        row = db_session.execute(
+            select(ImageMask).where(ImageMask.mask_sha256 == seeded["mask"])
+        ).scalar_one()
+        row.status = "withdrawn"
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['mask']}"))
+
+    def test_a_derivative_with_no_version_is_not_served(
+        self, client: TestClient, seeded: dict[str, str], db_session: Session
+    ) -> None:
+        obj = db_session.get(PublicObject, seeded["clean"])
+        assert obj is not None
+        obj.image_version_id = None
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{seeded['clean']}"))
+
+    def test_a_mask_shared_by_two_images_stays_while_one_is_live(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        for n in (1, 2):
+            seed_clean_image(
+                db_session,
+                store,
+                _photo(1, variant=n),
+                origins=[ImageOrigin(url=ITEM.format(n=n), source="mfc")],
+                figure_id=f"mfc:{n}",
+            )
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        rows = list(db_session.execute(select(ImageMask)).scalars())
+        assert len(rows) == 2 and rows[0].mask_sha256 == rows[1].mask_sha256
+        mask = rows[0].mask_sha256
+        _source_image(db_session, rows[0].source_sha256).deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        assert client.get(f"/d/{mask}").status_code == 200
+        _source_image(db_session, rows[1].source_sha256).deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{mask}"))
 
     def test_an_unknown_address(self, client: TestClient, seeded: dict[str, str]) -> None:
         self._assert_404(client.get("/d/" + "0" * 64))

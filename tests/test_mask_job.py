@@ -611,6 +611,117 @@ class TestResume:
             run_mask_batch(db_session, store, resume_batch_id=1)
 
 
+class TestReevaluate:
+    """The origin re-checks every mask on every request; ``reevaluate_masks``
+    brings the rows in line, so the lane's own record says which masks are
+    published: an ``ok`` row whose clean image was soft-deleted or is no
+    longer eligible becomes ``withdrawn`` (with the refusal as its reason),
+    and a ``withdrawn`` row whose image is live and eligible again becomes
+    ``ok``. Dry run by default."""
+
+    def _settle_two(self, db: Session, store: LocalObjectStore) -> list[ImageMask]:
+        _seed(db, store, 1)
+        _seed(db, store, 2)
+        run_mask_batch(db, store, backend=_Model(), dry_run=False)
+        rows = _masks(db)
+        assert [r.status for r in rows] == ["ok", "ok"]
+        return rows
+
+    def test_a_collector_photo_origin_withdraws_the_mask_and_its_removal_restores_it(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import ImageVersion
+        from app.workers.mask_job import reevaluate_masks
+
+        first, second = self._settle_two(db_session, store)
+        clean = db_session.get(PublicObject, first.source_sha256)
+        assert clean is not None
+        version = db_session.get(ImageVersion, clean.image_version_id)
+        assert version is not None
+        link = FigureGallery(
+            figure_id="mfc:9", source_url=PICTURE.format(n=9), image_id=version.image_id
+        )
+        db_session.add(link)
+        db_session.commit()
+
+        dry = reevaluate_masks(db_session)
+        assert dry == {
+            "dry_run": True,
+            "withdrawn": [first.source_sha256],
+            "restored": [],
+            "unchanged": 1,
+        }
+        db_session.refresh(first)
+        assert first.status == "ok"
+
+        applied = reevaluate_masks(db_session, dry_run=False)
+        assert applied["withdrawn"] == [first.source_sha256]
+        db_session.refresh(first)
+        db_session.refresh(second)
+        assert (first.status, first.reason) == ("withdrawn", "user_photo")
+        assert (second.status, second.reason) == ("ok", None)
+        assert reevaluate_masks(db_session, dry_run=False)["withdrawn"] == []
+
+        import datetime as dt
+
+        link.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        restored = reevaluate_masks(db_session, dry_run=False)
+        assert restored["restored"] == [first.source_sha256]
+        db_session.refresh(first)
+        assert (first.status, first.reason) == ("ok", None)
+
+    def test_a_soft_deleted_image_withdraws_its_mask(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        import datetime as dt
+
+        from app.models import ImageVersion
+        from app.workers.mask_job import reevaluate_masks
+
+        first, _ = self._settle_two(db_session, store)
+        clean = db_session.get(PublicObject, first.source_sha256)
+        assert clean is not None
+        version = db_session.get(ImageVersion, clean.image_version_id)
+        assert version is not None
+        image = db_session.get(ImageModel, version.image_id)
+        assert image is not None
+        image.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False)
+        assert (report["withdrawn"], report["unchanged"]) == ([first.source_sha256], 1)
+        db_session.refresh(first)
+        assert (first.status, first.reason) == ("withdrawn", "deleted")
+
+    def test_held_and_ineligible_rows_are_left_alone(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.workers.mask_job import reevaluate_masks
+
+        _seed(db_session, store, 1)
+        _seed(db_session, store, 2, url=PICTURE)
+        run_mask_batch(db_session, store, backend=_Constant(255), dry_run=False)
+        before = [(r.status, r.reason) for r in _masks(db_session)]
+        assert sorted(before) == [("held", "full_frame"), ("ineligible", "user_photo")]
+        report = reevaluate_masks(db_session, dry_run=False)
+        assert report == {"dry_run": False, "withdrawn": [], "restored": [], "unchanged": 0}
+        assert [(r.status, r.reason) for r in _masks(db_session)] == before
+
+    def test_the_task_defaults_to_a_dry_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.workers import tasks
+
+        seen: dict[str, object] = {}
+
+        def _fake(db: object, **kw: object) -> dict[str, object]:
+            seen.update(kw)
+            return {"dry_run": kw["dry_run"]}
+
+        monkeypatch.setattr(tasks, "reevaluate_masks", _fake)
+        monkeypatch.setattr(tasks, "worker_session", _NullSession)
+        assert tasks.reevaluate_published_masks() == {"dry_run": True}
+        assert tasks.reevaluate_published_masks(apply=True) == {"dry_run": False}
+
+
 class TestObjectStores:
     def test_local_store_refuses_keys_that_leave_its_root(self, tmp_path: Path) -> None:
         s = LocalObjectStore(tmp_path)
