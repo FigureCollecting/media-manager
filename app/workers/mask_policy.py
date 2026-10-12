@@ -27,9 +27,11 @@ policy reads.
 FAIL CLOSED. No mask for: an ungranted source or host (``not_granted``); an
 MFC URL that matches neither rule, an MFC host recorded under another source
 or an ``mfc`` row on another host, a URL carrying credentials or a
-backslash, a host that is not a plain name (whitespace, a percent escape:
-which host served it is ambiguous), a URL that is not http(s), schemeless
-included (``unknown_origin``); bytes with no origin (``no_origin``); and bytes seen
+backslash, a host that is not a plain ASCII name (whitespace, a percent
+escape, a non-ASCII letter), a port that is not a port, a URL the parser
+rejects (which host served it is ambiguous), a URL that is not http(s),
+schemeless included (``unknown_origin``); bytes with no origin
+(``no_origin``); and bytes seen
 under several origins when ANY of them is ineligible (the same picture
 captured as an item image and as a collector's photo is a collector's photo
 somewhere). Hosts are compared lower-cased without trailing dots.
@@ -114,7 +116,14 @@ def classify_origin(origin: ImageOrigin, store_grants: StoreGrants | None = None
     """``store_grants`` defaults to the configured grants."""
     if not origin.url:
         return "no_origin"
-    parts = urlsplit(origin.url)
+    try:
+        parts = urlsplit(origin.url)
+        parts.port  # noqa: B018 -- raises on a port that is not one
+    except ValueError:
+        # Unparseable (an unclosed or non-IP bracket, a netloc that changes
+        # under NFKC) or a port that is not a port: which host served the
+        # bytes is ambiguous.
+        return "unknown_origin"
     if parts.scheme not in ("http", "https") or "@" in parts.netloc or "\\" in origin.url:
         return "unknown_origin"
     host = (parts.hostname or "").rstrip(".")
