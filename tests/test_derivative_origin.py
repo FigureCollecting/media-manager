@@ -537,6 +537,122 @@ class TestNotFound:
         for mask in masks:
             self._assert_404(client.get(f"/d/{mask}"))
 
+    def _lossy_pair(self) -> tuple[bytes, bytes]:
+        """An opaque capture and a capture whose bytes ARE its clean copy, a
+        JPEG: the two do not share a pixel digest (challenger i4 J1-J4)."""
+        from app.workers.mask_seed import make_clean_copy
+
+        arr = np.full((60, 40, 3), (245, 245, 245), dtype=np.uint8)
+        arr[10:50, 12:28] = (20, 20, 30)
+        arr[20:30, 15:25] = (200, 40, 40)
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
+        first = buf.getvalue()
+        again, mime, _w, _h = make_clean_copy(first)
+        assert mime == "image/jpeg"
+        return first, again
+
+    def _seed_one(
+        self, db: Session, store: LocalObjectStore, data: bytes, url: str, source: str = "mfc"
+    ) -> PublicObject:
+        return seed_clean_image(
+            db,
+            store,
+            data,
+            origins=[ImageOrigin(url=url, source=source)],
+            figure_id=f"{source}:{hashlib.sha256(data).hexdigest()[:8]}",
+        )
+
+    def _ok_masks(self, db: Session) -> list[str]:
+        db.expire_all()
+        rows = db.execute(select(ImageMask).where(ImageMask.status == "ok")).scalars()
+        return [r.mask_sha256 or "" for r in rows]
+
+    def test_a_collector_photo_whose_bytes_are_the_items_jpeg_copy_takes_its_mask_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """J1: the item's mask is served; then a collector's photo whose bytes
+        ARE the item's copy is captured -- the mask is a 404 at once, before
+        any re-evaluation; the copy itself stays (display is not decided
+        here)."""
+        first, again = self._lossy_pair()
+        copy = self._seed_one(db_session, store, first, ITEM.format(n=1))
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        (mask,) = self._ok_masks(db_session)
+        assert client.get(f"/d/{mask}").status_code == 200
+        self._seed_one(db_session, store, again, PICTURE)
+        assert copy.sha256 == hashlib.sha256(again).hexdigest()
+        self._assert_404(client.get(f"/d/{mask}"))
+        assert client.get(f"/d/{copy.sha256}").content == again
+
+    def test_photo_first_the_item_is_seeded_and_no_mask_is_served(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """J2: seeding the item after the collector's photo whose bytes its
+        copy turns out to be no longer raises; no mask of the picture is
+        made, and every clean copy of it is served."""
+        first, again = self._lossy_pair()
+        photo_copy = self._seed_one(db_session, store, again, PICTURE)
+        item_copy = self._seed_one(db_session, store, first, ITEM.format(n=1))
+        assert item_copy.sha256 == hashlib.sha256(again).hexdigest()
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert {(i.status, i.reason) for i in report.items} == {("ineligible", "user_photo")}
+        assert self._ok_masks(db_session) == []
+        for sha in (photo_copy.sha256, item_copy.sha256):
+            assert client.get(f"/d/{sha}").status_code == 200
+
+    @pytest.mark.parametrize("again_first", [False, True], ids=["first-first", "again-first"])
+    def test_soft_deleting_the_capture_whose_bytes_are_the_jpeg_copy_takes_it_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore, again_first: bool
+    ) -> None:
+        """J3: a takedown under the capture whose bytes ARE the copy takes
+        every clean copy of the picture and every mask of it offline."""
+        first, again = self._lossy_pair()
+        captures = [(first, ITEM.format(n=1)), (again, ITEM.format(n=2))]
+        copies = [
+            self._seed_one(db_session, store, data, url).sha256
+            for data, url in (captures[::-1] if again_first else captures)
+        ]
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        masks = self._ok_masks(db_session)
+        assert masks
+        for sha in [*copies, *masks]:
+            assert client.get(f"/d/{sha}").status_code == 200
+        captured = db_session.execute(
+            select(ImageModel).where(ImageModel.sha256 == hashlib.sha256(again).hexdigest())
+        ).scalar_one()
+        captured.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        for sha in [*copies, *masks]:
+            self._assert_404(client.get(f"/d/{sha}"))
+
+    @pytest.mark.usefixtures("shop_registered")
+    @pytest.mark.parametrize("shop_first", [False, True], ids=["item-first", "shop-first"])
+    def test_revoking_the_store_whose_capture_is_the_jpeg_copy_takes_every_mask_offline(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore, shop_first: bool
+    ) -> None:
+        """J4: revoke-store reaches the item copy's mask when the store's
+        capture IS that copy."""
+        from app.workers.mask_job import revoke_store
+
+        first, again = self._lossy_pair()
+        captures = [
+            (first, ITEM.format(n=1), "mfc"),
+            (again, "https://img.shop.example/p/1.jpg", "shop"),
+        ]
+        for data, url, source in captures[::-1] if shop_first else captures:
+            self._seed_one(db_session, store, data, url, source)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        masks = self._ok_masks(db_session)
+        assert masks
+        granted = Settings(environment="test", mask_store_grants={"shop": ["shop.example"]})
+        origin_app.dependency_overrides[get_settings] = lambda: granted
+        for mask in masks:
+            assert client.get(f"/d/{mask}").status_code == 200
+        revoke_store(db_session, "shop", dry_run=False)
+        for mask in masks:
+            self._assert_404(client.get(f"/d/{mask}"))
+
     def _register_matted(
         self,
         db: Session,

@@ -963,6 +963,379 @@ class TestCapturesKeyedOnPixels:
         assert (row.status, row.reason) == ("withdrawn", "deleted")
 
 
+def _opaque_capture(text: str | None) -> bytes:
+    """An OPAQUE picture (no pixel is transparent), so its clean copy is a
+    JPEG -- LOSSY: decoding the copy does not give back these pixels. A text
+    chunk unless ``text`` is None."""
+    from PIL import PngImagePlugin
+
+    arr = np.full((60, 40, 3), (245, 245, 245), dtype=np.uint8)
+    arr[10:50, 12:28] = (20, 20, 30)
+    arr[20:30, 15:25] = (200, 40, 40)
+    info = None
+    if text is not None:
+        info = PngImagePlugin.PngInfo()
+        info.add_text("Comment", text)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGB").save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+def _lossy_pair() -> tuple[bytes, bytes]:
+    """Challenger i4's J pair: an opaque capture, and a capture whose bytes
+    ARE its clean copy (our JPEG captured again). Unlike the lossless pair,
+    the two do NOT share a pixel digest."""
+    first = _opaque_capture("crawl 1")
+    again, mime, _w, _h = make_clean_copy(first)
+    assert mime == "image/jpeg"
+    assert pixel_digest(first) != pixel_digest(again)
+    return first, again
+
+
+def _jpeg_comment(jpeg: bytes, text: bytes) -> bytes:
+    """``jpeg`` with a COM segment after SOI: other bytes, the very same
+    pixels (metadata a platform adds without re-encoding)."""
+    assert jpeg[:2] == b"\xff\xd8"
+    return jpeg[:2] + b"\xff\xfe" + (len(text) + 2).to_bytes(2, "big") + text + jpeg[2:]
+
+
+def _png_resave(data: bytes) -> bytes:
+    """``data``'s pixels re-saved losslessly as a PNG: other bytes, the same pixels."""
+    with Image.open(io.BytesIO(data)) as im:
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _behind(db: Session, sha256: str) -> set[int]:
+    return set(
+        db.execute(
+            select(PublicObjectImage.image_id).where(PublicObjectImage.sha256 == sha256)
+        ).scalars()
+    )
+
+
+def _one_picture(db: Session) -> list[PublicObject]:
+    """Every clean copy, each asserted to be judged over EVERY image seeded
+    (the test seeded captures of one picture only)."""
+    images = set(db.execute(select(ImageModel.id)).scalars())
+    copies = _public(db, "sanitized")
+    assert copies
+    for copy in copies:
+        assert _behind(db, copy.sha256) == images, copy.sha256
+    return copies
+
+
+class TestOurLossyCopyCapturedAgain:
+    """Challenger i4 J1-J4: an OPAQUE picture's clean copy is a JPEG, so our
+    copy captured again -- its very bytes, or its pixels under other bytes (a
+    comment a platform adds, a lossless re-save) -- does NOT share the
+    original's pixel digest. It is still a capture of the same picture: it
+    is linked behind the copy by the copy's bytes or by the copy's OWN pixel
+    digest, in either seeding order, and every clean copy of the picture is
+    judged over every capture of it."""
+
+    def _seed_in_order(
+        self,
+        db: Session,
+        store: LocalObjectStore,
+        captures: list[tuple[bytes, str, str]],
+        *,
+        reverse: bool,
+    ) -> None:
+        for data, url, source in captures[::-1] if reverse else captures:
+            seed_clean_image(
+                db,
+                store,
+                data,
+                origins=[ImageOrigin(url=url, source=source)],
+                figure_id=f"{source}:{hashlib.sha256(data).hexdigest()[:8]}",
+            )
+
+    def _image(self, db: Session, data: bytes) -> ImageModel:
+        sha = hashlib.sha256(data).hexdigest()
+        return db.execute(select(ImageModel).where(ImageModel.sha256 == sha)).scalar_one()
+
+    @pytest.mark.parametrize("photo_first", [False, True], ids=["item-first", "photo-first"])
+    def test_a_collector_photo_whose_bytes_are_the_items_copy_refuses_the_mask(
+        self, db_session: Session, store: LocalObjectStore, photo_first: bool
+    ) -> None:
+        """J1 (item first: a mask over a copy whose bytes ARE a collector's
+        photo) and J2 (photo first: seeding the item raised)."""
+        first, again = _lossy_pair()
+        self._seed_in_order(
+            db_session,
+            store,
+            [(first, ITEM.format(n=1), "mfc"), (again, PICTURE.format(n=1), "mfc")],
+            reverse=photo_first,
+        )
+        copies = _one_picture(db_session)
+        assert hashlib.sha256(again).hexdigest() in {c.sha256 for c in copies}
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert {(i.status, i.reason) for i in report.items} == {("ineligible", "user_photo")}
+        assert _public(db_session, "mask") == []
+
+    @pytest.mark.parametrize("photo_first", [False, True], ids=["item-first", "photo-first"])
+    @pytest.mark.parametrize("resave", ["jpeg-comment", "png"])
+    def test_a_collector_photo_with_the_copys_pixels_under_other_bytes_refuses_the_mask(
+        self, db_session: Session, store: LocalObjectStore, photo_first: bool, resave: str
+    ) -> None:
+        first, again = _lossy_pair()
+        photo = _jpeg_comment(again, b"posted") if resave == "jpeg-comment" else _png_resave(again)
+        assert photo != again
+        assert pixel_digest(photo) == pixel_digest(again)
+        self._seed_in_order(
+            db_session,
+            store,
+            [(first, ITEM.format(n=1), "mfc"), (photo, PICTURE.format(n=1), "mfc")],
+            reverse=photo_first,
+        )
+        _one_picture(db_session)
+        report = run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert {(i.status, i.reason) for i in report.items} == {("ineligible", "user_photo")}
+        assert _public(db_session, "mask") == []
+
+    @pytest.mark.parametrize("again_first", [False, True], ids=["first-first", "again-first"])
+    def test_soft_deleting_the_capture_whose_bytes_are_the_copy_withdraws_every_mask(
+        self, db_session: Session, store: LocalObjectStore, again_first: bool
+    ) -> None:
+        """J3: a takedown under the capture whose bytes ARE the copy reaches
+        the copy and every mask of the picture."""
+        import datetime as dt
+
+        from app.publication import images_behind
+        from app.workers.mask_job import reevaluate_masks
+
+        first, again = _lossy_pair()
+        self._seed_in_order(
+            db_session,
+            store,
+            [(first, ITEM.format(n=1), "mfc"), (again, ITEM.format(n=2), "mfc")],
+            reverse=again_first,
+        )
+        copies = _one_picture(db_session)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        ok = sorted(r.source_sha256 for r in _masks(db_session) if r.status == "ok")
+        assert ok == sorted(c.sha256 for c in copies)
+        self._image(db_session, again).deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        report = reevaluate_masks(db_session, dry_run=False)
+        assert sorted(report["withdrawn"]) == ok
+        assert {(r.status, r.reason) for r in _masks(db_session)} == {("withdrawn", "deleted")}
+        assert [images_behind(db_session, c.sha256) for c in copies] == [None] * len(copies)
+
+    @pytest.mark.usefixtures("stores_registered")
+    @pytest.mark.parametrize("shop_first", [False, True], ids=["item-first", "shop-first"])
+    def test_revoking_the_store_whose_capture_is_the_copy_withdraws_every_mask(
+        self, db_session: Session, store: LocalObjectStore, shop_first: bool
+    ) -> None:
+        """J4: revoke-store reaches the item's copy whose bytes the store's
+        capture IS."""
+        first, again = _lossy_pair()
+        self._seed_in_order(
+            db_session,
+            store,
+            [(first, ITEM.format(n=1), "mfc"), (again, SHOP.format(n=1), "shop")],
+            reverse=shop_first,
+        )
+        copies = _one_picture(db_session)
+        run_mask_batch(db_session, store, backend=_Model(), dry_run=False)
+        assert sorted(r.source_sha256 for r in _masks(db_session) if r.status == "ok") == sorted(
+            c.sha256 for c in copies
+        )
+        report = revoke_store_applied(db_session, "shop")
+        assert sorted(report["reevaluate"]["withdrawn"]) == sorted(c.sha256 for c in copies)
+        db_session.expire_all()
+        assert {(r.status, r.reason) for r in _masks(db_session)} == {
+            ("withdrawn", "store_revoked")
+        }
+
+    def test_a_copy_is_found_by_its_bytes_when_its_own_digest_is_stale(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """The bytes are the key no decoder can change: a copy whose recorded
+        own digest no longer matches what the decoder now computes (another
+        libjpeg) is still found by a capture of its very bytes."""
+        first, again = _lossy_pair()
+        copy = seed_clean_image(
+            db_session,
+            store,
+            first,
+            origins=[ImageOrigin(url=ITEM.format(n=1), source="mfc")],
+            figure_id="mfc:1",
+        )
+        copy.own_pixel_sha256 = "0" * 64
+        db_session.commit()
+        seed_clean_image(
+            db_session,
+            store,
+            again,
+            origins=[ImageOrigin(url=PICTURE.format(n=1), source="mfc")],
+            figure_id="mfc:photo",
+        )
+        assert [c.sha256 for c in _one_picture(db_session)] == [copy.sha256]
+
+    def test_a_capture_whose_bytes_a_new_copy_turns_out_to_be_is_linked_behind_it(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Photo first, with the photo's own copy keyed on a digest the
+        decoder no longer reproduces: the item's new copy is linked to the
+        photo by its bytes alone, and the photo's copy joins the picture."""
+        first, again = _lossy_pair()
+        photo_copy = seed_clean_image(
+            db_session,
+            store,
+            again,
+            origins=[ImageOrigin(url=PICTURE.format(n=1), source="mfc")],
+            figure_id="mfc:photo",
+        )
+        photo_copy.pixel_sha256 = "1" * 64
+        db_session.commit()
+        item_copy = seed_clean_image(
+            db_session,
+            store,
+            first,
+            origins=[ImageOrigin(url=ITEM.format(n=1), source="mfc")],
+            figure_id="mfc:1",
+        )
+        assert item_copy.sha256 == hashlib.sha256(again).hexdigest()
+        assert sorted(c.sha256 for c in _one_picture(db_session)) == sorted(
+            [item_copy.sha256, photo_copy.sha256]
+        )
+
+    def test_a_seeded_copy_carries_its_own_digest(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """A JPEG copy's own digest is its decoded bytes', not its original's;
+        a lossless copy's is its original's."""
+        first, again = _lossy_pair()
+        lossy = seed_clean_image(db_session, store, first, origins=[], figure_id="x:1")
+        assert (lossy.pixel_sha256, lossy.own_pixel_sha256) == (
+            pixel_digest(first),
+            pixel_digest(again),
+        )
+        lossless = seed_clean_image(
+            db_session, store, _rgba_capture("x"), origins=[], figure_id="x:2"
+        )
+        assert (
+            lossless.own_pixel_sha256 == lossless.pixel_sha256 == pixel_digest(_rgba_capture("x"))
+        )
+
+
+class TestTheGateLinksOurCopyCapturedFirst:
+    """``register_public_object`` refuses an original's bytes -- except a
+    clean copy of ANOTHER image whose bytes an original already has (our
+    copy captured before it was minted): that original is linked behind it
+    and judged with it."""
+
+    def _version_of_another_image(self, db: Session, store: LocalObjectStore) -> int:
+        from app.models import ImageVersion
+
+        other = _seed(db, store, 2)
+        assert other.image_version_id is not None
+        version = db.get(ImageVersion, other.image_version_id)
+        assert version is not None
+        return version.id
+
+    def _register(self, db: Session, sha: str, kind: str, version_id: int | None) -> PublicObject:
+        clean = kind == "sanitized"
+        return register_public_object(
+            db,
+            sha256=sha,
+            kind=kind,
+            mime="image/jpeg",
+            size=1,
+            width=1,
+            height=1,
+            storage_key=f"derived/{kind}",
+            image_version_id=version_id,
+            pixel_sha256="c" * 64 if clean else None,
+            own_pixel_sha256="d" * 64 if clean else None,
+        )
+
+    def test_a_clean_copy_whose_bytes_another_image_has_is_linked_behind_it(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        _seed(db_session, store, 1)
+        captured = db_session.execute(select(ImageModel).order_by(ImageModel.id)).scalars().first()
+        assert captured is not None
+        version_id = self._version_of_another_image(db_session, store)
+        obj = self._register(db_session, captured.sha256, "sanitized", version_id)
+        assert captured.id in _behind(db_session, obj.sha256)
+
+    @pytest.mark.parametrize(
+        ("kind", "versioned"),
+        [("sanitized", False), ("mask", True), ("matted", True)],
+        ids=["clean-copy-of-no-version", "mask", "matted"],
+    )
+    def test_anything_else_with_an_originals_bytes_is_refused(
+        self, db_session: Session, store: LocalObjectStore, kind: str, versioned: bool
+    ) -> None:
+        _seed(db_session, store, 1)
+        captured = db_session.execute(select(ImageModel).order_by(ImageModel.id)).scalars().first()
+        assert captured is not None
+        version_id = self._version_of_another_image(db_session, store) if versioned else None
+        with pytest.raises(ValueError, match="original"):
+            self._register(db_session, captured.sha256, kind, version_id)
+
+    def test_a_clean_copy_with_its_own_images_bytes_is_refused(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        from app.models import ImageVersion
+
+        own = _seed(db_session, store, 1)
+        version = db_session.get(ImageVersion, own.image_version_id)
+        assert version is not None
+        image = db_session.get(ImageModel, version.image_id)
+        assert image is not None
+        with pytest.raises(ValueError, match="original"):
+            self._register(db_session, image.sha256, "sanitized", version.id)
+
+    @pytest.mark.parametrize(
+        ("kind", "pixels", "own"),
+        [
+            ("sanitized", "c" * 64, None),
+            ("sanitized", None, "d" * 64),
+            ("mask", None, "d" * 64),
+        ],
+        ids=["clean-copy-without-own", "clean-copy-without-pixels", "mask-with-own"],
+    )
+    def test_a_clean_copy_and_only_a_clean_copy_carries_both_digests(
+        self, db_session: Session, kind: str, pixels: str | None, own: str | None
+    ) -> None:
+        with pytest.raises(ValueError, match="pixel digest"):
+            register_public_object(
+                db_session,
+                sha256="a" * 64,
+                kind=kind,
+                mime="image/png",
+                size=1,
+                width=1,
+                height=1,
+                storage_key="derived/x",
+                pixel_sha256=pixels,
+                own_pixel_sha256=own,
+            )
+
+    def test_the_own_digest_is_a_clean_copys_alone_in_the_schema(self, db_session: Session) -> None:
+        from sqlalchemy.exc import IntegrityError
+
+        db_session.add(
+            PublicObject(
+                sha256="f" * 64,
+                kind="mask",
+                mime="image/png",
+                bytes=1,
+                width=1,
+                height=1,
+                storage_key="derived/f",
+                own_pixel_sha256="d" * 64,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db_session.flush()
+
+
 def _image_of(db: Session, clean_sha: str) -> int:
     from app.models import ImageVersion
 
