@@ -526,6 +526,49 @@ class TestNotFound:
         for mask in masks:
             self._assert_404(client.get(f"/d/{mask}"))
 
+    def _register_matted(
+        self,
+        db: Session,
+        store: LocalObjectStore,
+        image_id: int,
+        derived_from: int | None,
+    ) -> str:
+        out = io.BytesIO()
+        Image.new("RGBA", (40, 60), (31, 30, 90, 255)).save(out, format="PNG")
+        data = out.getvalue()
+        sha = hashlib.sha256(data).hexdigest()
+        key = derived_key(sha, "image/png")
+        store.put(key, data, "image/png")
+        version = ImageVersion(
+            image_id=image_id,
+            version_no=3,
+            derived_from_version=derived_from,
+            transform_spec={"derive_kind": "matted"},
+            mime="image/png",
+            width=40,
+            height=60,
+            bytes=len(data),
+            storage_key=key,
+            visibility="public",
+            age_rating=0,
+            matted=True,
+        )
+        db.add(version)
+        db.flush()
+        register_public_object(
+            db,
+            sha256=sha,
+            kind="matted",
+            mime="image/png",
+            size=len(data),
+            width=40,
+            height=60,
+            storage_key=key,
+            image_version_id=version.id,
+        )
+        db.commit()
+        return sha
+
     @pytest.mark.parametrize(
         ("url", "status"),
         [(ITEM.format(n=7), 200), (PICTURE, 404)],
@@ -551,41 +594,65 @@ class TestNotFound:
         )
         clean_version = db_session.get(ImageVersion, clean.image_version_id)
         assert clean_version is not None
-        out = io.BytesIO()
-        Image.new("RGBA", (40, 60), (31, 30, 90, 255)).save(out, format="PNG")
-        data = out.getvalue()
-        sha = hashlib.sha256(data).hexdigest()
-        key = derived_key(sha, "image/png")
-        store.put(key, data, "image/png")
-        version = ImageVersion(
-            image_id=clean_version.image_id,
-            version_no=3,
-            derived_from_version=2,
-            transform_spec={"derive_kind": "matted"},
-            mime="image/png",
-            width=40,
-            height=60,
-            bytes=len(data),
-            storage_key=key,
-            visibility="public",
-            age_rating=0,
-            matted=True,
-        )
-        db_session.add(version)
-        db_session.flush()
-        register_public_object(
-            db_session,
-            sha256=sha,
-            kind="matted",
-            mime="image/png",
-            size=len(data),
-            width=40,
-            height=60,
-            storage_key=key,
-            image_version_id=version.id,
-        )
-        db_session.commit()
+        sha = self._register_matted(db_session, store, clean_version.image_id, 2)
         assert client.get(f"/d/{sha}").status_code == status
+
+    def test_a_matted_cut_out_of_a_shared_picture_is_judged_over_every_capture(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """Judged over the images behind the clean copy it was cut from
+        (derived_from), not over its own image alone: the same picture is
+        also a collector's photo, so the cut-out is refused like the mask."""
+        self._seed_capture(db_session, store, 0, ITEM.format(n=0))
+        self._seed_capture(db_session, store, 1, PICTURE)
+        clean = db_session.execute(
+            select(PublicObject).where(PublicObject.kind == "sanitized")
+        ).scalar_one()
+        assert client.get(f"/d/{clean.sha256}").status_code == 200
+        item = _source_image(db_session, clean.sha256)
+        sha = self._register_matted(db_session, store, item.id, 2)
+        self._assert_404(client.get(f"/d/{sha}"))
+
+    @pytest.mark.parametrize("derived_from", [1, None], ids=["the-original", "nothing"])
+    def test_a_matted_cut_out_not_cut_from_a_clean_copy_is_not_served(
+        self,
+        client: TestClient,
+        db_session: Session,
+        store: LocalObjectStore,
+        derived_from: int | None,
+    ) -> None:
+        clean = seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=ITEM.format(n=7), source="mfc")],
+            figure_id="mfc:7",
+        )
+        image = _source_image(db_session, clean.sha256)
+        sha = self._register_matted(db_session, store, image.id, derived_from)
+        self._assert_404(client.get(f"/d/{sha}"))
+
+    @pytest.mark.parametrize("deleted", ["matted", "clean"])
+    def test_a_matted_cut_out_goes_offline_with_its_version_or_its_clean_copy(
+        self, client: TestClient, db_session: Session, store: LocalObjectStore, deleted: str
+    ) -> None:
+        clean = seed_clean_image(
+            db_session,
+            store,
+            _photo(7),
+            origins=[ImageOrigin(url=ITEM.format(n=7), source="mfc")],
+            figure_id="mfc:7",
+        )
+        image = _source_image(db_session, clean.sha256)
+        sha = self._register_matted(db_session, store, image.id, 2)
+        assert client.get(f"/d/{sha}").status_code == 200
+        target = db_session.get(PublicObject, sha if deleted == "matted" else clean.sha256)
+        assert target is not None
+        version = db_session.get(ImageVersion, target.image_version_id)
+        assert version is not None
+        version.deleted_at = dt.datetime.now(dt.UTC)
+        db_session.commit()
+        self._assert_404(client.get(f"/d/{sha}"))
 
     def test_a_store_mask_is_judged_by_the_origins_own_grants(
         self,
