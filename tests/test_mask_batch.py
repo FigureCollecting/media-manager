@@ -1266,11 +1266,16 @@ def test_a_copy_just_written_is_read_back_from_memory(tmp_path: Path) -> None:
     """The lane re-reads the clean copy it just stored (to hash it before the
     mask); over the WAN that is a Hetzner round trip per image saved."""
     gets: list[str] = []
+    heads: list[str] = []
 
     class _Backing(LocalObjectStore):
         def get(self, key: str) -> bytes:
             gets.append(key)
             return super().get(key)
+
+        def etag(self, key: str) -> str:
+            heads.append(key)
+            return super().etag(key)
 
     backing = _Backing(tmp_path / "media")
     store = mb.RecentWrites(backing, keep=2)
@@ -1278,6 +1283,7 @@ def test_a_copy_just_written_is_read_back_from_memory(tmp_path: Path) -> None:
         store.put(f"k{n}", bytes([n]), "image/png")
     assert store.get("k2") == b"\x02" and store.get("k1") == b"\x01"
     assert gets == []
+    assert heads == ["k2", "k1"]  # the bucket's ETag vouches for each kept copy
     assert store.get("k0") == b"\x00"  # evicted: read from the bucket
     assert gets == ["k0"]
     assert backing.get("k2") == b"\x02"  # every write still reaches the bucket
@@ -1569,3 +1575,89 @@ def test_a_failure_that_does_not_open_the_circuit_stays_failed(
     rt = _runtime(db_session, tmp_path, raw)
     assert mb.run_batch([gone, raw.add(1)], mb.BatchConfig(max_consecutive_failures=2), rt) == 1
     assert mb.Progress(tmp_path / "progress.jsonl").load()["e" * 64]["status"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# a kept copy is served only when the bucket's ETag matches it
+# --------------------------------------------------------------------------
+
+
+def test_a_copy_the_bucket_stored_wrong_is_read_back_from_the_bucket(tmp_path: Path) -> None:
+    """A PUT the bucket accepted but stored wrong: the kept bytes would hash
+    right, so the lane's source_hash_mismatch could never fire. The ETag says
+    otherwise, and the bucket's own bytes go to the lane's hash check."""
+
+    class _Mangling(LocalObjectStore):
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            super().put(key, data[:-1], content_type)
+
+    store = mb.RecentWrites(_Mangling(tmp_path / "media"))
+    store.put("k", b"clean copy", "image/png")
+    assert store.get("k") == b"clean cop"
+
+
+def test_without_an_etag_the_copy_is_read_back_from_the_bucket(tmp_path: Path) -> None:
+    class _Plain:
+        def __init__(self) -> None:
+            self.objects: dict[str, bytes] = {}
+            self.gets = 0
+
+        def get(self, key: str) -> bytes:
+            self.gets += 1
+            return self.objects[key]
+
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            self.objects[key] = data
+
+    plain = _Plain()
+    store = mb.RecentWrites(plain)
+    store.put("k", b"x", "image/png")
+    assert store.get("k") == b"x" and plain.gets == 1
+
+    class _Unreachable(LocalObjectStore):
+        def etag(self, key: str) -> str:
+            raise ConnectionError("HEAD failed")
+
+    unreachable = mb.RecentWrites(_Unreachable(tmp_path / "u"))
+    unreachable.put("k", b"y", "image/png")
+    assert unreachable.get("k") == b"y"  # from the bucket, which still answers GET
+
+    class _Multipart(LocalObjectStore):
+        def etag(self, key: str) -> str:
+            return "0" * 32 + "-2"
+
+    multipart = mb.RecentWrites(_Multipart(tmp_path / "m"))
+    multipart.put("k", b"z", "image/png")
+    seen: list[str] = []
+    multipart._store.get = lambda key: seen.append(key) or b"z"  # type: ignore[method-assign]
+    assert multipart.get("k") == b"z" and seen == ["k"]
+
+
+def test_a_put_that_raises_keeps_nothing(tmp_path: Path) -> None:
+    class _Down(LocalObjectStore):
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            raise ConnectionError("bucket gone")
+
+    store = mb.RecentWrites(_Down(tmp_path / "media"))
+    with pytest.raises(ConnectionError):
+        store.put("k", b"never stored", "image/png")
+    with pytest.raises(FileNotFoundError):
+        store.get("k")  # nothing kept: the bucket is asked, and has nothing
+
+
+def test_the_stores_etag_is_the_md5_of_the_stored_bytes(tmp_path: Path) -> None:
+    from app.object_store import S3ObjectStore
+    from moto import mock_aws
+
+    md5 = hashlib.md5(b"bytes", usedforsecurity=False).hexdigest()
+    local = LocalObjectStore(tmp_path)
+    local.put("derived/ab/abc.png", b"bytes", "image/png")
+    assert local.etag("derived/ab/abc.png") == md5
+    with mock_aws():
+        import boto3
+
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket="images")
+        s3 = S3ObjectStore(client=client, bucket="images")
+        s3.put("derived/ab/abc.png", b"bytes", "image/png")
+        assert s3.etag("derived/ab/abc.png") == md5  # HEAD, quotes stripped
