@@ -9,6 +9,7 @@ same key and a duplicate write is a no-op in effect.
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
 import re
 from pathlib import Path
@@ -56,6 +57,12 @@ class S3ObjectStore:
             Bucket=self._bucket, Key=key, Body=data, ContentType=content_type, ACL="private"
         )
 
+    def etag(self, key: str) -> str:
+        """The stored object's ETag (a HEAD, no body): for a single-part PUT,
+        the md5 of the bytes the bucket holds."""
+        head = self._client.head_object(Bucket=self._bucket, Key=key)
+        return str(head["ETag"]).strip('"')
+
 
 class LocalObjectStore:
     """A directory of objects keyed by relative path. A key that would leave
@@ -77,6 +84,10 @@ class LocalObjectStore:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+
+    def etag(self, key: str) -> str:
+        """As S3 reports it for a single-part PUT: the md5 of the stored bytes."""
+        return hashlib.md5(self._path(key).read_bytes(), usedforsecurity=False).hexdigest()
 
     def keys(self) -> set[str]:
         if not self._root.exists():

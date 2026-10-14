@@ -558,9 +558,12 @@ class ReadOnlyStore:
 class RecentWrites:
     """The media bucket with its last few writes kept in memory: the lane
     re-reads the clean copy it has just stored (to hash it before the mask),
-    and over the WAN that read is a round trip per image. Every write still
-    goes to the bucket; keys are content addresses, so a kept copy is never
-    stale."""
+    and over the WAN that read is a GET of the whole image per image. Every
+    write still goes to the bucket, and is kept only once the PUT returned.
+    A kept copy is served only when the bucket's ETag (a HEAD, no body) is
+    the md5 of the kept bytes, so the lane's hash check still covers what the
+    bucket holds: a PUT the bucket stored wrong, a store with no ETag, an ETag
+    that is no md5 (multipart) or a HEAD that fails all read the bucket."""
 
     def __init__(self, store: ObjectStore, *, keep: int = 4) -> None:
         self._store = store
@@ -568,9 +571,20 @@ class RecentWrites:
         self._recent: dict[str, bytes] = {}
 
     def get(self, key: str) -> bytes:
-        if key in self._recent:
-            return self._recent[key]
+        kept = self._recent.get(key)
+        if kept is not None and self._stored_as(key, kept):
+            return kept
         return self._store.get(key)
+
+    def _stored_as(self, key: str, data: bytes) -> bool:
+        etag = getattr(self._store, "etag", None)
+        if etag is None:
+            return False
+        try:
+            stored = etag(key)
+        except Exception:
+            return False  # the GET that follows succeeds or fails on its own
+        return bool(stored == hashlib.md5(data, usedforsecurity=False).hexdigest())
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         self._store.put(key, data, content_type)
