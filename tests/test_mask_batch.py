@@ -1792,8 +1792,13 @@ def _client_error(code: str, status: int) -> Exception:
 
 
 def _transport_errors() -> list[Exception]:
-    from botocore.exceptions import EndpointConnectionError, ReadTimeoutError
-    from sqlalchemy.exc import OperationalError
+    from botocore.exceptions import (
+        ConnectionClosedError,
+        EndpointConnectionError,
+        ReadTimeoutError,
+    )
+    from requests.exceptions import ReadTimeout
+    from sqlalchemy.exc import InterfaceError, OperationalError
 
     return [
         ConnectionError("port-forward gone"),
@@ -1804,6 +1809,10 @@ def _transport_errors() -> list[Exception]:
         ReadTimeoutError(endpoint_url="https://hel1.example"),
         _client_error("SlowDown", 503),
         _client_error("InternalError", 500),
+        _client_error("GatewayTimeout", 504),
+        ConnectionClosedError(endpoint_url="https://hel1.example"),
+        InterfaceError("SELECT 1", {}, Exception("connection already closed")),
+        ReadTimeout(),
     ]
 
 
@@ -1821,13 +1830,36 @@ def _own_faults() -> list[Exception]:
 
 
 def test_an_outage_is_told_from_an_images_own_fault() -> None:
-    assert [mb.is_outage(e) for e in _transport_errors()] == [True] * 8
+    assert [mb.is_outage(e) for e in _transport_errors()] == [True] * 12
     assert [mb.is_outage(e) for e in _own_faults()] == [False] * 6
     # the lane records the class name only
-    for name in ("ConnectionError", "OperationalError", "ReadTimeoutError", "TimeoutError"):
+    for name in (
+        "ConnectionError",
+        "OperationalError",
+        "InterfaceError",
+        "ReadTimeoutError",
+        "TimeoutError",
+        "Timeout",
+        "HTTPClientError",
+        "ConnectionResetError",
+        "ConnectionRefusedError",
+        "ConnectionAbortedError",
+        "BrokenPipeError",
+        "EndpointConnectionError",
+        "ConnectionClosedError",
+        "ConnectTimeoutError",
+        "ProxyConnectionError",
+    ):
         assert mb.is_outage_reason(name) is True
     for name in ("ClientError", "RuntimeError", "unsupported_codec:zstd", "Fail", None):
         assert mb.is_outage_reason(name) is False
+
+
+@pytest.mark.parametrize(
+    ("status", "outage"), [(499, False), (500, True), (504, True), (599, True)]
+)
+def test_every_bucket_status_from_500_up_is_an_outage(status: int, outage: bool) -> None:
+    assert mb.is_outage(_client_error("Err", status)) is outage
 
 
 class _Bucket(LocalObjectStore):
@@ -2025,6 +2057,109 @@ def test_a_bucket_5xx_inside_the_lane_is_an_outage(db_session: Session, tmp_path
     assert (first["status"], first["reason"]) == ("interrupted", "ClientError")
     assert [progress[i.blob_sha256]["reason"] for i in items[1:]] == ["seed:ClientError"] * 2
     assert {progress[i.blob_sha256]["status"] for i in items} == {"interrupted"}
+
+
+class _Bucket403(LocalObjectStore):
+    """The media bucket answering AccessDenied (403) to every PUT once ``down``."""
+
+    down = False
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        if self.down:
+            raise _client_error("AccessDenied", 403)
+        super().put(key, data, content_type)
+
+
+def test_a_bucket_403_inside_the_lane_stays_failed_and_opens_no_circuit(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """A 4xx the media bucket answers inside the mask step is the image's fault
+    (the lane records ClientError for it, as for a 503): not an outage."""
+    raw = _Raw(tmp_path / "raw")
+    media = _Bucket403(tmp_path / "media")
+
+    class _Then403(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            media.down = True  # after the copy was seeded: the mask PUT gets the 403
+            return super().predict_alpha(image)
+
+    rt = _runtime(db_session, tmp_path, raw, backend=_Then403())
+    rt.media_store = media
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(max_consecutive_failures=1), rt) == 1  # not 3
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("failed", "ClientError")
+
+
+class _ClosedRaw(LocalObjectStore):
+    """The raw bucket whose connection closes in the middle of the response."""
+
+    def get(self, key: str) -> bytes:
+        from botocore.exceptions import ConnectionClosedError
+
+        raise ConnectionClosedError(endpoint_url="https://hel1.example")
+
+
+def test_a_raw_connection_closed_mid_response_is_an_outage(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    rt = _runtime(db_session, tmp_path, raw)
+    rt.raw_store = mb.ReadOnlyStore(_ClosedRaw(tmp_path / "closed"))
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), rt) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "fetch:ConnectionClosedError")
+
+
+def _lane_raises(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise error
+
+    monkeypatch.setattr(mask_job, "register_public_object", boom)
+
+
+def test_a_database_interface_error_inside_the_lane_is_an_outage(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import InterfaceError
+
+    _lane_raises(monkeypatch, InterfaceError("INSERT", {}, Exception("connection already closed")))
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "InterfaceError")
+
+
+def test_a_requests_style_timeout_inside_the_lane_is_an_outage(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from requests.exceptions import Timeout
+
+    _lane_raises(monkeypatch, Timeout())
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "Timeout")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ConnectionResetError(), ConnectionRefusedError(), ConnectionAbortedError()],
+    ids=lambda e: type(e).__name__,
+)
+def test_the_lane_records_only_the_class_so_its_connection_errors_are_named(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """The lane keeps the subclass name (not ConnectionError), so the name list must hold it."""
+    _lane_raises(monkeypatch, error)
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", type(error).__name__)
 
 
 # --------------------------------------------------------------------------
