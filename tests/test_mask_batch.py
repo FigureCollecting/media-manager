@@ -1431,3 +1431,74 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
     assert "97%" in paused[0]["detail"]
     assert (gamer.loads, gamer.releases) == (2, 1)  # released for the game, loaded again
     assert gates.gpu is not None and gates.gpu.own_mib == 9200  # measured again after the reload
+
+
+# --------------------------------------------------------------------------
+# the run options are validated before anything runs
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--chunk-size", "0"),  # would loop forever, a mask_batches row per pass
+        ("--chunk-size", "-1"),
+        ("--chunk-size", "two"),
+        ("--max-consecutive-failures", "0"),  # would call one success an outage
+        ("--max-consecutive-failures", "-3"),
+        ("--gpu-samples", "0"),
+        ("--gpu-samples", "-1"),
+        ("--limit", "-1"),  # would silently drop the last image
+        ("--limit", "1.5"),
+        ("--poll-seconds", "0"),  # a tight loop on the address echo in a VPN window
+        ("--poll-seconds", "0.5"),
+        ("--poll-seconds", "-60"),
+        ("--poll-seconds", "nan"),
+        ("--poll-seconds", "soon"),
+    ],
+)
+def test_a_bad_run_option_is_refused_by_the_parser(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], option: str, value: str
+) -> None:
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--no-residential-check", "--dry-run", option, value]
+    with pytest.raises(SystemExit) as exc:
+        mb.main(argv)
+    assert exc.value.code == 2
+    assert option in capsys.readouterr().err
+    assert not (tmp_path / "mask-batch-progress.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "field", "expected"),
+    [
+        ("--chunk-size", "1", "chunk_size", 1),
+        ("--max-consecutive-failures", "1", "max_consecutive_failures", 1),
+        ("--gpu-samples", "1", "gpu_samples", 1),
+        ("--limit", "0", "limit", 0),
+        ("--poll-seconds", "1", "poll_seconds", 1.0),
+        ("--poll-seconds", "2.5", "poll_seconds", 2.5),
+    ],
+)
+def test_the_smallest_sane_run_options_are_accepted(
+    option: str, value: str, field: str, expected: float
+) -> None:
+    args = mb._parser().parse_args(["run", "--worklist", "w", option, value])
+    assert getattr(args, field) == expected
+
+
+def test_run_batch_refuses_a_chunk_size_below_one(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    model = _Model()
+    calls = iter(range(100))  # without the guard the loop never ends: stop it, red not hung
+    rt = _runtime(
+        db_session, tmp_path, raw, backend=model, events=events, stop=lambda: next(calls) >= 50
+    )
+    for size in (0, -1):
+        assert mb.run_batch([raw.add(1)], mb.BatchConfig(chunk_size=size), rt) == 2
+    assert [e["event"] for e in events] == ["refused", "refused"]
+    assert "chunk size" in events[0]["detail"]
+    assert model.loads == 0
+    assert db_session.execute(select(func.count()).select_from(MaskBatch)).scalar_one() == 0
+    assert not (tmp_path / "progress.jsonl").exists()
