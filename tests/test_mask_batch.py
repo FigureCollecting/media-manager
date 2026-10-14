@@ -1423,7 +1423,8 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
 
     def sleep(seconds: float) -> None:
         clock.sleep(seconds)
-        card.game = False  # the game ends while the batch waits
+        if len(clock.slept) == 2:
+            card.game = False  # the game ends while the batch waits, two polls in
 
     gates = mb.Gates(
         windows=(), gpu=mb.GpuGate(query=card.query, samples=1), residential=None, now=clock.now
@@ -1435,6 +1436,7 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
     paused = _events(events, "paused")
     assert len(paused) == 1 and paused[0]["gate"] == "gpu"
     assert "97%" in paused[0]["detail"]
+    assert clock.slept == [60, 60]  # the released model's memory is no longer credited
     assert (gamer.loads, gamer.releases) == (2, 1)  # released for the game, loaded again
     assert gates.gpu is not None and gates.gpu.own_mib == 9200  # measured again after the reload
 
@@ -1551,6 +1553,7 @@ def test_failures_that_open_the_circuit_are_interrupted_and_a_plain_rerun_retrie
     assert progress[items[1].blob_sha256]["reason"] == "ConnectionError"  # the cause is kept
     chunks = _events(events, "chunk")
     assert chunks[1]["counts"] == {"interrupted": 2}  # this chunk's share of the streak
+    assert [f["reason"] for f in chunks[1]["failures"]] == ["ConnectionError"] * 2
     assert _events(events, "circuit_open")[0]["interrupted"] == 3
     # the lane recorded those three as failed in the media db
     assert mask_job.original_settled(db_session, items[1].blob_sha256) == "failed"
@@ -1615,12 +1618,19 @@ def test_without_an_etag_the_copy_is_read_back_from_the_bucket(tmp_path: Path) -
     assert store.get("k") == b"x" and plain.gets == 1
 
     class _Unreachable(LocalObjectStore):
+        gets = 0
+
+        def get(self, key: str) -> bytes:
+            self.gets += 1
+            return super().get(key)
+
         def etag(self, key: str) -> str:
             raise ConnectionError("HEAD failed")
 
-    unreachable = mb.RecentWrites(_Unreachable(tmp_path / "u"))
+    bucket = _Unreachable(tmp_path / "u")
+    unreachable = mb.RecentWrites(bucket)
     unreachable.put("k", b"y", "image/png")
-    assert unreachable.get("k") == b"y"  # from the bucket, which still answers GET
+    assert unreachable.get("k") == b"y" and bucket.gets == 1  # the bucket, which answers GET
 
     class _Multipart(LocalObjectStore):
         def etag(self, key: str) -> str:
@@ -1641,6 +1651,7 @@ def test_a_put_that_raises_keeps_nothing(tmp_path: Path) -> None:
     store = mb.RecentWrites(_Down(tmp_path / "media"))
     with pytest.raises(ConnectionError):
         store.put("k", b"never stored", "image/png")
+    assert store._recent == {}  # kept only once the PUT returned
     with pytest.raises(FileNotFoundError):
         store.get("k")  # nothing kept: the bucket is asked, and has nothing
 
@@ -1722,3 +1733,39 @@ def test_only_a_gpu_run_builds_the_gpu_gate_and_the_vram_sampler(
     sampler = rt.vram()
     assert isinstance(sampler, mb.VramSampler)
     assert (sampler._command is not None) is on_gpu
+
+
+def test_the_own_memory_is_measured_after_the_model_has_run(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """An ineligible photo never reaches the model: the arena is not yet full
+    after it, so measuring then would credit too little and pause the batch."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    ran = {"since_load": False}
+
+    class _Arena(_Model):
+        def load(self) -> None:
+            super().load()
+            ran["since_load"] = False
+
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            ran["since_load"] = True
+            return super().predict_alpha(image)
+
+    model = _Arena()
+
+    def query() -> str:
+        if model.loads > model.releases:
+            return HELD if ran["since_load"] else "0, 8400, 3300, 12282"  # weights only
+        return IDLE
+
+    gates = mb.Gates(
+        windows=(), gpu=mb.GpuGate(query=query, samples=1), residential=None, now=clock.now
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
+    items = [raw.add(1, rank=0, url=PICTURE), raw.add(2, rank=1), raw.add(3, rank=2)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, poll_seconds=60), rt) == 0
+    assert _events(events, "paused") == []
+    assert gates.gpu is not None and gates.gpu.own_mib == 9200
