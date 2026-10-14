@@ -42,6 +42,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -136,6 +137,7 @@ def _candidates(
     page_size: int,
     redrive: tuple[str, ...],
     source: str | None = None,
+    only: Sequence[str] | None = None,
 ) -> list[PublicObject]:
     settled = select(ImageMask.source_sha256).where(
         ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
@@ -166,6 +168,8 @@ def _candidates(
         query = query.where(PublicObject.sha256 > after)
     if source is not None:
         query = query.where(PublicObject.sha256.in_(_of_source(source)))
+    if only is not None:
+        query = query.where(PublicObject.sha256.in_(only))
     return list(db.execute(query).scalars())
 
 
@@ -384,6 +388,80 @@ def _open_batch(
     return batch
 
 
+def _redrive(retry_failed: bool, recheck_ineligible: bool) -> tuple[str, ...]:
+    return ("failed",) * retry_failed + ("ineligible",) * recheck_ineligible
+
+
+def open_mask_batch(db: Session, *, backend_name: str) -> MaskBatch:
+    """A new applied batch for ``settle_clean_copy`` (MASK-BATCH-1: one per
+    chunk); close it with ``finish_mask_batch``."""
+    return _open_batch(db, resume_batch_id=None, backend_name=backend_name, limit=None, source=None)
+
+
+def finish_mask_batch(db: Session, batch: MaskBatch) -> None:
+    batch.status = "done"
+    batch.finished_at = dt.datetime.now(dt.UTC)
+    db.commit()
+
+
+def settle_clean_copy(
+    db: Session,
+    store: ObjectStore,
+    sha256: str,
+    *,
+    backend: MattingBackend,
+    batch: MaskBatch,
+    retry_failed: bool = False,
+    recheck_ineligible: bool = False,
+) -> ItemReport | None:
+    """Settle ONE clean copy, by its sha, exactly as ``run_mask_batch`` settles
+    each of its candidates (MASK-BATCH-1 drives the lane image by image, in its
+    own order). None when the copy is not a candidate: already settled at this
+    pipeline version (unless re-driven), soft-deleted, or not a clean copy.
+    Applied only: a backend that is not a mask model is refused."""
+    if not backend.publishes_masks:
+        raise ValueError(f"backend {backend.name!r} is not a mask model: dry run only")
+    page = _candidates(
+        db,
+        after=None,
+        page_size=1,
+        redrive=_redrive(retry_failed, recheck_ineligible),
+        only=(sha256,),
+    )
+    if not page:
+        return None
+    return _settle(db, store, page[0], backend, batch)
+
+
+def original_settled(
+    db: Session, original_sha256: str, *, retry_failed: bool = False
+) -> str | None:
+    """The mask result, at this pipeline version, of a clean copy behind the
+    original whose bytes have ``original_sha256`` -- ``ok`` when any copy has
+    one -- or None when it has no copy yet or no result yet (a ``failed``
+    result counts as none when ``retry_failed``). MASK-BATCH-1's idempotence
+    check: an original whose copy is settled is skipped without its bytes
+    being read."""
+    copies = (
+        select(PublicObjectImage.sha256)
+        .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
+        .join(PublicObject, PublicObject.sha256 == PublicObjectImage.sha256)
+        .where(ImageModel.sha256 == original_sha256, PublicObject.kind == "sanitized")
+    )
+    statuses = set(
+        db.execute(
+            select(ImageMask.status).where(
+                ImageMask.source_sha256.in_(copies),
+                ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
+                ImageMask.status.not_in(_redrive(retry_failed, False)),
+            )
+        ).scalars()
+    )
+    if not statuses:
+        return None
+    return "ok" if "ok" in statuses else min(statuses)
+
+
 def run_mask_batch(
     db: Session,
     store: ObjectStore,
@@ -425,7 +503,7 @@ def run_mask_batch(
         if resume_batch_id is not None and batch.item_limit is not None:
             limit = max(0, batch.item_limit - sum(batch.counts.values()))
 
-    redrive = ("failed",) * retry_failed + ("ineligible",) * recheck_ineligible
+    redrive = _redrive(retry_failed, recheck_ineligible)
     report = BatchReport(batch_id=batch.id if batch else None, dry_run=dry_run)
     cursor = batch.cursor_sha256 if batch else None
     remaining = limit
@@ -443,9 +521,7 @@ def run_mask_batch(
             remaining -= len(page)
 
     if batch is not None:
-        batch.status = "done"
-        batch.finished_at = dt.datetime.now(dt.UTC)
-        db.commit()
+        finish_mask_batch(db, batch)
     return report
 
 

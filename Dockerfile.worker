@@ -1,29 +1,31 @@
 # syntax=docker/dockerfile:1
 #
 # --- BiRefNet matting backend: base image + CUDA/cuDNN pin rationale ------
-# onnxruntime-gpu 1.27.0 (latest on PyPI as of this writing, released
-# 2026-06-18) dropped CUDA 12 as its default GPU package: its own release
-# notes say "CUDA 12 packages are deprecated, please move to CUDA 13
-# ASAP", and its optional pip extras confirm the pairing it was actually
-# built against --
-#   nvidia-cuda-runtime-cu13 ~=13.0   (extra "cuda")
-#   nvidia-cudnn-cu13        ~=9.0    (extra "cudnn")
-# i.e. CUDA 13.x + cuDNN 9.x. A mismatched CUDA/cuDNN does NOT fail the
-# build or the container start -- onnxruntime silently falls back to
-# CPUExecutionProvider (the same hazard class as any nvidia-cudnn
-# cu12/cu13 pip-wheel collision: a mismatched wheel overwrites the .so
-# files a GPU library expects, and the failure is silent, not a crash).
-# Rather than lean on the pip [cuda]/[cudnn] extras alone, this image
-# bases directly on an NVIDIA CUDA 13 image that already ships matching
-# CUDA 13.x runtime + cuDNN 9.x system libraries via LD_LIBRARY_PATH, so
-# there is one single, verifiable source of truth for the pin.
-# app.workers.matting.BiRefNetMattingBackend._get_session() additionally
+# onnxruntime-gpu 1.31.0 (latest on PyPI, released 2026-10-09; MASK-BATCH-1
+# moved the pin from 1.27.0). Since 1.27 the PyPI GPU package is built
+# against CUDA 13.0 + cuDNN 9.x (CUDA 12 packages are deprecated) and runs on
+# any later CUDA 13 minor; 1.28 made cuDNN optional at runtime for the CUDA
+# EP. 1.31.0 was measured against 1.27.0 on the seven July figures on the
+# RTX 4070 Ti: the same IoU against the July cut-outs, no alpha more than
+# 2/255 apart, the same speed and GPU memory (MASK-BATCH-1 PR). A mismatched
+# CUDA/cuDNN does NOT fail the build or the container start --
+# onnxruntime silently falls back to CPUExecutionProvider (the same hazard
+# class as any nvidia-cudnn cu12/cu13 pip-wheel collision: a mismatched
+# wheel overwrites the .so files a GPU library expects, and the failure is
+# silent, not a crash). Rather than lean on the pip [cuda]/[cudnn] extras
+# alone, this image bases directly on an NVIDIA CUDA 13 image that already
+# ships matching CUDA 13.x runtime + cuDNN 9.x system libraries via
+# LD_LIBRARY_PATH, so there is one single, verifiable source of truth for the
+# pin. app.workers.matting.BiRefNetMattingBackend._get_session() additionally
 # checks at runtime that CUDAExecutionProvider actually loaded and raises
-# rather than silently degrading if it didn't.
+# rather than silently degrading if it didn't (MATTING_DEVICE=cuda, the
+# default; "auto" falls back to a lean CPU session and says so).
 #
 # Tag verified to exist via the Docker Hub v2 API (nvidia/cuda tags,
-# name=cudnn-runtime-ubuntu24.04) at authoring time.
-FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS base
+# name=cudnn-runtime-ubuntu24.04): 13.4.2 is the latest 13.x (2026-09-29).
+# The host driver must support CUDA 13.4 (the WSL box: driver 617.42, CUDA
+# UMD 13.4).
+FROM nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -63,7 +65,7 @@ RUN pip install --no-cache-dir poetry==1.8.3 && \
 # the shared dependency set -- and CI, which never builds this image --
 # stays GPU-free. Pinned exactly to match the base image's CUDA 13.x /
 # cuDNN 9.x pair documented above.
-RUN pip install --no-cache-dir onnxruntime-gpu==1.27.0
+RUN pip install --no-cache-dir onnxruntime-gpu==1.31.0
 
 # --- Matting weights: exactly the bytes the mask lane was measured on -----
 # MASK-1's live acceptance (2026-10-11: the seven July figures, IoU 0.91-0.99

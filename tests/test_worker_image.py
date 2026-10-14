@@ -36,3 +36,25 @@ def test_every_weight_is_pinned_by_its_measured_sha256() -> None:
 
 def test_the_image_never_selects_a_backend() -> None:
     assert not re.search(r"^\s*(ENV|ARG)\b.*\bMATTING_BACKEND=", DOCKERFILE, re.MULTILINE)
+
+
+def test_onnxruntime_gpu_is_the_release_the_batch_was_measured_on() -> None:
+    """MASK-BATCH-1 (2026-10-14): onnxruntime-gpu 1.31.0, the latest release,
+    measured against 1.27.0 on this lane's seven July figures: the same IoU
+    against the July cut-outs to three places, no alpha more than 2 of 255
+    apart, the same speed and memory."""
+    assert re.search(r"pip install --no-cache-dir onnxruntime-gpu==1\.31\.0\s", DOCKERFILE)
+
+
+def test_the_base_is_the_cuda_13_cudnn_9_runtime_it_was_measured_on() -> None:
+    """onnxruntime-gpu 1.27+ is built against CUDA 13.0 and cuDNN 9 and runs on
+    any later CUDA 13 minor; nvidia/cuda 13.4.2 is the latest 13.x runtime."""
+    m = re.search(
+        r"^FROM nvidia/cuda:(\d+)\.(\d+)\.(\d+)-cudnn-runtime-ubuntu24\.04\b", DOCKERFILE, re.M
+    )
+    assert m is not None
+    assert (int(m[1]), int(m[2]), int(m[3])) == (13, 4, 2)
+
+
+def test_the_image_never_selects_a_device() -> None:
+    assert not re.search(r"^\s*(ENV|ARG)\b.*\bMATTING_DEVICE=", DOCKERFILE, re.MULTILINE)

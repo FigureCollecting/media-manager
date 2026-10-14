@@ -87,34 +87,48 @@ def _weights(given: str | None, env: str, flag: str, backend: str) -> str:
 
 
 def make_backend(
-    name: str | None, model: str | None, isnet_general: str | None, isnet_anime: str | None
+    name: str | None,
+    model: str | None,
+    isnet_general: str | None,
+    isnet_anime: str | None,
+    *,
+    device: str | None = None,
+    cpu_threads: int | None = None,
 ) -> MattingBackend | None:
-    """None = the configured backend (Settings.matting_backend)."""
+    """None = the configured backend (Settings.matting_backend). ``device``
+    and ``cpu_threads`` place every session (default: Settings.matting_device
+    and matting_cpu_threads; app.workers.matting.MATTING_DEVICES)."""
     if name is None:
         return None
+    if name not in ("birefnet", "birefnet-basekept"):
+        return StubMattingBackend()
+    if device is None or cpu_threads is None:
+        from ..config import get_settings
+
+        settings = get_settings()
+        device = device or settings.matting_device
+        cpu_threads = cpu_threads if cpu_threads is not None else settings.matting_cpu_threads
+    placement: dict[str, Any] = {"device": device, "cpu_threads": cpu_threads}
+    primary = BiRefNetMattingBackend(
+        model_path=_weights(model, "MATTING_MODEL_PATH", "--model", name), **placement
+    )
     if name == "birefnet":
-        return BiRefNetMattingBackend(
-            model_path=_weights(model, "MATTING_MODEL_PATH", "--model", name)
-        )
-    if name == "birefnet-basekept":
-        return BaseKeptMattingBackend(
-            primary=BiRefNetMattingBackend(
-                model_path=_weights(model, "MATTING_MODEL_PATH", "--model", name)
+        return primary
+    return BaseKeptMattingBackend(
+        primary=primary,
+        donors=[
+            IsNetMattingBackend(
+                model_path=_weights(
+                    isnet_general, "MATTING_ISNET_GENERAL_PATH", "--isnet-general", name
+                ),
+                **placement,
             ),
-            donors=[
-                IsNetMattingBackend(
-                    model_path=_weights(
-                        isnet_general, "MATTING_ISNET_GENERAL_PATH", "--isnet-general", name
-                    )
-                ),
-                IsNetMattingBackend(
-                    model_path=_weights(
-                        isnet_anime, "MATTING_ISNET_ANIME_PATH", "--isnet-anime", name
-                    )
-                ),
-            ],
-        )
-    return StubMattingBackend()
+            IsNetMattingBackend(
+                model_path=_weights(isnet_anime, "MATTING_ISNET_ANIME_PATH", "--isnet-anime", name),
+                **placement,
+            ),
+        ],
+    )
 
 
 def open_stores(sandbox: str | None) -> tuple[Session, ObjectStore]:
