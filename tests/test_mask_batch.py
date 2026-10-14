@@ -1,0 +1,1062 @@
+"""MASK-BATCH-1: the gated, chunked, resumable mask batch for the WSL GPU.
+
+The driver (``app.cli.mask_batch``) reads a work list of ORIGINALS (the
+spine's captured item images: blob sha, raw-bucket key, origin url, product),
+Ross's holdings first, and per original: skips it when its clean copy already
+has a mask result (idempotent per image sha), reads the bytes from the raw
+bucket (read only) and checks their sha, seeds the clean copy
+(``seed_clean_image``) and settles its mask (``settle_clean_copy``) in the
+media database and bucket. Before EVERY chunk it checks Ross's gate -- the
+scraper-quiet minute windows, the GPU (utilisation < 5 % OR free >= 9 GiB)
+and the residential exit -- and waits while any fails, releasing the model so
+a game gets the GPU back. Per chunk it reports count, s/img, peak VRAM and the
+failures; its own progress file makes it resumable; ``--dry-run`` touches
+nothing.
+
+No GPU, no network, no real model here: SQLite, local directories, the
+stub's arithmetic standing in for a mask model, fake clocks and fake
+nvidia-smi output.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import gzip
+import hashlib
+import io
+import json
+import sys
+from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+from app.cli import mask_batch as mb
+from app.models import ImageMask, MaskBatch, PublicObject
+from app.object_store import LocalObjectStore
+from app.workers import mask_job
+from app.workers.mask_policy import ImageOrigin
+from app.workers.mask_seed import seed_clean_image
+from app.workers.matting import MattingBackend, StubMattingBackend
+from PIL import Image
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
+PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/{n}.jpeg"
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+def _photo(n: int) -> bytes:
+    arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
+    arr[10:50, 12:28] = (31 + 10 * n % 200, 30, 90)
+    arr[0, 0] = (250, 250, 248 - n % 3)
+    arr[1, 0] = (n % 251, 250, 250)
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class _Model(StubMattingBackend):
+    """The stub's arithmetic standing in for a mask MODEL (publishes)."""
+
+    name = "stub-model"
+    publishes_masks = True
+
+    def __init__(self) -> None:
+        self.loads = 0
+        self.releases = 0
+
+    def load(self) -> None:
+        self.loads += 1
+
+    def release(self) -> None:
+        self.releases += 1
+
+    @property
+    def active_provider(self) -> str | None:
+        return "FakeExecutionProvider"
+
+
+class _Raw:
+    """A raw bucket on disk, keyed the way the scraper's asset lane keys it."""
+
+    def __init__(self, root: Path) -> None:
+        self.store = LocalObjectStore(root)
+
+    def add(
+        self, n: int, *, codec: str = "identity", rank: int = 9, url: str = ITEM
+    ) -> mb.WorkItem:
+        data = _photo(n)
+        sha = hashlib.sha256(data).hexdigest()
+        key = f"raw-img/sha256/{sha[:2]}/{sha}.png"
+        self.store.put(key, gzip.compress(data) if codec == "gzip" else data, "image/png")
+        return mb.WorkItem(
+            blob_sha256=sha,
+            storage_key=key,
+            url=url.format(n=n),
+            product_id=f"00000000-0000-0000-0000-{n:012d}",
+            head_id=f"00000000-0000-0000-0000-{n:012d}",
+            rank=rank,
+            codec=codec,
+        )
+
+
+class _Clock:
+    """UTC wall clock + monotonic clock; ``sleep`` advances both."""
+
+    def __init__(self, minute: int = 30) -> None:
+        self.t = dt.datetime(2026, 10, 14, 15, minute, 0, tzinfo=dt.UTC)
+        self.mono = 1000.0
+        self.slept: list[float] = []
+
+    def now(self) -> dt.datetime:
+        return self.t
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.advance(seconds)
+
+    def advance(self, seconds: float) -> None:
+        self.t += dt.timedelta(seconds=seconds)
+        self.mono += seconds
+
+
+class _Sampler:
+    def __init__(self, peak: int | None = 3210) -> None:
+        self.peak_mib = peak
+        self.entered = 0
+
+    def __enter__(self) -> _Sampler:
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _runtime(
+    db: Session,
+    tmp_path: Path,
+    raw: _Raw,
+    *,
+    clock: _Clock | None = None,
+    gates: mb.Gates | None = None,
+    backend: MattingBackend | None = None,
+    progress: Path | None = None,
+    events: list[dict[str, Any]] | None = None,
+    stop: Callable[[], bool] | None = None,
+) -> mb.Runtime:
+    clock = clock or _Clock()
+    model = backend or _Model()
+    out = events if events is not None else []
+    return mb.Runtime(
+        gates=gates or mb.Gates(windows=(), gpu=None, residential=None, now=clock.now),
+        open_db=lambda: db,
+        media_store=LocalObjectStore(tmp_path / "media"),
+        raw_store=mb.ReadOnlyStore(raw.store),
+        make_backend=lambda: model,
+        progress=mb.Progress(progress if progress is not None else tmp_path / "progress.jsonl"),
+        vram=lambda: _Sampler(),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        emit=out.append,
+        stop_requested=stop or (lambda: False),
+    )
+
+
+def _events(events: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    return [e for e in events if e["event"] == name]
+
+
+def _gpu(readings: Iterable[str]) -> Callable[[], str]:
+    it = iter(readings)
+    return lambda: next(it)
+
+
+# --------------------------------------------------------------------------
+# the work list
+# --------------------------------------------------------------------------
+
+
+def _line(sha: str, rank: int, **extra: Any) -> str:
+    row = {
+        "blob_sha256": sha,
+        "storage_key": f"raw-img/sha256/{sha[:2]}/{sha}.jpg",
+        "url": ITEM.format(n=1),
+        "source": "mfc",
+        "product_id": "p",
+        "rank": rank,
+        **extra,
+    }
+    return json.dumps(row)
+
+
+def test_the_work_list_is_ross_first_then_file_order_each_original_once() -> None:
+    a, b, c = "a" * 64, "b" * 64, "c" * 64
+    lines = [
+        "##### worklist-catalog.sql",
+        _line(a, 9),
+        _line(b, 9),
+        "(3 rows)",
+        "",
+        _line(c, 2),
+        _line(b, 0),  # b is also one of Ross's: his rank wins
+    ]
+    items, skipped = mb.parse_worklist(lines)
+    assert [(i.blob_sha256, i.rank) for i in items] == [(b, 0), (c, 2), (a, 9)]
+    assert skipped == 4
+    assert items[0].codec == "identity"
+    assert items[0].head_id is None
+
+
+def test_a_bad_row_in_the_work_list_is_refused_with_its_line_number() -> None:
+    with pytest.raises(ValueError, match="line 2: blob_sha256"):
+        mb.parse_worklist([_line("a" * 64, 0), _line("A" * 64, 0)])
+    with pytest.raises(ValueError, match="line 1: storage_key"):
+        mb.parse_worklist([_line("a" * 64, 0, storage_key="")])
+    with pytest.raises(ValueError, match="line 1: rank"):
+        mb.parse_worklist([_line("a" * 64, -1)])
+    with pytest.raises(ValueError, match="line 1: rank"):
+        mb.parse_worklist([_line("a" * 64, True)])
+    with pytest.raises(ValueError, match="line 1: url"):
+        mb.parse_worklist([_line("a" * 64, 0, url=None)])
+    with pytest.raises(ValueError, match="line 1: product_id"):
+        mb.parse_worklist([_line("a" * 64, 0, product_id="")])
+    with pytest.raises(ValueError, match="line 1: codec"):
+        mb.parse_worklist([_line("a" * 64, 0, codec=7)])
+    with pytest.raises(ValueError, match="line 1: not a JSON object"):
+        mb.parse_worklist(['{"blob_sha256": '])
+
+
+def test_read_worklists_concatenates_files_before_ordering(tmp_path: Path) -> None:
+    (tmp_path / "catalog.jsonl").write_text(_line("a" * 64, 9) + "\n")
+    (tmp_path / "ross.jsonl").write_text(_line("a" * 64, 1) + "\n" + _line("d" * 64, 0) + "\n")
+    items, skipped = mb.read_worklists([tmp_path / "catalog.jsonl", tmp_path / "ross.jsonl"])
+    assert [(i.blob_sha256[0], i.rank) for i in items] == [("d", 0), ("a", 1)]
+    assert skipped == 0
+
+
+# --------------------------------------------------------------------------
+# the gates
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reading", "ok"),
+    [
+        ("4, 0, 12000, 12282", True),  # idle GPU, whatever the memory
+        ("5, 9216, 3000, 12282", True),  # busy, but 9 GiB free
+        ("5, 9215, 3000, 12282", False),  # busy and one MiB short
+        ("99, 100, 12000, 12282", False),  # a game
+        ("0, 12000, 200, 12282", True),
+    ],
+)
+def test_the_gpu_gate_is_ross_rule(reading: str, ok: bool) -> None:
+    gate = mb.GpuGate(query=lambda: reading, samples=1, sleep=lambda s: None)
+    result = gate.check()
+    assert result.ok is ok
+    assert result.gate == "gpu"
+    assert "util" in result.detail and "free" in result.detail
+
+
+def test_every_gpu_sample_must_pass() -> None:
+    slept: list[float] = []
+    gate = mb.GpuGate(
+        query=_gpu(["0, 100, 1, 12282", "80, 100, 1, 12282", "0, 100, 1, 12282"]),
+        samples=3,
+        interval=0.5,
+        sleep=slept.append,
+    )
+    assert gate.check().ok is False
+    assert slept == [0.5, 0.5]
+
+
+def test_the_gpu_gate_fails_closed() -> None:
+    def broken() -> str:
+        raise OSError("nvidia-smi: not found")
+
+    assert mb.GpuGate(query=broken, samples=1).check().ok is False
+    assert mb.GpuGate(query=lambda: "N/A, 1, 2, 3", samples=1).check().ok is False
+    assert mb.GpuGate(query=lambda: "1, 2", samples=1).check().ok is False
+    assert mb.GpuGate(query=lambda: "", samples=1).check().ok is False
+
+
+def test_the_gpu_reading_keeps_the_used_memory_for_the_baseline() -> None:
+    reading = mb.GpuGate(query=lambda: "3, 10579, 1416, 12282", samples=1).read()
+    assert reading == mb.GpuReading(util=3, free_mib=10579, used_mib=1416, total_mib=12282)
+
+
+def test_nvidia_smi_query_names_one_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    class _Done:
+        stdout = "1, 2, 3, 4\n"
+
+    def fake_run(cmd: list[str], **kw: Any) -> _Done:
+        seen.append(cmd)
+        assert kw["check"] is True and kw["timeout"] > 0
+        return _Done()
+
+    monkeypatch.setattr(mb.subprocess, "run", fake_run)
+    assert mb.nvidia_smi_query(1)() == "1, 2, 3, 4"
+    assert seen[0][0] == "nvidia-smi" and seen[0][-2:] == ["-i", "1"]
+    assert "--query-gpu=utilization.gpu,memory.free,memory.used,memory.total" in seen[0]
+
+
+def test_the_busy_windows_are_the_scraper_rolls() -> None:
+    windows = mb.parse_windows(mb.DEFAULT_BUSY_WINDOWS)
+    assert windows == ((3, 26), (41, 43), (50, 56))
+    busy = {m for m in range(60) if mb.busy_window(m, windows)}
+    quiet = sorted(set(range(60)) - busy)
+    assert quiet == [0, 1, 2, *range(27, 41), 44, 45, 46, 47, 48, 49, 57, 58, 59]
+    assert mb.busy_window(26, windows) == (3, 26)
+    assert mb.parse_windows("") == ()
+
+
+@pytest.mark.parametrize("spec", ["3-", "26-3", "0-60", "-1-4", "a-b", "3"])
+def test_a_malformed_window_is_refused(spec: str) -> None:
+    with pytest.raises(ValueError, match="window"):
+        mb.parse_windows(spec)
+
+
+def test_the_residential_check_wants_the_home_address() -> None:
+    clock = _Clock()
+    answers = iter(["198.51.100.7\n", "203.0.113.9"])
+    check = mb.ResidentialCheck(
+        expected_ip="198.51.100.7", fetch=lambda: next(answers), ttl=300, clock=clock.monotonic
+    )
+    assert check.check().ok is True
+    clock.advance(299)
+    assert check.check().ok is True  # cached: no second fetch yet
+    clock.advance(1)
+    result = check.check()
+    assert result.ok is False and result.gate == "residential"
+    assert "203.0.113.9" in result.detail
+
+
+def test_a_failed_residential_check_is_never_cached() -> None:
+    calls: list[int] = []
+
+    def fetch() -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("no route")
+        return "198.51.100.7"
+
+    check = mb.ResidentialCheck(expected_ip="198.51.100.7", fetch=fetch, ttl=300)
+    assert check.check().ok is False
+    assert check.check().ok is True
+    assert len(calls) == 2
+
+
+def test_public_ip_reads_the_echo_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Resp:
+        text = "198.51.100.7\n"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    seen: list[tuple[str, float]] = []
+
+    def fake_get(url: str, *, timeout: float) -> _Resp:
+        seen.append((url, timeout))
+        return _Resp()
+
+    monkeypatch.setattr(mb.httpx, "get", fake_get)
+    assert mb.public_ip("https://echo.example/")() == "198.51.100.7\n"
+    assert seen == [("https://echo.example/", 10.0)]
+
+
+def test_the_gates_are_checked_window_then_gpu_then_residential() -> None:
+    clock = _Clock(minute=10)
+    gpu_calls: list[int] = []
+
+    def gpu() -> str:
+        gpu_calls.append(1)
+        return "90, 10, 1, 12282"
+
+    gates = mb.Gates(
+        windows=((3, 26),),
+        gpu=mb.GpuGate(query=gpu, samples=1),
+        residential=mb.ResidentialCheck(expected_ip="x", fetch=lambda: "x"),
+        now=clock.now,
+    )
+    first = gates.check()
+    assert (first.ok, first.gate) == (False, "window")
+    assert gpu_calls == []  # the window is decided before nvidia-smi is asked
+    clock.advance(17 * 60)
+    assert gates.check().gate == "gpu"
+    gates.gpu = None
+    assert gates.check().ok is True
+
+
+# --------------------------------------------------------------------------
+# progress, sampler, read-only store
+# --------------------------------------------------------------------------
+
+
+def test_progress_survives_a_torn_last_line(tmp_path: Path) -> None:
+    path = tmp_path / "deep" / "progress.jsonl"
+    progress = mb.Progress(path)
+    assert progress.load() == {}
+    progress.append({"event": "item", "blob_sha256": "a" * 64, "status": "ok"})
+    progress.append({"event": "chunk", "chunk": 1})
+    with path.open("a") as fh:
+        fh.write('{"event": "item", "blob_sha256": "b')  # the power went out here
+    assert set(progress.load()) == {"a" * 64}
+    assert mb.Progress(None).load() == {}
+    mb.Progress(None).append({"event": "item"})  # no file: nothing written
+
+
+def test_the_vram_sampler_keeps_the_peak() -> None:
+    cmd = [sys.executable, "-c", "print(100); print(250); print('N/A'); print(200)"]
+    with mb.VramSampler(cmd) as sampler:
+        pass
+    assert sampler.peak_mib == 250
+    with mb.VramSampler(None) as none:
+        pass
+    assert none.peak_mib is None
+    with mb.VramSampler(["/nonexistent/nvidia-smi"]) as missing:
+        pass
+    assert missing.peak_mib is None
+
+
+def test_the_raw_bucket_is_read_only(tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    ro = mb.ReadOnlyStore(raw.store)
+    assert hashlib.sha256(ro.get(item.storage_key)).hexdigest() == item.blob_sha256
+    with pytest.raises(PermissionError):
+        ro.put("x", b"y", "image/png")
+
+
+# --------------------------------------------------------------------------
+# the mask lane, one clean copy at a time
+# --------------------------------------------------------------------------
+
+
+def _seed(db: Session, store: LocalObjectStore, n: int, url: str = ITEM) -> PublicObject:
+    return seed_clean_image(
+        db,
+        store,
+        _photo(n),
+        origins=[ImageOrigin(url=url.format(n=n), source="mfc")],
+        figure_id=f"f{n}",
+    )
+
+
+def test_settle_clean_copy_settles_once(db_session: Session, tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "media")
+    obj = _seed(db_session, store, 1)
+    batch = mask_job.open_mask_batch(db_session, backend_name="stub-model")
+    first = mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
+    assert first is not None and first.status == "ok"
+    assert (
+        mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
+        is None
+    )
+    mask_job.finish_mask_batch(db_session, batch)
+    assert db_session.get(MaskBatch, batch.id).status == "done"  # type: ignore[union-attr]
+    assert db_session.get(MaskBatch, batch.id).counts["ok"] == 1  # type: ignore[union-attr]
+
+
+def test_settle_clean_copy_refuses_a_backend_that_is_no_mask_model(
+    db_session: Session, tmp_path: Path
+) -> None:
+    store = LocalObjectStore(tmp_path / "media")
+    obj = _seed(db_session, store, 1)
+    batch = mask_job.open_mask_batch(db_session, backend_name="stub")
+    with pytest.raises(ValueError, match="not a mask model"):
+        mask_job.settle_clean_copy(
+            db_session, store, obj.sha256, backend=StubMattingBackend(), batch=batch
+        )
+
+
+def test_a_failed_copy_is_redriven_only_when_asked(db_session: Session, tmp_path: Path) -> None:
+    class _Boom(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            raise RuntimeError("boom")
+
+    store = LocalObjectStore(tmp_path / "media")
+    obj = _seed(db_session, store, 1)
+    batch = mask_job.open_mask_batch(db_session, backend_name="boom")
+    failed = mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Boom(), batch=batch)
+    assert failed is not None and failed.status == "failed"
+    assert mask_job.original_settled(db_session, hashlib.sha256(_photo(1)).hexdigest()) == "failed"
+    assert (
+        mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
+        is None
+    )
+    again = mask_job.settle_clean_copy(
+        db_session, store, obj.sha256, backend=_Model(), batch=batch, retry_failed=True
+    )
+    assert again is not None and again.status == "ok"
+    assert (
+        mask_job.original_settled(
+            db_session, hashlib.sha256(_photo(1)).hexdigest(), retry_failed=True
+        )
+        == "ok"
+    )
+
+
+def test_original_settled_reads_the_copy_behind_an_original(
+    db_session: Session, tmp_path: Path
+) -> None:
+    store = LocalObjectStore(tmp_path / "media")
+    sha = hashlib.sha256(_photo(1)).hexdigest()
+    assert mask_job.original_settled(db_session, sha) is None  # never seen
+    _seed(db_session, store, 1)
+    assert mask_job.original_settled(db_session, sha) is None  # a copy, no result yet
+    batch = mask_job.open_mask_batch(db_session, backend_name="m")
+    obj = db_session.execute(
+        select(PublicObject).where(PublicObject.kind == "sanitized")
+    ).scalar_one()
+    mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
+    assert mask_job.original_settled(db_session, sha) == "ok"
+    failed_only = mask_job.original_settled(db_session, sha, retry_failed=True)
+    assert failed_only == "ok"  # an ok result is never re-driven
+
+
+# --------------------------------------------------------------------------
+# the driver
+# --------------------------------------------------------------------------
+
+
+def test_mints_ross_first_and_reports_every_chunk(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    items, _ = mb.parse_worklist(
+        [
+            json.dumps(raw.add(1, rank=9).as_row()),
+            json.dumps(raw.add(2, rank=0).as_row()),
+            json.dumps(raw.add(3, rank=2).as_row()),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    code = mb.run_batch(items, mb.BatchConfig(chunk_size=2), rt)
+    assert code == 0
+    chunks = _events(events, "chunk")
+    assert [c["count"] for c in chunks] == [2, 1]
+    assert [c["ranks"] for c in chunks] == [[0, 2], [9]]
+    first = chunks[0]
+    assert first["counts"]["ok"] == 2 and first["failures"] == []
+    assert first["peak_vram_mib"] == 3210
+    assert first["provider"] == "FakeExecutionProvider"
+    assert first["seconds_per_image"] is not None and first["seconds_per_image"] >= 0
+    assert first["mask_seconds_per_image"] is not None
+    assert first["batch_id"] is not None
+    rows = db_session.execute(select(ImageMask.status)).scalars().all()
+    assert rows == ["ok", "ok", "ok"]
+    done = _events(events, "done")[0]
+    assert done["counts"]["ok"] == 3 and done["pending"] == 0
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert {r["status"] for r in progress.values()} == {"ok"}
+    assert all(r["clean_sha256"] and r["mask_sha256"] for r in progress.values())
+    statuses = db_session.execute(select(MaskBatch.status)).scalars().all()
+    assert statuses == ["done", "done"]
+
+
+def test_a_rerun_is_idempotent_per_image_sha(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(1, rank=0), raw.add(2, rank=0)]
+    assert mb.run_batch(items, mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 0
+    masks = db_session.execute(select(func.count()).select_from(ImageMask)).scalar_one()
+
+    # the same progress file: nothing is even looked up
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch(items, mb.BatchConfig(), rt) == 0
+    assert _events(events, "chunk") == []
+    assert _events(events, "start")[0]["pending"] == 0
+
+    # a lost progress file: the database says both are settled
+    events2: list[dict[str, Any]] = []
+    model = _Model()
+    rt2 = _runtime(
+        db_session, tmp_path, raw, events=events2, progress=tmp_path / "fresh.jsonl", backend=model
+    )
+    assert mb.run_batch(items, mb.BatchConfig(), rt2) == 0
+    (chunk,) = _events(events2, "chunk")
+    assert chunk["counts"]["already"] == 2 and chunk["count"] == 2
+    assert chunk["seconds_per_image"] is None  # nothing was minted
+    assert db_session.execute(select(func.count()).select_from(ImageMask)).scalar_one() == masks
+
+
+def test_resume_skips_what_is_done_and_retries_failures_only_on_request(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    ok, failed, fresh = raw.add(1, rank=0), raw.add(2, rank=0), raw.add(3, rank=0)
+    progress = mb.Progress(tmp_path / "progress.jsonl")
+    progress.append({"event": "item", "blob_sha256": ok.blob_sha256, "status": "ok"})
+    progress.append({"event": "item", "blob_sha256": failed.blob_sha256, "status": "failed"})
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch([ok, failed, fresh], mb.BatchConfig(), rt) == 0
+    start = _events(events, "start")[0]
+    assert (start["done"], start["failed_before"], start["pending"]) == (1, 1, 1)
+    assert _events(events, "chunk")[0]["count"] == 1
+
+    events2: list[dict[str, Any]] = []
+    rt2 = _runtime(db_session, tmp_path, raw, events=events2)
+    assert mb.run_batch([ok, failed, fresh], mb.BatchConfig(retry_failed=True), rt2) == 0
+    assert _events(events2, "start")[0]["pending"] == 1
+    assert progress.load()[failed.blob_sha256]["status"] == "ok"
+
+
+def test_per_image_failures_are_counted_and_named(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    good = raw.add(1, rank=0)
+    zipped = raw.add(2, rank=0, codec="gzip")
+    missing = mb.WorkItem(
+        blob_sha256="e" * 64, storage_key="raw-img/sha256/ee/none.png", url=ITEM, product_id="p"
+    )
+    wrong = raw.add(4, rank=0)
+    wrong = mb.WorkItem(**{**wrong.as_row(), "blob_sha256": "f" * 64})
+    odd = raw.add(5, rank=0)
+    odd = mb.WorkItem(**{**odd.as_row(), "codec": "zstd"})
+    picture = raw.add(6, rank=0, url=PICTURE)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    code = mb.run_batch(
+        [good, zipped, missing, wrong, odd, picture], mb.BatchConfig(chunk_size=10), rt
+    )
+    assert code == 1  # finished, with failures
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"]["ok"] == 2
+    assert chunk["counts"]["ineligible"] == 1  # a collector's photo: no mask, no failure
+    assert chunk["counts"]["failed"] == 3
+    reasons = {f["blob_sha256"]: f["reason"] for f in chunk["failures"]}
+    assert reasons == {
+        "e" * 64: "fetch:FileNotFoundError",
+        "f" * 64: "raw_hash_mismatch",
+        odd.blob_sha256: "unsupported_codec:zstd",
+    }
+    # nothing was seeded for a failed original
+    assert mask_job.original_settled(db_session, odd.blob_sha256) is None
+
+
+def test_a_seed_failure_is_one_images_failure(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    junk = b"not an image at all"
+    sha = hashlib.sha256(junk).hexdigest()
+    raw.store.put(f"raw-img/sha256/{sha[:2]}/{sha}.png", junk, "image/png")
+    item = mb.WorkItem(
+        blob_sha256=sha, storage_key=f"raw-img/sha256/{sha[:2]}/{sha}.png", url=ITEM, product_id="p"
+    )
+    events: list[dict[str, Any]] = []
+    good = raw.add(2, rank=9)
+    assert (
+        mb.run_batch(
+            [item, good], mb.BatchConfig(), _runtime(db_session, tmp_path, raw, events=events)
+        )
+        == 1
+    )
+    (chunk,) = _events(events, "chunk")
+    assert chunk["failures"][0]["reason"].startswith("seed:")
+    assert chunk["counts"]["ok"] == 1
+
+
+def test_a_mask_failure_recorded_by_the_lane_counts_as_a_failure(
+    db_session: Session, tmp_path: Path
+) -> None:
+    class _Boom(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            raise RuntimeError("boom")
+
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events, backend=_Boom())
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 1
+    (chunk,) = _events(events, "chunk")
+    assert chunk["failures"] == [
+        {"blob_sha256": hashlib.sha256(_photo(1)).hexdigest(), "reason": "RuntimeError"}
+    ]
+
+
+def test_consecutive_failures_open_the_circuit(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    gone = [
+        mb.WorkItem(blob_sha256=f"{n:064x}", storage_key=f"raw-img/x/{n}", url=ITEM, product_id="p")
+        for n in range(6)
+    ]
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch(gone, mb.BatchConfig(max_consecutive_failures=3), rt) == 3
+    assert _events(events, "circuit_open")[0]["consecutive_failures"] == 3
+    assert _events(events, "chunk")[0]["count"] == 3
+    assert len(mb.Progress(tmp_path / "progress.jsonl").load()) == 3
+    assert db_session.execute(select(MaskBatch.status)).scalars().all() == ["done"]
+
+
+def test_a_success_resets_the_failure_streak(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+
+    def gone(n: int) -> mb.WorkItem:
+        return mb.WorkItem(blob_sha256=f"{n:064x}", storage_key=f"x/{n}", url=ITEM, product_id="p")
+
+    items = [gone(1), gone(2), raw.add(3), gone(4), gone(5)]
+    assert (
+        mb.run_batch(
+            items, mb.BatchConfig(max_consecutive_failures=3), _runtime(db_session, tmp_path, raw)
+        )
+        == 1
+    )
+
+
+def test_a_failing_gate_pauses_releases_the_gpu_and_resumes(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    model = _Model()
+    readings = ["2, 100, 1, 12282"] + ["97, 3000, 9000, 12282"] * 2 + ["1, 9000, 3000, 12282"] * 5
+    gates = mb.Gates(
+        windows=(), gpu=mb.GpuGate(query=_gpu(readings), samples=1), residential=None, now=clock.now
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
+    items = [raw.add(1), raw.add(2)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, poll_seconds=60), rt) == 0
+    paused = _events(events, "paused")
+    assert len(paused) == 1  # one line per pause, not one per poll
+    assert paused[0]["gate"] == "gpu" and "97%" in paused[0]["detail"]
+    assert len(_events(events, "resumed")) == 1
+    assert clock.slept == [60, 60]
+    assert model.releases >= 1  # the game gets the GPU back
+    assert model.loads == 2  # loaded for chunk 1, again after the pause
+    assert [c["baseline_vram_mib"] for c in _events(events, "chunk")] == [1, 3000]
+
+
+def test_waiting_longer_than_allowed_gives_up(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    gates = mb.Gates(
+        windows=(),
+        gpu=None,
+        residential=mb.ResidentialCheck(expected_ip="a", fetch=lambda: "b"),
+        now=clock.now,
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, events=events)
+    config = mb.BatchConfig(poll_seconds=60, max_wait_seconds=150)
+    assert mb.run_batch([raw.add(1)], config, rt) == 4
+    assert _events(events, "gave_up")[0]["gate"] == "residential"
+    assert clock.slept == [60, 60, 60]
+
+
+def test_a_chunk_never_starts_in_a_busy_window_and_yields_when_one_begins(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock(minute=2)
+    clock.advance(50)  # 15:02:50, quiet until :03
+
+    class _Slow(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(6)  # each image takes 6 s
+            return super().predict_alpha(image)
+
+    gates = mb.Gates(windows=((3, 26),), gpu=None, residential=None, now=clock.now)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(
+        db_session, tmp_path, raw, clock=clock, gates=gates, backend=_Slow(), events=events
+    )
+    items = [raw.add(n) for n in range(4)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=10, poll_seconds=60), rt) == 0
+    chunks = _events(events, "chunk")
+    assert chunks[0]["count"] == 2 and chunks[0]["yielded"] is True  # :02:50 and :02:56
+    assert _events(events, "paused")[0]["gate"] == "window"
+    assert clock.now().minute >= 27
+    assert sum(c["count"] for c in chunks) == 4
+
+
+def test_the_limit_caps_the_images_considered(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    items = [raw.add(n, rank=n) for n in range(5)]
+    assert mb.run_batch(items, mb.BatchConfig(limit=2), rt) == 0
+    assert _events(events, "start")[0]["pending"] == 2
+    assert _events(events, "chunk")[0]["ranks"] == [0, 1]
+
+
+def test_a_stop_request_finishes_the_image_in_flight(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    flag = {"stop": False}
+
+    class _StopAfterOne(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            flag["stop"] = True
+            return super().predict_alpha(image)
+
+    events: list[dict[str, Any]] = []
+    rt = _runtime(
+        db_session, tmp_path, raw, backend=_StopAfterOne(), events=events, stop=lambda: flag["stop"]
+    )
+    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(), rt) == 130
+    assert _events(events, "chunk")[0]["count"] == 1
+    assert _events(events, "stopped")
+    assert db_session.execute(select(MaskBatch.status)).scalars().all() == ["done"]
+
+
+def test_a_stop_while_paused_exits_without_a_chunk(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock(minute=10)
+    gates = mb.Gates(windows=((3, 26),), gpu=None, residential=None, now=clock.now)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(
+        db_session,
+        tmp_path,
+        raw,
+        clock=clock,
+        gates=gates,
+        events=events,
+        stop=lambda: bool(clock.slept),
+    )
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 130
+    assert _events(events, "chunk") == []
+
+
+def test_a_model_that_will_not_load_is_refused_before_any_image(
+    db_session: Session, tmp_path: Path
+) -> None:
+    class _NoCuda(_Model):
+        def load(self) -> None:
+            raise RuntimeError("onnxruntime session loaded without CUDAExecutionProvider")
+
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, backend=_NoCuda(), events=events)
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 2
+    assert "CUDAExecutionProvider" in _events(events, "refused")[0]["detail"]
+    assert mb.Progress(tmp_path / "progress.jsonl").load() == {}
+    assert db_session.execute(select(func.count()).select_from(MaskBatch)).scalar_one() == 0
+
+
+def test_a_backend_that_is_no_mask_model_is_refused(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, backend=StubMattingBackend(), events=events)
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 2
+    assert "not a mask model" in _events(events, "refused")[0]["detail"]
+
+
+def test_the_dry_run_touches_nothing(tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(n, rank=n % 3) for n in range(5)]
+
+    def forbidden(*a: object, **k: object) -> Any:
+        raise AssertionError("a dry run opened something")
+
+    clock = _Clock(minute=10)
+    events: list[dict[str, Any]] = []
+    progress_path = tmp_path / "progress.jsonl"
+    progress_path.write_text(
+        json.dumps({"event": "item", "blob_sha256": items[0].blob_sha256, "status": "ok"}) + "\n"
+    )
+    before = progress_path.read_bytes()
+    rt = mb.Runtime(
+        gates=mb.Gates(windows=((3, 26),), gpu=None, residential=None, now=clock.now),
+        open_db=forbidden,
+        media_store=None,
+        raw_store=None,
+        make_backend=forbidden,
+        progress=mb.Progress(progress_path),
+        vram=forbidden,
+        sleep=forbidden,
+        monotonic=clock.monotonic,
+        emit=events.append,
+        stop_requested=lambda: False,
+    )
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, dry_run=True), rt) == 0
+    (plan,) = _events(events, "plan")
+    assert plan["pending"] == 4 and plan["chunks"] == 2
+    assert plan["gate"] == {"ok": False, "gate": "window", "detail": plan["gate"]["detail"]}
+    assert [i["rank"] for i in plan["first_chunk"]] == [0, 1]
+    assert progress_path.read_bytes() == before
+    assert not (tmp_path / "media").exists()
+
+
+# --------------------------------------------------------------------------
+# the work-list SQL (run by the orchestrator, read only)
+# --------------------------------------------------------------------------
+
+ROSS = "a7f14f89-0000-4000-8000-000000000001"
+
+
+def _read_only(sql: str) -> None:
+    lines = [ln.strip() for ln in sql.strip().splitlines() if ln.strip()]
+    assert lines[0] == "BEGIN TRANSACTION READ ONLY;"
+    assert lines[-1] == "ROLLBACK;"
+    body = " ".join(lines).upper()
+    for word in ("INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER ", "COPY ", "COMMIT"):
+        assert word not in body, word
+
+
+def test_the_ross_heads_query_is_read_only_and_names_one_user() -> None:
+    sql = mb.ross_heads_sql(ROSS)
+    _read_only(sql)
+    assert f"'{ROSS}'::uuid" in sql
+    assert "occ/%/head" in sql and "occ/%/status" not in sql
+    with pytest.raises(ValueError, match="uuid"):
+        mb.ross_heads_sql("x'; DROP TABLE holding; --")
+
+
+def test_the_ross_worklist_query_carries_only_validated_heads() -> None:
+    heads = [
+        "##### ross-heads.sql",
+        json.dumps({"head_id": "11111111-1111-4111-8111-111111111111", "rank": 0}),
+        json.dumps({"head_id": "22222222-2222-4222-8222-222222222222", "rank": 2}),
+        "(2 rows)",
+    ]
+    sql = mb.ross_worklist_sql(heads)
+    _read_only(sql)
+    assert "('11111111-1111-4111-8111-111111111111'::uuid, 0)" in sql
+    assert "('22222222-2222-4222-8222-222222222222'::uuid, 2)" in sql
+    with pytest.raises(ValueError, match="head"):
+        mb.ross_worklist_sql([json.dumps({"head_id": "x'); DROP", "rank": 0})])
+    with pytest.raises(ValueError, match="rank"):
+        mb.ross_worklist_sql(
+            [json.dumps({"head_id": "11111111-1111-4111-8111-111111111111", "rank": "0); --"})]
+        )
+    with pytest.raises(ValueError, match="no heads"):
+        mb.ross_worklist_sql(["(0 rows)"])
+
+
+def test_the_catalog_query_shards_by_the_first_byte_of_the_sha() -> None:
+    whole = mb.catalog_worklist_sql()
+    _read_only(whole)
+    assert "get_byte" not in whole
+    shard = mb.catalog_worklist_sql("3/8")
+    _read_only(shard)
+    assert "get_byte(pi.blob_sha256, 0) % 8 = 3" in shard
+    for bad in ("8/8", "-1/8", "1/0", "a/b", "1"):
+        with pytest.raises(ValueError, match="shard"):
+            mb.catalog_worklist_sql(bad)
+
+
+# --------------------------------------------------------------------------
+# the command line
+# --------------------------------------------------------------------------
+
+
+def _worklist_file(tmp_path: Path, items: list[mb.WorkItem]) -> Path:
+    path = tmp_path / "worklist.jsonl"
+    path.write_text("".join(json.dumps(i.as_row()) + "\n" for i in items))
+    return path
+
+
+def test_main_refuses_without_the_residential_address(tmp_path: Path) -> None:
+    wl = _worklist_file(tmp_path, [])
+    assert mb.main(["run", "--worklist", str(wl), "--device", "cpu", "--dry-run"]) == 2
+
+
+def test_main_refuses_a_malformed_work_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wl = tmp_path / "bad.jsonl"
+    wl.write_text(_line("Z" * 64, 0) + "\n")
+    code = mb.main(["run", "--worklist", str(wl), "--no-residential-check", "--dry-run"])
+    assert code == 2
+    assert "blob_sha256" in capsys.readouterr().err
+
+
+def test_main_dry_run_prints_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    wl = _worklist_file(tmp_path, [raw.add(1, rank=0), raw.add(2, rank=9)])
+    monkeypatch.setattr(mb, "nvidia_smi_query", lambda index: lambda: "0, 11000, 1200, 12282")
+    code = mb.main(
+        [
+            "run",
+            "--worklist",
+            str(wl),
+            "--residential-ip",
+            "198.51.100.7",
+            "--ip-echo-url",
+            "https://echo.invalid/",
+            "--busy-windows",
+            "",
+            "--dry-run",
+        ]
+    )
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    plan = next(e for e in out if e["event"] == "plan")
+    assert code == 0
+    assert plan["pending"] == 2
+    assert plan["gate"]["ok"] is False and plan["gate"]["gate"] == "residential"
+
+
+def test_main_runs_a_sandbox_batch_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    wl = _worklist_file(tmp_path, [raw.add(1, rank=0), raw.add(2, rank=0)])
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Model())
+    progress = tmp_path / "state" / "progress.jsonl"
+    argv = [
+        "--sandbox",
+        str(tmp_path / "sandbox"),
+        "run",
+        "--worklist",
+        str(wl),
+        "--raw-dir",
+        str(tmp_path / "raw"),
+        "--progress",
+        str(progress),
+        "--device",
+        "cpu",
+        "--no-residential-check",
+        "--busy-windows",
+        "",
+        "--chunk-size",
+        "1",
+    ]
+    assert mb.main(argv) == 0
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [e["count"] for e in out if e["event"] == "chunk"] == [1, 1]
+    assert len(mb.Progress(progress).load()) == 2
+    assert mb.main(argv) == 0  # resumed: nothing left
+    again = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert next(e for e in again if e["event"] == "start")["pending"] == 0
+
+
+def test_main_prints_the_sql(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert mb.main(["sql", "ross-heads", "--user", ROSS]) == 0
+    assert "occ/%/head" in capsys.readouterr().out
+    heads = tmp_path / "heads.txt"
+    heads.write_text(
+        json.dumps({"head_id": "11111111-1111-4111-8111-111111111111", "rank": 0}) + "\n"
+    )
+    assert mb.main(["sql", "ross-worklist", "--heads", str(heads)]) == 0
+    assert "'11111111-1111-4111-8111-111111111111'::uuid" in capsys.readouterr().out
+    assert mb.main(["sql", "catalog-worklist", "--shard", "0/4"]) == 0
+    assert "% 4 = 0" in capsys.readouterr().out
+    assert mb.main(["sql", "ross-heads", "--user", "nope"]) == 2
+
+
+def test_build_backend_reads_the_weights_and_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.workers.basekept import BaseKeptMattingBackend
+    from app.workers.matting import BiRefNetMattingBackend
+
+    monkeypatch.setenv("MATTING_MODEL_PATH", "/b.onnx")
+    monkeypatch.setenv("MATTING_ISNET_GENERAL_PATH", "/g.onnx")
+    monkeypatch.setenv("MATTING_ISNET_ANIME_PATH", "/a.onnx")
+    args = mb._parser().parse_args(
+        ["run", "--worklist", "w", "--device", "auto", "--cpu-threads", "2"]
+    )
+    backend = mb.build_backend(args)
+    assert isinstance(backend, BaseKeptMattingBackend)
+    assert isinstance(backend.primary, BiRefNetMattingBackend)
+    assert (backend.primary.device, backend.primary.cpu_threads) == ("auto", 2)
