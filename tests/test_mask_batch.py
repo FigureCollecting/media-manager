@@ -202,7 +202,7 @@ def _line(sha: str, rank: int, **extra: Any) -> str:
 
 
 def test_the_work_list_is_ross_first_then_file_order_each_original_once() -> None:
-    a, b, c = "a" * 64, "b" * 64, "c" * 64
+    a, b, c, d = "a" * 64, "b" * 64, "c" * 64, "d" * 64
     lines = [
         "##### worklist-catalog.sql",
         _line(a, 9),
@@ -212,9 +212,11 @@ def test_the_work_list_is_ross_first_then_file_order_each_original_once() -> Non
         _line(c, 2),
         _line(b, 0),  # b is also one of Ross's: his rank wins
         _line(c, 9),  # a later, lower-priority copy of c changes nothing
+        _line(d, 9),
+        _line(a, 9),  # a repeat at the same rank keeps a's first place
     ]
     items, skipped = mb.parse_worklist(lines)
-    assert [(i.blob_sha256, i.rank) for i in items] == [(b, 0), (c, 2), (a, 9)]
+    assert [(i.blob_sha256, i.rank) for i in items] == [(b, 0), (c, 2), (a, 9), (d, 9)]
     assert skipped == 2  # the psql header and footer; blank lines are not counted
     assert items[0].codec == "identity"
     assert items[0].head_id is None
@@ -491,10 +493,13 @@ def _seed(db: Session, store: LocalObjectStore, n: int, url: str = ITEM) -> Publ
 
 def test_settle_clean_copy_settles_once(db_session: Session, tmp_path: Path) -> None:
     store = LocalObjectStore(tmp_path / "media")
-    obj = _seed(db_session, store, 1)
+    one, two = _seed(db_session, store, 1), _seed(db_session, store, 2)
+    obj = max(one, two, key=lambda o: o.sha256)  # not the first in sha order
     batch = mask_job.open_mask_batch(db_session, backend_name="stub-model")
     first = mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
     assert first is not None and first.status == "ok"
+    assert first.source_sha256 == obj.sha256  # that copy, and only that copy
+    assert db_session.execute(select(ImageMask.source_sha256)).scalars().all() == [obj.sha256]
     assert (
         mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
         is None
@@ -862,9 +867,8 @@ def test_a_chunk_never_starts_in_a_busy_window_and_yields_when_one_begins(
 
     gates = mb.Gates(windows=((3, 26),), gpu=None, residential=None, now=clock.now)
     events: list[dict[str, Any]] = []
-    rt = _runtime(
-        db_session, tmp_path, raw, clock=clock, gates=gates, backend=_Slow(), events=events
-    )
+    model = _Slow()
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
     items = [raw.add(n) for n in range(4)]
     assert mb.run_batch(items, mb.BatchConfig(chunk_size=10, poll_seconds=60), rt) == 0
     chunks = _events(events, "chunk")
@@ -872,6 +876,10 @@ def test_a_chunk_never_starts_in_a_busy_window_and_yields_when_one_begins(
     assert _events(events, "paused")[0]["gate"] == "window"
     assert clock.now().minute >= 27
     assert sum(c["count"] for c in chunks) == 4
+    # a scraper window can last 24 minutes: the GPU is not held through it
+    # (the gate reads no GPU inside a window, so a game started then would
+    # find ~9.5 GB taken), and the model is loaded again after it
+    assert (model.releases, model.loads) == (1, 2)
 
 
 def test_the_limit_caps_the_images_considered(db_session: Session, tmp_path: Path) -> None:
