@@ -839,7 +839,10 @@ def test_a_failing_gate_pauses_releases_the_gpu_and_resumes(
         + ["1, 9000, 3000, 12282"] * 5
     )
     gates = mb.Gates(
-        windows=(), gpu=mb.GpuGate(query=_gpu(readings), samples=1), residential=None, now=clock.now
+        windows=(),
+        gpu=mb.GpuGate(query=_gpu(readings), samples=1, sleep=lambda s: None),
+        residential=None,
+        now=clock.now,
     )
     events: list[dict[str, Any]] = []
     rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
@@ -1318,70 +1321,184 @@ def test_the_residential_address_may_be_the_isps_block() -> None:
 
 
 # --------------------------------------------------------------------------
-# the gate does not count the batch's own GPU memory against it
+# the gate while the model is held: another consumer pauses, our own never
 # --------------------------------------------------------------------------
 
-#: The card as nvidia-smi shows it on Ross's box: ~1.3 GB of desktop, the
-#: model's ~9.2 GB while it is held, a game's ~4 GB on top.
-IDLE = "0, 10800, 1300, 12282"
-HELD = "6, 1400, 10500, 12282"  # our model held; util 6 % is its own tail
+#: The card as nvidia-smi shows it on this box (MASK-BATCH-1 close-out 2,
+#: measured): ~1.3 GB of desktop; the model's own 9,473 MiB once it has run
+#: (MORE than the 9 GiB mark, so free + own can never be the test); a game's
+#: ~1.5 GB and 97 % on top.
+IDLE = "0, 10985, 1297, 12282"
+HELD = "0, 1112, 10770, 12282"  # our model held, the chunk over: the card idle
+HELD_TAIL = "6, 1112, 10770, 12282"  # the same, a reading that caught its own tail
 GAME_ON_HELD = "97, 0, 12282, 12282"
-GAME = "97, 6800, 5300, 12282"
+GAME = "97, 7985, 4297, 12282"
+OWN = 10770 - 1297
 
 
-def test_the_gpu_gate_credits_the_memory_the_batch_itself_holds() -> None:
-    readings = iter([IDLE, HELD, HELD, GAME_ON_HELD, HELD])
-    gate = mb.GpuGate(query=lambda: next(readings), samples=1)
+def _held_gate(*after: str, samples: int = 1) -> tuple[mb.GpuGate, list[float]]:
+    """A gate that saw IDLE, loaded the model and measured it at HELD; then ``after``."""
+    readings = iter([IDLE, HELD, *after])
+    slept: list[float] = []
+    gate = mb.GpuGate(query=lambda: next(readings), samples=samples, sleep=slept.append)
     assert gate.check().ok is True  # IDLE: before the model is loaded
-    gate.mark_loading()  # baseline 1300 MiB, the model not yet loaded
-    gate.measure_own()  # HELD after the first image: 10500 - 1300 = ours
-    assert gate.own_mib == 9200
-    held = gate.check()  # HELD: 1400 free + 9200 ours >= 9 GiB
+    gate.mark_loading()
+    gate.measure_own()
+    assert gate.own_mib == OWN
+    slept.clear()
+    return gate, slept
+
+
+def test_the_measured_own_memory_is_above_the_9_gib_mark() -> None:
+    # why crediting the model's own memory cannot be the rule on this card
+    assert OWN > mb.DEFAULT_GPU_FREE_MIN_MIB
+
+
+def test_while_the_model_is_held_its_own_memory_never_pauses_the_batch() -> None:
+    gate, slept = _held_gate(HELD, HELD_TAIL, HELD, samples=3)
+    held = gate.check()  # 1112 MiB free and the model's 9.2 GB: no pause
     assert held.ok is True
-    assert "9200 MiB ours" in held.detail
-    assert gate.check().ok is False  # a game: 0 free + 9200 ours < 9 GiB
-    gate.forget_own()  # the model was released
+    assert "+0 MiB" in held.detail
+    assert slept == [mb.DEFAULT_GPU_SETTLE_SECONDS, 0.5, 0.5]  # settle, then the samples
+    assert mb.DEFAULT_GPU_SETTLE_SECONDS >= 2
+
+
+def test_while_held_a_game_pauses_the_batch() -> None:
+    gate, _ = _held_gate(GAME_ON_HELD)
+    result = gate.check()
+    assert result.ok is False and result.gate == "gpu"
+    assert "97%" in result.detail and "+1512 MiB" in result.detail
+
+
+@pytest.mark.parametrize(("grown", "ok"), [(0, True), (512, True), (513, False), (1200, False)])
+def test_while_held_memory_another_process_takes_pauses_the_batch(grown: int, ok: bool) -> None:
+    # a quiet consumer (util 2 %): only its memory shows it
+    gate, _ = _held_gate(f"2, {1112 - grown}, {10770 + grown}, 12282")
+    result = gate.check()
+    assert result.ok is ok
+    if not ok:
+        assert f"+{grown} MiB" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("utils", "ok"),
+    [
+        ((60, 60, 60), False),  # busy on every settled sample: someone else computes
+        ((60, 4, 60), True),  # one quiet sample: our tail or a blip
+        ((5, 5, 5), False),
+        ((4, 4, 4), True),
+    ],
+)
+def test_while_held_a_gpu_busy_on_every_settled_sample_pauses_the_batch(
+    utils: tuple[int, int, int], ok: bool
+) -> None:
+    # a compute consumer with next to no memory (+100 MiB)
+    gate, slept = _held_gate(*(f"{u}, 1012, 10870, 12282" for u in utils), samples=3)
+    result = gate.check()
+    assert result.ok is ok
+    assert len(slept) == 3  # every sample was read: one busy reading alone never pauses
+    if not ok:
+        assert "every" in result.detail
+
+
+def test_memory_another_process_freed_lowers_the_reference() -> None:
+    # someone left (-500 MiB), then a quiet consumer takes 513 MiB: +13 MiB over
+    # the snapshot, +513 over what the card held after they left
+    gate, _ = _held_gate("2, 1612, 10270, 12282", "2, 1099, 10783, 12282")
+    assert gate.check().ok is True
+    assert gate.check().ok is False
+
+
+@pytest.mark.parametrize(("excess", "ok"), [(0, True), (512, True), (513, False)])
+def test_own_memory_beyond_the_caps_counts_as_another_consumer(excess: int, ok: bool) -> None:
+    """A consumer that started while the model loaded is measured as ours; the
+    model cannot hold more than its arena caps (8 + 2 GiB) and ~0.5 GiB of
+    overhead, so the rest is someone else's."""
+    assert mb.OWN_MAX_MIB == 8192 + 2048 + 512
+    used = 300 + mb.OWN_MAX_MIB + excess
+    readings = iter(["0, 11900, 300, 12282", f"0, {12282 - used}, {used}, 12282"] * 2)
+    gate = mb.GpuGate(query=lambda: next(readings), samples=1, sleep=lambda s: None)
+    gate.check()
+    gate.mark_loading()
+    gate.measure_own()
+    assert gate.own_mib == mb.OWN_MAX_MIB + excess  # reported as measured
+    assert gate.check().ok is ok
+
+
+def test_loaded_but_not_yet_measured_the_gate_is_ross_rule_after_the_settle() -> None:
+    # a chunk of ineligible photos only: the weights loaded, the model never ran
+    readings = iter([IDLE, "0, 8400, 3300, 12282", "97, 8400, 3300, 12282"])
+    slept: list[float] = []
+    gate = mb.GpuGate(query=lambda: next(readings), samples=1, sleep=slept.append)
+    gate.check()
+    gate.mark_loading()
+    assert gate.check().ok is True  # idle, though 8400 MiB < 9 GiB free
+    assert gate.check().ok is False  # busy and short of 9 GiB: Ross's rule
+    assert slept == [mb.DEFAULT_GPU_SETTLE_SECONDS] * 2
+
+
+def test_released_the_gate_is_ross_rule_again_without_a_settle() -> None:
+    gate, slept = _held_gate(GAME, IDLE)
+    gate.forget_own()
     assert gate.own_mib == 0
-    assert gate.check().ok is False  # HELD without the credit: busy
+    assert gate.check().ok is False  # the game, our model gone: busy, 7985 MiB free
+    assert gate.check().ok is True
+    assert slept == []
 
 
 def test_the_own_memory_is_never_negative_and_needs_a_baseline() -> None:
-    gate = mb.GpuGate(query=lambda: HELD, samples=1)
+    gate = mb.GpuGate(query=lambda: HELD, samples=1, sleep=lambda s: None)
     gate.mark_loading()  # no reading yet: no baseline
     gate.measure_own()
     assert gate.own_mib == 0
     shrinking = iter([HELD, IDLE])
-    gate = mb.GpuGate(query=lambda: next(shrinking), samples=1)
+    gate = mb.GpuGate(query=lambda: next(shrinking), samples=1, sleep=lambda s: None)
     gate.check()
-    gate.mark_loading()  # baseline 10500 (someone else's memory)
-    gate.measure_own()  # it went away: 1300 - 10500
+    gate.mark_loading()  # baseline 10770 (someone else's memory)
+    gate.measure_own()  # it went away: 1297 - 10770
     assert gate.own_mib == 0
 
-    def broken() -> str:
-        raise OSError("nvidia-smi")
 
-    gate = mb.GpuGate(query=lambda: IDLE, samples=1)
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("nvidia-smi"),
+        subprocess.CalledProcessError(9, "nvidia-smi"),
+        subprocess.TimeoutExpired("nvidia-smi", 15),
+        ValueError("N/A"),
+    ],
+)
+def test_an_unreadable_gpu_at_measure_time_leaves_ross_rule_in_force(error: Exception) -> None:
+    def broken() -> str:
+        raise error
+
+    gate = mb.GpuGate(query=lambda: IDLE, samples=1, sleep=lambda s: None)
     gate.check()
     gate.mark_loading()
     gate._query = broken
-    gate.measure_own()  # unreadable: no credit (the gate itself then fails closed)
+    gate.measure_own()  # no exception: no measurement
     assert gate.own_mib == 0
+    gate._query = lambda: HELD_TAIL  # util 6 %, 1112 MiB free: Ross's rule pauses
+    assert gate.check().ok is False
 
 
 class _Card:
-    """nvidia-smi on the box: what it shows follows the model and a game."""
+    """nvidia-smi on the box: what it shows follows the model and a consumer."""
 
-    def __init__(self, model: _Model) -> None:
+    def __init__(self, model: _Model, other: tuple[int, int] = (97, 1512)) -> None:
         self.model = model
         self.game = False
+        self.other = other  # (util, MiB) of the other consumer
         self.reads = 0
 
     def query(self) -> str:
         self.reads += 1
-        held = self.model.loads > self.model.releases
+        used = 1297 + (OWN if self.model.loads > self.model.releases else 0)
+        util = 0
         if self.game:
-            return GAME_ON_HELD if held else GAME
-        return HELD if held else IDLE
+            util, used = self.other[0], used + self.other[1]
+        used = min(used, 12282)
+        return f"{util}, {12282 - used}, {used}, 12282"
 
 
 def test_with_the_model_loaded_and_nothing_else_on_the_gpu_the_batch_never_pauses(
@@ -1391,9 +1508,8 @@ def test_with_the_model_loaded_and_nothing_else_on_the_gpu_the_batch_never_pause
     clock = _Clock()
     model = _Model()
     card = _Card(model)
-    gates = mb.Gates(
-        windows=(), gpu=mb.GpuGate(query=card.query, samples=3), residential=None, now=clock.now
-    )
+    gate = mb.GpuGate(query=card.query, samples=3, sleep=lambda s: None)
+    gates = mb.Gates(windows=(), gpu=gate, residential=None, now=clock.now)
     events: list[dict[str, Any]] = []
     rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
     items = [raw.add(n) for n in range(4)]
@@ -1401,12 +1517,20 @@ def test_with_the_model_loaded_and_nothing_else_on_the_gpu_the_batch_never_pause
     assert _events(events, "paused") == []
     assert (model.loads, model.releases) == (1, 0)
     chunks = _events(events, "chunk")
-    assert [c["held_vram_mib"] for c in chunks] == [9200] * 4
+    assert [c["held_vram_mib"] for c in chunks] == [OWN] * 4
     assert clock.slept.count(60) == 0
 
 
+@pytest.mark.parametrize(
+    ("other", "shows"),
+    [
+        ((97, 1512), "97%"),  # a game: busy and memory
+        ((2, 1200), "+1200 MiB"),  # quiet, memory only
+        ((90, 100), "every"),  # compute, next to no memory
+    ],
+)
 def test_another_process_on_the_gpu_still_pauses_the_batch(
-    db_session: Session, tmp_path: Path
+    db_session: Session, tmp_path: Path, other: tuple[int, int], shows: str
 ) -> None:
     raw = _Raw(tmp_path / "raw")
     clock = _Clock()
@@ -1414,31 +1538,30 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
 
     class _Gamer(_Model):
         def predict_alpha(self, image: Image.Image) -> np.ndarray:
-            # a game starts during the second chunk, the model long measured
+            # it starts during the second chunk, the model long measured
             card.game = self.loads == 1 and len(_events(events, "chunk")) == 1
             return super().predict_alpha(image)
 
     gamer = _Gamer()
-    card = _Card(gamer)
+    card = _Card(gamer, other)
 
     def sleep(seconds: float) -> None:
         clock.sleep(seconds)
         if len(clock.slept) == 2:
-            card.game = False  # the game ends while the batch waits, two polls in
+            card.game = False  # it ends while the batch waits, two polls in
 
-    gates = mb.Gates(
-        windows=(), gpu=mb.GpuGate(query=card.query, samples=1), residential=None, now=clock.now
-    )
+    gate = mb.GpuGate(query=card.query, samples=3, sleep=lambda s: None)
+    gates = mb.Gates(windows=(), gpu=gate, residential=None, now=clock.now)
     rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=gamer, events=events)
     rt.sleep = sleep
     items = [raw.add(n) for n in range(3)]
     assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, poll_seconds=60), rt) == 0
     paused = _events(events, "paused")
     assert len(paused) == 1 and paused[0]["gate"] == "gpu"
-    assert "97%" in paused[0]["detail"]
-    assert clock.slept == [60, 60]  # the released model's memory is no longer credited
-    assert (gamer.loads, gamer.releases) == (2, 1)  # released for the game, loaded again
-    assert gates.gpu is not None and gates.gpu.own_mib == 9200  # measured again after the reload
+    assert shows in paused[0]["detail"]
+    assert clock.slept == [60, 60]  # released, Ross's rule until it ended
+    assert (gamer.loads, gamer.releases) == (2, 1)  # released for it, loaded again
+    assert gate.own_mib == OWN  # measured again after the reload
 
 
 # --------------------------------------------------------------------------
@@ -1761,11 +1884,14 @@ def test_the_own_memory_is_measured_after_the_model_has_run(
         return IDLE
 
     gates = mb.Gates(
-        windows=(), gpu=mb.GpuGate(query=query, samples=1), residential=None, now=clock.now
+        windows=(),
+        gpu=mb.GpuGate(query=query, samples=1, sleep=lambda s: None),
+        residential=None,
+        now=clock.now,
     )
     events: list[dict[str, Any]] = []
     rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
     items = [raw.add(1, rank=0, url=PICTURE), raw.add(2, rank=1), raw.add(3, rank=2)]
     assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, poll_seconds=60), rt) == 0
     assert _events(events, "paused") == []
-    assert gates.gpu is not None and gates.gpu.own_mib == 9200
+    assert gates.gpu is not None and gates.gpu.own_mib == OWN
