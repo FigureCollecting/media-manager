@@ -241,7 +241,9 @@ class GpuGate:
     """Ross's rule: the GPU is free for a chunk when its utilisation is below
     ``util_max`` percent OR at least ``free_min_mib`` of its memory is free,
     on each of ``samples`` readings ``interval`` seconds apart (one failing
-    reading fails the gate). An unreadable GPU fails it (closed)."""
+    reading fails the gate). An unreadable GPU fails it (closed); with
+    ``absent_ok`` (``--device auto``) a box with no nvidia-smi at all passes:
+    the model then runs on the CPU, and there is no GPU to protect."""
 
     def __init__(
         self,
@@ -252,8 +254,10 @@ class GpuGate:
         samples: int = 3,
         interval: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
+        absent_ok: bool = False,
     ) -> None:
         self._query = query
+        self.absent_ok = absent_ok
         self.util_max = util_max
         self.free_min_mib = free_min_mib
         self.samples = max(1, samples)
@@ -275,6 +279,10 @@ class GpuGate:
                 self._sleep(self.interval)
             try:
                 reading = self.read()
+            except FileNotFoundError:
+                if self.absent_ok:
+                    return GateResult(True, "gpu", "no GPU on this box (device auto: CPU)")
+                return GateResult(False, "gpu", "GPU unreadable: no nvidia-smi")
             except Exception as exc:
                 return GateResult(False, "gpu", f"GPU unreadable: {type(exc).__name__}")
             self.last = reading
@@ -994,6 +1002,7 @@ def _run(args: argparse.Namespace) -> int:
                 util_max=args.gpu_util_max,
                 free_min_mib=args.gpu_free_min_mib,
                 samples=args.gpu_samples,
+                absent_ok=args.device == "auto",
             )
             if on_gpu
             else None

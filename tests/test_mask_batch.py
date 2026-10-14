@@ -1209,3 +1209,23 @@ def test_build_backend_reads_the_weights_and_the_device(monkeypatch: pytest.Monk
     assert isinstance(backend, BaseKeptMattingBackend)
     assert isinstance(backend.primary, BiRefNetMattingBackend)
     assert (backend.primary.device, backend.primary.cpu_threads) == ("auto", 2)
+
+
+@pytest.mark.parametrize(("device", "gate_ok"), [("auto", True), ("cuda", False)])
+def test_main_wires_the_gpu_less_pass_to_device_auto_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    device: str,
+    gate_ok: bool,
+) -> None:
+    def absent() -> str:
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(mb, "nvidia_smi_query", lambda index: absent)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--device", device, "--no-residential-check"]
+    assert mb.main([*argv, "--busy-windows", "", "--dry-run"]) == 0
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    plan = next(e for e in out if e["event"] == "plan")
+    assert plan["gate"]["ok"] is gate_ok
