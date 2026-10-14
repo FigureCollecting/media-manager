@@ -23,7 +23,10 @@
 #   MASK_BATCH_NAME       the container name (default mask-batch): one batch at a time; stop it
 #                         with `docker stop -t 120 mask-batch` (it finishes the image in flight)
 #   MASK_BATCH_GPUS       docker --gpus value (default all; "none" runs without a GPU)
-#   MASK_BATCH_MEMORY     docker --memory (default 8g; the GPU run peaks near 2.3 GB of RAM)
+#   MASK_BATCH_MEMORY     docker --memory. Default 8g on the GPU (the run peaks near 2.3 GB of
+#                         RAM); 10g when the model may run on the CPU (--device auto or cpu, or
+#                         MASK_BATCH_GPUS=none): BiRefNet + two IS-Net sessions on the CPU are
+#                         OOM-killed at 8g (exit 137 on the same image every rerun). 10g measured.
 #   MASK_BATCH_APP_DIR    TESTS ONLY: mount this app/ over the image's /app/app
 set -euo pipefail
 
@@ -36,10 +39,20 @@ state="$1"; shift
 mkdir -p "$state"
 state="$(cd "$state" && pwd)"
 
-args=(run --rm --init --name "${MASK_BATCH_NAME:-mask-batch}" --network host
-      --memory "${MASK_BATCH_MEMORY:-8g}" --user "$(id -u):$(id -g)"
-      -v "$state:/state" -w /state -e PYTHONPATH=/app)
 gpus="${MASK_BATCH_GPUS:-all}"
+memory=8g
+[ "$gpus" = "none" ] && memory=10g
+prev=""
+for arg in "$@"; do
+  case "$prev $arg" in
+    "--device auto" | "--device cpu" | *" --device=auto" | *" --device=cpu") memory=10g ;;
+  esac
+  prev="$arg"
+done
+
+args=(run --rm --init --name "${MASK_BATCH_NAME:-mask-batch}" --network host
+      --memory "${MASK_BATCH_MEMORY:-$memory}" --user "$(id -u):$(id -g)"
+      -v "$state:/state" -w /state -e PYTHONPATH=/app)
 [ "$gpus" = "none" ] || args+=(--gpus "$gpus")
 for name in DATABASE_URL PGPASSWORD PGSSLMODE \
             S3_ENDPOINT_URL S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_SECURE \
