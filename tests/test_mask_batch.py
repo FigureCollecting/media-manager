@@ -1464,12 +1464,20 @@ def test_loaded_but_not_yet_measured_the_gate_is_ross_rule_after_the_settle() ->
 
 
 def test_released_the_gate_is_ross_rule_again_without_a_settle() -> None:
-    gate, slept = _held_gate(GAME, IDLE)
+    gate, slept = _held_gate(GAME, "97, 9300, 2690, 12282", IDLE)
     gate.forget_own()
     assert gate.own_mib == 0
     assert gate.check().ok is False  # the game, our model gone: busy, 7985 MiB free
+    assert gate.check().ok is True  # busy, but 9 GiB free: Ross's rule passes it
     assert gate.check().ok is True
     assert slept == []
+
+
+def test_a_new_load_is_measured_afresh() -> None:
+    # loaded again without a release: Ross's rule until the model has run again
+    gate, _ = _held_gate("0, 512, 11370, 12282")
+    gate.mark_loading()
+    assert gate.check().ok is True  # idle; +600 MiB over the old measurement is not growth
 
 
 def test_the_own_memory_is_never_negative_and_needs_a_baseline() -> None:
@@ -1663,6 +1671,7 @@ def test_the_smallest_sane_run_options_are_accepted(
 @pytest.mark.parametrize(
     "argv",
     [
+        ["--sand", "box"],  # before the command
         ["--dev", "auto"],  # would run on the CPU in the wrapper's 8g (it looks for --device)
         ["--devi=cpu"],
         ["--chunk", "5"],
@@ -1673,10 +1682,12 @@ def test_an_abbreviated_option_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: list[str]
 ) -> None:
     wl = _worklist_file(tmp_path, [])
+    run = ["run", "--worklist", str(wl), "--no-residential-check", "--dry-run"]
     with pytest.raises(SystemExit) as exc:
-        mb.main(["run", "--worklist", str(wl), "--no-residential-check", "--dry-run", *argv])
+        mb.main([*argv, *run] if argv[0] == "--sand" else [*run, *argv])
     assert exc.value.code == 2
-    assert "unrecognized arguments" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "unrecognized arguments" in err or "invalid choice: 'box'" in err
 
 
 def test_run_batch_refuses_a_chunk_size_below_one(db_session: Session, tmp_path: Path) -> None:
@@ -1948,14 +1959,50 @@ def test_an_interrupted_image_that_fails_for_its_own_fault_becomes_failed(
 
 
 class _Bucket5xx(LocalObjectStore):
-    """The media bucket answering 503 to every PUT once ``down``."""
+    """The media bucket answering 503 to every PUT (or GET) once ``down``."""
 
     down = False
+    reads_too = False
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         if self.down:
             raise _client_error("SlowDown", 503)
         super().put(key, data, content_type)
+
+    def get(self, key: str) -> bytes:
+        if self.reads_too:
+            raise _client_error("ServiceUnavailable", 503)
+        return super().get(key)
+
+
+def test_a_bucket_5xx_on_the_lanes_read_is_an_outage(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    media = _Bucket5xx(tmp_path / "media")
+    media.reads_too = True  # the lane reads the seeded copy back: 503
+    rt = _runtime(db_session, tmp_path, raw)
+    rt.media_store = media
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), rt) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "ClientError")
+
+
+def test_a_database_blip_inside_the_lane_is_an_outage(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane catches it and records only the class name; no bucket error
+    was seen, so the name alone tells the outage."""
+    from sqlalchemy.exc import OperationalError
+
+    def blip(*a: object, **k: object) -> None:
+        raise OperationalError("INSERT", {}, Exception("server closed the connection"))
+
+    monkeypatch.setattr(mask_job, "register_public_object", blip)
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "OperationalError")
 
 
 def test_a_bucket_5xx_inside_the_lane_is_an_outage(db_session: Session, tmp_path: Path) -> None:
