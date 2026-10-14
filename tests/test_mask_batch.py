@@ -20,6 +20,7 @@ nvidia-smi output.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import gzip
 import hashlib
@@ -799,10 +800,10 @@ def test_a_mask_failure_recorded_by_the_lane_counts_as_a_failure(
 
 def test_consecutive_failures_open_the_circuit(db_session: Session, tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw")
-    gone = [
-        mb.WorkItem(blob_sha256=f"{n:064x}", storage_key=f"raw-img/x/{n}", url=ITEM, product_id="p")
-        for n in range(6)
-    ]
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    gone = [raw.add(n) for n in range(6)]
+    bucket.down = {i.storage_key for i in gone}  # an outage, not the images
     events: list[dict[str, Any]] = []
     rt = _runtime(db_session, tmp_path, raw, events=events)
     assert mb.run_batch(gone, mb.BatchConfig(max_consecutive_failures=3), rt) == 3
@@ -814,11 +815,10 @@ def test_consecutive_failures_open_the_circuit(db_session: Session, tmp_path: Pa
 
 def test_a_success_resets_the_failure_streak(db_session: Session, tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw")
-
-    def gone(n: int) -> mb.WorkItem:
-        return mb.WorkItem(blob_sha256=f"{n:064x}", storage_key=f"x/{n}", url=ITEM, product_id="p")
-
-    items = [gone(1), gone(2), raw.add(3), gone(4), gone(5)]
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(1, 6)]
+    bucket.down = {i.storage_key for i in items if i is not items[2]}
     assert (
         mb.run_batch(
             items, mb.BatchConfig(max_consecutive_failures=3), _runtime(db_session, tmp_path, raw)
@@ -1701,6 +1701,223 @@ def test_a_failure_that_does_not_open_the_circuit_stays_failed(
     rt = _runtime(db_session, tmp_path, raw)
     assert mb.run_batch([gone, raw.add(1)], mb.BatchConfig(max_consecutive_failures=2), rt) == 1
     assert mb.Progress(tmp_path / "progress.jsonl").load()["e" * 64]["status"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# only an outage opens the circuit; an image's own fault stays failed
+# --------------------------------------------------------------------------
+
+
+def _client_error(code: str, status: int) -> Exception:
+    """As boto3 raises it: a ClientError subclass named for the code when it has one."""
+    from botocore.exceptions import ClientError
+
+    cls = type(code, (ClientError,), {}) if code == "NoSuchKey" else ClientError
+    body = {
+        "Error": {"Code": code, "Message": code},
+        "ResponseMetadata": {"HTTPStatusCode": status},
+    }
+    return cls(body, "GetObject")  # type: ignore[arg-type]
+
+
+def _transport_errors() -> list[Exception]:
+    from botocore.exceptions import EndpointConnectionError, ReadTimeoutError
+    from sqlalchemy.exc import OperationalError
+
+    return [
+        ConnectionError("port-forward gone"),
+        ConnectionResetError(),
+        TimeoutError(),
+        OperationalError("SELECT 1", {}, Exception("server closed the connection")),
+        EndpointConnectionError(endpoint_url="https://hel1.example"),
+        ReadTimeoutError(endpoint_url="https://hel1.example"),
+        _client_error("SlowDown", 503),
+        _client_error("InternalError", 500),
+    ]
+
+
+def _own_faults() -> list[Exception]:
+    from PIL import UnidentifiedImageError
+
+    return [
+        _client_error("NoSuchKey", 404),
+        _client_error("AccessDenied", 403),
+        FileNotFoundError("raw-img/none"),
+        UnidentifiedImageError("not a picture"),
+        ValueError("bad"),
+        RuntimeError("model"),
+    ]
+
+
+def test_an_outage_is_told_from_an_images_own_fault() -> None:
+    assert [mb.is_outage(e) for e in _transport_errors()] == [True] * 8
+    assert [mb.is_outage(e) for e in _own_faults()] == [False] * 6
+    # the lane records the class name only
+    for name in ("ConnectionError", "OperationalError", "ReadTimeoutError", "TimeoutError"):
+        assert mb.is_outage_reason(name) is True
+    for name in ("ClientError", "RuntimeError", "unsupported_codec:zstd", "Fail", None):
+        assert mb.is_outage_reason(name) is False
+
+
+class _Bucket(LocalObjectStore):
+    """The raw bucket as S3 answers: a missing key is NoSuchKey; a key in
+    ``down`` is an outage (the connection drops)."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.down: set[str] = set()
+
+    def get(self, key: str) -> bytes:
+        if key in self.down:
+            raise ConnectionError("connection dropped")
+        try:
+            return super().get(key)
+        except FileNotFoundError:
+            raise _client_error("NoSuchKey", 404) from None
+
+
+def _own_fault_items(raw: _Raw) -> list[mb.WorkItem]:
+    """Five originals that fail for their own reasons, every run the same."""
+    zstd = dataclasses.replace(raw.add(101), codec="zstd")
+    wrong = raw.add(102)
+    raw.store.put(wrong.storage_key, b"other bytes", "image/png")
+    gone = dataclasses.replace(raw.add(103), storage_key="raw-img/sha256/no/such.png")
+    junk = b"not a picture at all"
+    sha = hashlib.sha256(junk).hexdigest()
+    raw.store.put(f"raw-img/{sha}", junk, "image/png")
+    not_image = mb.WorkItem(blob_sha256=sha, storage_key=f"raw-img/{sha}", url=ITEM, product_id="p")
+    gzip_junk = dataclasses.replace(raw.add(104), codec="gzip")
+    raw.store.put(gzip_junk.storage_key, _photo(104), "image/png")  # not gzip at all
+    return [dataclasses.replace(i, rank=0) for i in (zstd, wrong, gone, not_image, gzip_junk)]
+
+
+def test_an_images_own_faults_never_open_the_circuit_and_a_plain_rerun_moves_on(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    raw.store = _Bucket(tmp_path / "raw")
+    bad = _own_fault_items(raw)
+    good = [raw.add(n, rank=1) for n in range(3)]
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    config = mb.BatchConfig(chunk_size=4, max_consecutive_failures=3)
+    assert mb.run_batch(bad + good, config, rt) == 1  # done, with failures
+    assert _events(events, "circuit_open") == []
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert [progress[i.blob_sha256]["reason"] for i in bad] == [
+        "unsupported_codec:zstd",
+        "raw_hash_mismatch",
+        "fetch:NoSuchKey",
+        "seed:UnidentifiedImageError",
+        "fetch:BadGzipFile",
+    ]
+    assert {progress[i.blob_sha256]["status"] for i in bad} == {"failed"}
+    assert {progress[i.blob_sha256]["status"] for i in good} == {"ok"}
+
+    for _ in range(2):  # plain reruns: nothing left, never stuck on the five
+        again: list[dict[str, Any]] = []
+        rt2 = _runtime(db_session, tmp_path, raw, events=again)
+        assert mb.run_batch(bad + good, config, rt2) == 0
+        start = _events(again, "start")[0]
+        assert (start["pending"], start["failed_before"]) == (0, 5)
+
+
+def test_an_images_own_fault_neither_counts_toward_nor_resets_the_streak(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    out = [raw.add(n, rank=0) for n in (1, 2, 4, 5)]
+    bucket.down = {i.storage_key for i in out}
+    zstd = dataclasses.replace(raw.add(3, rank=0), codec="zstd")
+    items = [out[0], out[1], zstd, out[2], out[3], raw.add(6, rank=1)]
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=3), rt) == 3
+    (opened,) = _events(events, "circuit_open")
+    assert (opened["consecutive_failures"], opened["interrupted"]) == (3, 3)
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    statuses = [progress[i.blob_sha256]["status"] for i in items[:4]]
+    assert statuses == ["interrupted", "interrupted", "failed", "interrupted"]
+    assert items[4].blob_sha256 not in progress  # stopped before it
+
+
+def test_a_lone_outage_failure_is_interrupted_and_retried_by_a_plain_rerun(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(3)]
+    bucket.down = {items[0].storage_key}
+    rt = _runtime(db_session, tmp_path, raw)
+    assert mb.run_batch(items, mb.BatchConfig(), rt) == 1  # done, one image interrupted
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert progress[items[0].blob_sha256]["status"] == "interrupted"
+    assert progress[items[0].blob_sha256]["reason"] == "fetch:ConnectionError"
+    bucket.down = set()
+    events: list[dict[str, Any]] = []
+    assert (
+        mb.run_batch(items, mb.BatchConfig(), _runtime(db_session, tmp_path, raw, events=events))
+        == 0
+    )
+    assert _events(events, "done")[0]["counts"] == {"ok": 1}
+
+
+def test_an_interrupted_image_that_fails_for_its_own_fault_becomes_failed(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(4)]
+    bucket.down = {i.storage_key for i in items}
+    config = mb.BatchConfig(max_consecutive_failures=2)
+    assert mb.run_batch(items, config, _runtime(db_session, tmp_path, raw)) == 3
+    bucket.down = set()
+    for item in items[:2]:  # their bytes went bad meanwhile: their own fault now
+        raw.store.put(item.storage_key, b"rotted", "image/png")
+    assert mb.run_batch(items, config, _runtime(db_session, tmp_path, raw)) == 1
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert [progress[i.blob_sha256]["status"] for i in items] == ["failed", "failed", "ok", "ok"]
+    assert progress[items[0].blob_sha256]["reason"] == "raw_hash_mismatch"
+    events: list[dict[str, Any]] = []
+    assert mb.run_batch(items, config, _runtime(db_session, tmp_path, raw, events=events)) == 0
+    assert _events(events, "start")[0]["pending"] == 0  # not re-driven again
+
+
+class _Bucket5xx(LocalObjectStore):
+    """The media bucket answering 503 to every PUT once ``down``."""
+
+    down = False
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        if self.down:
+            raise _client_error("SlowDown", 503)
+        super().put(key, data, content_type)
+
+
+def test_a_bucket_5xx_inside_the_lane_is_an_outage(db_session: Session, tmp_path: Path) -> None:
+    """The lane records only the class (ClientError, 4xx or 5xx alike); the
+    driver saw the exception the bucket raised and tells the outage apart."""
+    raw = _Raw(tmp_path / "raw")
+    media = _Bucket5xx(tmp_path / "media")
+
+    class _Then503(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            media.down = True  # after the copy was seeded: the mask PUT gets the 503
+            return super().predict_alpha(image)
+
+    rt = _runtime(db_session, tmp_path, raw, backend=_Then503())
+    rt.media_store = media
+    items = [raw.add(n) for n in range(3)]
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=5), rt) == 1
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    first = progress[items[0].blob_sha256]
+    assert (first["status"], first["reason"]) == ("interrupted", "ClientError")
+    assert [progress[i.blob_sha256]["reason"] for i in items[1:]] == ["seed:ClientError"] * 2
+    assert {progress[i.blob_sha256]["status"] for i in items} == {"interrupted"}
 
 
 # --------------------------------------------------------------------------
