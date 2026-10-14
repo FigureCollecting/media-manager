@@ -34,7 +34,8 @@ lane's own reason); ``--max-consecutive-failures`` in a row stops the batch
 THE GATE, before EVERY chunk (Ross 2026-10-12): not inside a scraper roll
 window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
 :50-:56; a chunk that runs into one stops before its next image); the GPU idle
-(utilisation < 5 %) OR at least 9 GiB of it free, on every one of
+(utilisation < 5 %) OR at least 9 GiB of it free -- the memory the batch's
+own model holds counts as free (``GpuGate``) -- on every one of
 ``--gpu-samples`` readings; and the box on its residential address (a VPN
 window moves it; ``--residential-ip`` takes an address or the ISP's block).
 While the gate fails the batch waits, polling every
@@ -103,6 +104,8 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _MAX_RANK = 99
+#: The statuses of an image the model ran on (its arena is full afterwards).
+_RAN_MODEL = ("ok", "held", "empty")
 
 
 # --------------------------------------------------------------------------
@@ -246,7 +249,16 @@ class GpuGate:
     on each of ``samples`` readings ``interval`` seconds apart (one failing
     reading fails the gate). An unreadable GPU fails it (closed); with
     ``absent_ok`` (``--device auto``) a box with no nvidia-smi at all passes:
-    the model then runs on the CPU, and there is no GPU to protect."""
+    the model then runs on the CPU, and there is no GPU to protect.
+
+    The batch's OWN memory counts as free: while the model is held, the gate
+    asks whether 9 GiB would be free without it (free + ``own_mib``), so the
+    ~9.2 GB the model holds between chunks never pauses the batch on its own,
+    and another process that takes the memory still does. Under WSL nvidia-smi
+    cannot attribute memory to a process, so ``own_mib`` is measured: the
+    memory in use after the first image the model runs (its arena is full by
+    then: both models take fixed 1024 px inputs) less the reading before it
+    was loaded (``mark_loading``), once per load; ``forget_own`` on release."""
 
     def __init__(
         self,
@@ -267,6 +279,27 @@ class GpuGate:
         self.interval = interval
         self._sleep = sleep
         self.last: GpuReading | None = None
+        self.own_mib = 0
+        self._baseline_mib: int | None = None
+
+    def mark_loading(self) -> None:
+        """The model is about to load: the last reading is the card without it."""
+        self._baseline_mib = self.last.used_mib if self.last is not None else None
+        self.own_mib = 0
+
+    def measure_own(self) -> None:
+        """The model has run once: what it added since ``mark_loading`` is ours."""
+        if self._baseline_mib is None:
+            return
+        try:
+            reading = self.read()
+        except Exception:
+            return  # no credit; the next check fails closed if it stays unreadable
+        self.own_mib = max(0, reading.used_mib - self._baseline_mib)
+
+    def forget_own(self) -> None:
+        self.own_mib = 0
+        self._baseline_mib = None
 
     def read(self) -> GpuReading:
         parts = [p.strip() for p in self._query().split(",")]
@@ -289,11 +322,13 @@ class GpuGate:
             except Exception as exc:
                 return GateResult(False, "gpu", f"GPU unreadable: {type(exc).__name__}")
             self.last = reading
+            ours = f" + {self.own_mib} MiB ours" if self.own_mib else ""
             detail = (
                 f"util {reading.util}% (passes below {self.util_max}%), "
-                f"free {reading.free_mib} MiB (passes at {self.free_min_mib} MiB)"
+                f"free {reading.free_mib} MiB{ours} (passes at {self.free_min_mib} MiB)"
             )
-            if not (reading.util < self.util_max or reading.free_mib >= self.free_min_mib):
+            available = reading.free_mib + self.own_mib
+            if not (reading.util < self.util_max or available >= self.free_min_mib):
                 return GateResult(False, "gpu", detail)
         return GateResult(True, "gpu", detail)
 
@@ -726,6 +761,8 @@ def _wait_for_gate(rt: Runtime, config: BatchConfig, backend: MattingBackend | N
             if backend is not None and not released:
                 backend.release()
                 released = True
+                if rt.gates.gpu is not None:
+                    rt.gates.gpu.forget_own()
         if config.max_wait_seconds is not None and waited >= config.max_wait_seconds:
             raise _GaveUp(result)
         rt.sleep(config.poll_seconds)
@@ -792,11 +829,16 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
     position = 0
     chunk_no = 0
     loaded = False
+    measured = False
     try:
         while position < len(pending):
             if _wait_for_gate(rt, config, backend if loaded else None):
                 loaded = False
+            gpu = rt.gates.gpu
             if not loaded:
+                if gpu is not None:
+                    gpu.mark_loading()
+                    measured = False
                 try:
                     backend.load()
                 except Exception as exc:
@@ -804,7 +846,6 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     return 2
                 loaded = True
             chunk_no += 1
-            gpu = rt.gates.gpu
             chunk = _Chunk(
                 number=chunk_no,
                 batch_id=None,
@@ -823,6 +864,9 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                         break
                     record = _mint(db, item, rt, backend, batch, config.retry_failed)
                     record["chunk"] = chunk_no
+                    if gpu is not None and not measured and record["status"] in _RAN_MODEL:
+                        gpu.measure_own()
+                        measured = True
                     rt.progress.append(record)
                     chunk.records.append(record)
                     position += 1
@@ -831,6 +875,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                         break
             finish_mask_batch(db, batch)
             report = chunk.report(sampler.peak_mib, rt.monotonic() - chunk.started)
+            report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
             rt.emit(report)
             rt.progress.append(report)
             for status, n in report["counts"].items():

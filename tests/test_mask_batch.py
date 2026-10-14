@@ -833,7 +833,11 @@ def test_a_failing_gate_pauses_releases_the_gpu_and_resumes(
     raw = _Raw(tmp_path / "raw")
     clock = _Clock()
     model = _Model()
-    readings = ["2, 100, 1, 12282"] + ["97, 3000, 9000, 12282"] * 2 + ["1, 9000, 3000, 12282"] * 5
+    readings = (
+        ["2, 100, 1, 12282", "2, 2900, 9100, 12282"]  # before the load; after the first image
+        + ["97, 0, 12282, 12282", "97, 3000, 9000, 12282"]  # a game: held, then released
+        + ["1, 9000, 3000, 12282"] * 5
+    )
     gates = mb.Gates(
         windows=(), gpu=mb.GpuGate(query=_gpu(readings), samples=1), residential=None, now=clock.now
     )
