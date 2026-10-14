@@ -505,6 +505,31 @@ class ReadOnlyStore:
         raise PermissionError("the raw bucket is read only to the mask batch")
 
 
+class RecentWrites:
+    """The media bucket with its last few writes kept in memory: the lane
+    re-reads the clean copy it has just stored (to hash it before the mask),
+    and over the WAN that read is a round trip per image. Every write still
+    goes to the bucket; keys are content addresses, so a kept copy is never
+    stale."""
+
+    def __init__(self, store: ObjectStore, *, keep: int = 4) -> None:
+        self._store = store
+        self._keep = keep
+        self._recent: dict[str, bytes] = {}
+
+    def get(self, key: str) -> bytes:
+        if key in self._recent:
+            return self._recent[key]
+        return self._store.get(key)
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        self._store.put(key, data, content_type)
+        self._recent.pop(key, None)
+        self._recent[key] = data
+        while len(self._recent) > self._keep:
+            del self._recent[next(iter(self._recent))]
+
+
 # --------------------------------------------------------------------------
 # the driver
 # --------------------------------------------------------------------------
@@ -1045,7 +1070,8 @@ def _run(args: argparse.Namespace) -> int:
         from .masks import open_stores
 
         raw_store = _raw_store(args)
-        db, media_store = open_stores(args.sandbox)
+        db, bucket = open_stores(args.sandbox)
+        media_store = RecentWrites(bucket)
         sessions.append(db)
     rt = Runtime(
         gates=gates,
