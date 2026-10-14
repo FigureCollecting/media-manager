@@ -1503,3 +1503,69 @@ def test_run_batch_refuses_a_chunk_size_below_one(db_session: Session, tmp_path:
     assert model.loads == 0
     assert db_session.execute(select(func.count()).select_from(MaskBatch)).scalar_one() == 0
     assert not (tmp_path / "progress.jsonl").exists()
+
+
+# --------------------------------------------------------------------------
+# an outage is not the images' failure: a plain rerun retries them
+# --------------------------------------------------------------------------
+
+
+class _Flaky(LocalObjectStore):
+    """The media bucket through a port-forward that drops: while ``down``,
+    every read fails (the lane records the image as failed in the media db)."""
+
+    down = False
+
+    def get(self, key: str) -> bytes:
+        if self.down:
+            raise ConnectionError("port-forward gone")
+        return super().get(key)
+
+
+def test_failures_that_open_the_circuit_are_interrupted_and_a_plain_rerun_retries_them(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(n) for n in range(6)]
+    media = _Flaky(tmp_path / "media")
+
+    class _Outage(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            media.down = True  # the forward drops after the first image
+            return super().predict_alpha(image)
+
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, backend=_Outage(), events=events)
+    rt.media_store = media
+    config = mb.BatchConfig(chunk_size=2, max_consecutive_failures=3)
+    assert mb.run_batch(items, config, rt) == 3
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    statuses = [progress[i.blob_sha256]["status"] for i in items[:4]]
+    assert statuses == ["ok", "interrupted", "interrupted", "interrupted"]
+    assert progress[items[1].blob_sha256]["reason"] == "ConnectionError"  # the cause is kept
+    chunks = _events(events, "chunk")
+    assert chunks[1]["counts"] == {"interrupted": 2}  # this chunk's share of the streak
+    assert _events(events, "circuit_open")[0]["interrupted"] == 3
+    # the lane recorded those three as failed in the media db
+    assert mask_job.original_settled(db_session, items[1].blob_sha256) == "failed"
+
+    media.down = False  # the operator restores the port-forward and reruns, no flags
+    events2: list[dict[str, Any]] = []
+    rt2 = _runtime(db_session, tmp_path, raw, events=events2)
+    rt2.media_store = media
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2), rt2) == 0
+    start = _events(events2, "start")[0]
+    assert (start["done"], start["interrupted_before"], start["pending"]) == (1, 3, 5)
+    assert _events(events2, "done")[0]["counts"] == {"ok": 5}
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert {progress[i.blob_sha256]["status"] for i in items} == {"ok"}
+
+
+def test_a_failure_that_does_not_open_the_circuit_stays_failed(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    gone = mb.WorkItem(blob_sha256="e" * 64, storage_key="raw-img/none", url=ITEM, product_id="p")
+    rt = _runtime(db_session, tmp_path, raw)
+    assert mb.run_batch([gone, raw.add(1)], mb.BatchConfig(max_consecutive_failures=2), rt) == 1
+    assert mb.Progress(tmp_path / "progress.jsonl").load()["e" * 64]["status"] == "failed"
