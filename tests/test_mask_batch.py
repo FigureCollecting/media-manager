@@ -669,6 +669,32 @@ def test_resume_skips_what_is_done_and_retries_failures_only_on_request(
     assert progress.load()[failed.blob_sha256]["status"] == "ok"
 
 
+def test_a_failure_the_media_db_recorded_is_reminted_only_with_retry_failed(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """The progress file lost (another machine, a fresh state dir): the media
+    database's failed row alone makes the image settled, until asked."""
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+
+    class _Broken(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            raise RuntimeError("model fault")
+
+    first = _runtime(db_session, tmp_path, raw, backend=_Broken())
+    assert mb.run_batch([item], mb.BatchConfig(), first) == 1
+    assert mask_job.original_settled(db_session, item.blob_sha256) == "failed"
+
+    def run(name: str, retry: bool) -> dict[str, Any]:
+        rt = _runtime(db_session, tmp_path, raw, progress=tmp_path / name)
+        mb.run_batch([item], mb.BatchConfig(retry_failed=retry), rt)
+        return mb.Progress(tmp_path / name).load()[item.blob_sha256]
+
+    plain = run("fresh-1.jsonl", False)
+    assert (plain["status"], plain["mask_status"]) == ("already", "failed")
+    assert run("fresh-2.jsonl", True)["status"] == "ok"
+
+
 def test_per_image_failures_are_counted_and_named(db_session: Session, tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw")
     good = raw.add(1, rank=0)
@@ -1587,6 +1613,17 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--poll-seconds", "nan"),
         ("--poll-seconds", "inf"),
         ("--poll-seconds", "soon"),
+        ("--poll-seconds", "3601"),  # an hour at most between two looks at the gate
+        ("--poll-seconds", "1e308"),  # time.sleep raises OverflowError
+        ("--max-wait-seconds", "nan"),
+        ("--max-wait-seconds", "inf"),
+        ("--max-wait-seconds", "-5"),
+        ("--residential-ttl", "nan"),
+        ("--residential-ttl", "inf"),
+        ("--residential-ttl", "0"),
+        ("--residential-ttl", "-1"),
+        ("--gpu-free-min-mib", "0"),  # would pass a full card
+        ("--gpu-free-min-mib", "1023"),
     ],
 )
 def test_a_bad_run_option_is_refused_by_the_parser(
@@ -1610,6 +1647,10 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--limit", "0", "limit", 0),
         ("--poll-seconds", "1", "poll_seconds", 1.0),
         ("--poll-seconds", "2.5", "poll_seconds", 2.5),
+        ("--poll-seconds", "3600", "poll_seconds", 3600.0),
+        ("--max-wait-seconds", "0", "max_wait_seconds", 0.0),
+        ("--residential-ttl", "0.5", "residential_ttl", 0.5),
+        ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
     ],
 )
 def test_the_smallest_sane_run_options_are_accepted(
@@ -1617,6 +1658,25 @@ def test_the_smallest_sane_run_options_are_accepted(
 ) -> None:
     args = mb._parser().parse_args(["run", "--worklist", "w", option, value])
     assert getattr(args, field) == expected
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--dev", "auto"],  # would run on the CPU in the wrapper's 8g (it looks for --device)
+        ["--devi=cpu"],
+        ["--chunk", "5"],
+        ["--retry"],
+    ],
+)
+def test_an_abbreviated_option_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    wl = _worklist_file(tmp_path, [])
+    with pytest.raises(SystemExit) as exc:
+        mb.main(["run", "--worklist", str(wl), "--no-residential-check", "--dry-run", *argv])
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
 def test_run_batch_refuses_a_chunk_size_below_one(db_session: Session, tmp_path: Path) -> None:
