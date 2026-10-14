@@ -1345,14 +1345,22 @@ def _whole(minimum: int) -> Callable[[str], int]:
     return parse
 
 
-def _seconds(minimum: float) -> Callable[[str], float]:
+def _seconds(
+    minimum: float, maximum: float = math.inf, *, above: bool = False
+) -> Callable[[str], float]:
+    """Finite seconds from ``minimum`` (exclusive with ``above``) to ``maximum``."""
+
     def parse(text: str) -> float:
         try:
             value = float(text)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
-        if not (math.isfinite(value) and value >= minimum):
-            raise argparse.ArgumentTypeError(f"must be {minimum:g} s or more, got {text}")
+        low = value > minimum if above else value >= minimum
+        if not (math.isfinite(value) and low and value <= maximum):
+            bound = f"above {minimum:g} s" if above else f"{minimum:g} s or more"
+            if maximum < math.inf:
+                bound += f" and at most {maximum:g} s"
+            raise argparse.ArgumentTypeError(f"must be {bound}, got {text}")
         return value
 
     return parse
@@ -1360,12 +1368,17 @@ def _seconds(minimum: float) -> Callable[[str], float]:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m app.cli.mask_batch", description=(__doc__ or "").split("\n")[0]
+        prog="python -m app.cli.mask_batch",
+        description=(__doc__ or "").split("\n")[0],
+        allow_abbrev=False,
     )
     p.add_argument("--sandbox", help="SQLite + local objects in DIR instead of DATABASE_URL/S3")
     sub = p.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="mint masks for a work list (gated, chunked, resumable)")
+    # no abbreviations: the wrapper sizes the container by the literal --device
+    run = sub.add_parser(
+        "run", help="mint masks for a work list (gated, chunked, resumable)", allow_abbrev=False
+    )
     run.add_argument("--worklist", action="append", required=True, type=Path)
     run.add_argument("--progress", default="mask-batch-progress.jsonl")
     run.add_argument("--chunk-size", type=_whole(1), default=20)
@@ -1381,15 +1394,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--cpu-threads", type=int)
     run.add_argument("--gpu-index", type=int, default=0)
     run.add_argument("--gpu-util-max", type=int, default=DEFAULT_GPU_UTIL_MAX)
-    run.add_argument("--gpu-free-min-mib", type=int, default=DEFAULT_GPU_FREE_MIN_MIB)
+    run.add_argument("--gpu-free-min-mib", type=_whole(1024), default=DEFAULT_GPU_FREE_MIN_MIB)
     run.add_argument("--gpu-samples", type=_whole(1), default=3)
     run.add_argument("--busy-windows", default=DEFAULT_BUSY_WINDOWS)
     run.add_argument("--residential-ip")
     run.add_argument("--no-residential-check", action="store_true")
     run.add_argument("--ip-echo-url", default=DEFAULT_IP_ECHO_URL)
-    run.add_argument("--residential-ttl", type=float, default=300.0)
-    run.add_argument("--poll-seconds", type=_seconds(1.0), default=60.0)
-    run.add_argument("--max-wait-seconds", type=float)
+    run.add_argument("--residential-ttl", type=_seconds(0.0, above=True), default=300.0)
+    run.add_argument("--poll-seconds", type=_seconds(1.0, 3600.0), default=60.0)
+    run.add_argument("--max-wait-seconds", type=_seconds(0.0))
     run.add_argument("--max-consecutive-failures", type=_whole(1), default=5)
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 
