@@ -794,6 +794,9 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
     """Mint ``items`` chunk by chunk under the gate, lowest rank first (a
     stable sort: work-list order within a rank). Returns the exit status
     (module docstring)."""
+    if config.chunk_size < 1:
+        rt.emit({"event": "refused", "detail": f"chunk size {config.chunk_size} is below 1"})
+        return 2
     items = sorted(items, key=lambda i: i.rank)
     recorded = rt.progress.load()
     done = {sha for sha, r in recorded.items() if r.get("status") != "failed"}
@@ -1168,6 +1171,32 @@ def _sql(args: argparse.Namespace) -> int:
     return 0
 
 
+def _whole(minimum: int) -> Callable[[str], int]:
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be {minimum} or more, got {value}")
+        return value
+
+    return parse
+
+
+def _seconds(minimum: float) -> Callable[[str], float]:
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+        if not (math.isfinite(value) and value >= minimum):
+            raise argparse.ArgumentTypeError(f"must be {minimum:g} s or more, got {text}")
+        return value
+
+    return parse
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m app.cli.mask_batch", description=(__doc__ or "").split("\n")[0]
@@ -1178,8 +1207,8 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="mint masks for a work list (gated, chunked, resumable)")
     run.add_argument("--worklist", action="append", required=True, type=Path)
     run.add_argument("--progress", default="mask-batch-progress.jsonl")
-    run.add_argument("--chunk-size", type=int, default=20)
-    run.add_argument("--limit", type=int)
+    run.add_argument("--chunk-size", type=_whole(1), default=20)
+    run.add_argument("--limit", type=_whole(0))
     run.add_argument("--retry-failed", action="store_true")
     run.add_argument(
         "--dry-run", action="store_true", help="plan only: nothing is opened or written"
@@ -1192,15 +1221,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--gpu-index", type=int, default=0)
     run.add_argument("--gpu-util-max", type=int, default=DEFAULT_GPU_UTIL_MAX)
     run.add_argument("--gpu-free-min-mib", type=int, default=DEFAULT_GPU_FREE_MIN_MIB)
-    run.add_argument("--gpu-samples", type=int, default=3)
+    run.add_argument("--gpu-samples", type=_whole(1), default=3)
     run.add_argument("--busy-windows", default=DEFAULT_BUSY_WINDOWS)
     run.add_argument("--residential-ip")
     run.add_argument("--no-residential-check", action="store_true")
     run.add_argument("--ip-echo-url", default=DEFAULT_IP_ECHO_URL)
     run.add_argument("--residential-ttl", type=float, default=300.0)
-    run.add_argument("--poll-seconds", type=float, default=60.0)
+    run.add_argument("--poll-seconds", type=_seconds(1.0), default=60.0)
     run.add_argument("--max-wait-seconds", type=float)
-    run.add_argument("--max-consecutive-failures", type=int, default=5)
+    run.add_argument("--max-consecutive-failures", type=_whole(1), default=5)
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 
     sql = sub.add_parser("sql", help="print a read-only work-list query")

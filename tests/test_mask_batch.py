@@ -1454,6 +1454,7 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--poll-seconds", "0.5"),
         ("--poll-seconds", "-60"),
         ("--poll-seconds", "nan"),
+        ("--poll-seconds", "inf"),
         ("--poll-seconds", "soon"),
     ],
 )
