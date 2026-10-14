@@ -141,3 +141,40 @@ def test_a_cpu_run_and_a_test_mount_are_opt_in(tmp_path: Path) -> None:
     assert "--gpus" not in argv
     assert f"{app_dir}:/app/app:ro" in argv
     assert "mask-batch-test" in argv
+
+
+def _memory(argv: list[str]) -> str:
+    return argv[argv.index("--memory") + 1]
+
+
+@pytest.mark.parametrize(
+    ("args", "gpus", "memory"),
+    [
+        ((), None, "8g"),  # the GPU run peaks near 2.3 GB of RAM
+        (("--device", "cuda"), None, "8g"),
+        (("--device", "auto"), None, "10g"),  # may fall back to the CPU
+        (("--device=auto",), None, "10g"),
+        (("--device", "cpu"), None, "10g"),
+        (("--device=cpu",), None, "10g"),
+        ((), "none", "10g"),  # no GPU in the container: the CPU path
+        (("--device", "cuda"), "none", "10g"),
+    ],
+)
+def test_the_container_memory_fits_the_path(
+    tmp_path: Path, args: tuple[str, ...], gpus: str | None, memory: str
+) -> None:
+    """The CPU pass (BiRefNet + two IS-Net sessions) is OOM-killed at 8g
+    (exit 137 on the image, every rerun); 10g is the measured working value."""
+    env = {"MASK_BATCH_IMAGE": "w"} | ({"MASK_BATCH_GPUS": gpus} if gpus else {})
+    done, argv = _run(tmp_path, str(tmp_path / "s"), *args, **env)
+    assert done.returncode == 0, done.stderr
+    assert _memory(argv) == memory
+
+
+@pytest.mark.parametrize("args", [(), ("--device", "cpu")])
+def test_an_explicit_container_memory_wins(tmp_path: Path, args: tuple[str, ...]) -> None:
+    done, argv = _run(
+        tmp_path, str(tmp_path / "s"), *args, MASK_BATCH_IMAGE="w", MASK_BATCH_MEMORY="12g"
+    )
+    assert done.returncode == 0, done.stderr
+    assert _memory(argv) == "12g"
