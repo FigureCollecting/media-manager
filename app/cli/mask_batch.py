@@ -37,7 +37,8 @@ window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
 (utilisation < 5 %) OR at least 9 GiB of it free, on every one of
 ``--gpu-samples`` readings; and the box on its residential address (a VPN
 window changes it). While the gate fails the batch waits, polling every
-``--poll-seconds``, and releases the model (a game gets the GPU back).
+``--poll-seconds``, with the model released (a game gets the GPU back; it is
+loaded again, ~4 s, when the gate passes).
 
 THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
 flushed per line: a power cut loses at most the image in flight), and a run
@@ -669,8 +670,9 @@ def _mint(
 
 def _wait_for_gate(rt: Runtime, config: BatchConfig, backend: MattingBackend | None) -> bool:
     """Return once the gate passes -- True when the model was released on the
-    way -- meanwhile poll, say so once per gate, and release the model while
-    the GPU or the address is the problem."""
+    way -- meanwhile poll and say so once per gate. Any pause releases the
+    model: a game gets the GPU back, and a scraper window (up to 24 minutes,
+    during which no GPU reading is taken) does not hold ~9.5 GB idle."""
     paused: str | None = None
     released = False
     waited = 0.0
@@ -685,7 +687,7 @@ def _wait_for_gate(rt: Runtime, config: BatchConfig, backend: MattingBackend | N
         if result.gate != paused:
             paused = result.gate
             rt.emit({"event": "paused", "gate": result.gate, "detail": result.detail})
-            if backend is not None and not released and result.gate in ("gpu", "residential"):
+            if backend is not None and not released:
                 backend.release()
                 released = True
         if config.max_wait_seconds is not None and waited >= config.max_wait_seconds:
