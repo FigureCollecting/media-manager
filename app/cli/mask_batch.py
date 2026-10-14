@@ -29,7 +29,8 @@ refuses a write) and checked against its sha; the clean copy is seeded
 image's alone and is named (``fetch:<class>``, ``raw_hash_mismatch``,
 ``unsupported_codec:<codec>``, ``seed:<class>``, ``settle:<class>``, or the
 lane's own reason); ``--max-consecutive-failures`` in a row stops the batch
-(an outage, not an image).
+(an outage, not an image): those images are recorded ``interrupted``, not
+``failed``, and a plain rerun retries them (their failed media-db rows too).
 
 THE GATE, before EVERY chunk (Ross 2026-10-12): not inside a scraper roll
 window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
@@ -104,6 +105,8 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _MAX_RANK = 99
+#: The recorded statuses a run does not count as done.
+_REDO = ("failed", "interrupted")
 #: The statuses of an image the model ran on (its arena is full afterwards).
 _RAN_MODEL = ("ok", "held", "empty")
 
@@ -652,7 +655,7 @@ class _Chunk:
             "failures": [
                 {"blob_sha256": r["blob_sha256"], "reason": r["reason"]}
                 for r in self.records
-                if r["status"] == "failed"
+                if r["status"] in _REDO
             ],
             "yielded": self.yielded,
             "elapsed_seconds": round(elapsed, 3),
@@ -799,8 +802,9 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return 2
     items = sorted(items, key=lambda i: i.rank)
     recorded = rt.progress.load()
-    done = {sha for sha, r in recorded.items() if r.get("status") != "failed"}
+    done = {sha for sha, r in recorded.items() if r.get("status") not in _REDO}
     failed_before = {sha for sha, r in recorded.items() if r.get("status") == "failed"}
+    interrupted = {sha for sha, r in recorded.items() if r.get("status") == "interrupted"}
     pending = [
         i
         for i in items
@@ -814,6 +818,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
             "items": len(items),
             "done": len(done & {i.blob_sha256 for i in items}),
             "failed_before": len(failed_before & {i.blob_sha256 for i in items}),
+            "interrupted_before": len(interrupted & {i.blob_sha256 for i in items}),
             "pending": len(pending),
             "chunk_size": config.chunk_size,
             "dry_run": config.dry_run,
@@ -828,7 +833,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return 2
     db = rt.open_db()
     totals: dict[str, int] = {}
-    streak = 0
+    streak: list[dict[str, Any]] = []
     position = 0
     chunk_no = 0
     loaded = False
@@ -865,7 +870,9 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     if rt.gates.busy() is not None:
                         chunk.yielded = True
                         break
-                    record = _mint(db, item, rt, backend, batch, config.retry_failed)
+                    # an outage's casualties are re-driven without --retry-failed
+                    redrive = config.retry_failed or item.blob_sha256 in interrupted
+                    record = _mint(db, item, rt, backend, batch, redrive)
                     record["chunk"] = chunk_no
                     if gpu is not None and not measured and record["status"] in _RAN_MODEL:
                         gpu.measure_own()
@@ -873,18 +880,30 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     rt.progress.append(record)
                     chunk.records.append(record)
                     position += 1
-                    streak = streak + 1 if record["status"] == "failed" else 0
-                    if streak >= config.max_consecutive_failures:
+                    streak = [*streak, record] if record["status"] == "failed" else []
+                    if len(streak) >= config.max_consecutive_failures:
                         break
             finish_mask_batch(db, batch)
+            circuit_open = len(streak) >= config.max_consecutive_failures
+            if circuit_open:
+                # an outage, not the images: recorded so a plain rerun retries them
+                for record in streak:
+                    record["status"] = "interrupted"
+                    rt.progress.append(record)
             report = chunk.report(sampler.peak_mib, rt.monotonic() - chunk.started)
             report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
             rt.emit(report)
             rt.progress.append(report)
             for status, n in report["counts"].items():
                 totals[status] = totals.get(status, 0) + n
-            if streak >= config.max_consecutive_failures:
-                rt.emit({"event": "circuit_open", "consecutive_failures": streak})
+            if circuit_open:
+                rt.emit(
+                    {
+                        "event": "circuit_open",
+                        "consecutive_failures": len(streak),
+                        "interrupted": len(streak),
+                    }
+                )
                 return 3
             if rt.stop_requested():
                 raise _Stopped
