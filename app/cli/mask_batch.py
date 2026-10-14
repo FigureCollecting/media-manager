@@ -28,9 +28,13 @@ refuses a write) and checked against its sha; the clean copy is seeded
 (``settle_clean_copy``) in the media database and bucket. A failure is that
 image's alone and is named (``fetch:<class>``, ``raw_hash_mismatch``,
 ``unsupported_codec:<codec>``, ``seed:<class>``, ``settle:<class>``, or the
-lane's own reason); ``--max-consecutive-failures`` in a row stops the batch
-(an outage, not an image): those images are recorded ``interrupted``, not
-``failed``, and a plain rerun retries them (their failed media-db rows too).
+lane's own reason). An OUTAGE-class failure (``is_outage``: a dropped
+connection, a timeout, the database's OperationalError, the bucket's 5xx) is
+recorded ``interrupted``: a plain rerun retries it (its failed media-db row
+too), and ``--max-consecutive-failures`` of them in a row stop the batch. An
+image's OWN fault (its codec, its hash, NoSuchKey, an undecodable picture,
+the model's error) stays ``failed``: neither counted toward that streak nor
+resetting it, and retried only with ``--retry-failed``.
 
 THE GATE, before EVERY chunk (Ross 2026-10-12): not inside a scraper roll
 window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
@@ -738,6 +742,63 @@ class _Chunk:
         }
 
 
+#: The exception classes (by name, anywhere in the class's ancestry) of an
+#: OUTAGE -- the network, the database or the bucket -- not of the image: the
+#: builtin and botocore ConnectionError, timeouts, SQLAlchemy's
+#: OperationalError and InterfaceError (a dropped connection), botocore's
+#: HTTPClientError (a connection closed mid-response).
+_OUTAGE_CLASSES = frozenset(
+    {"ConnectionError", "TimeoutError", "Timeout", "OperationalError", "InterfaceError",
+     "HTTPClientError"}
+)  # fmt: skip
+#: The same, as the mask lane records a failure: its class name alone.
+_OUTAGE_REASONS = _OUTAGE_CLASSES | {
+    "ConnectionResetError", "ConnectionRefusedError", "ConnectionAbortedError",
+    "BrokenPipeError", "EndpointConnectionError", "ConnectionClosedError",
+    "ConnectTimeoutError", "ReadTimeoutError", "ProxyConnectionError",
+}  # fmt: skip
+
+
+def is_outage(exc: BaseException) -> bool:
+    """An outage-class failure (``_OUTAGE_CLASSES``, or the bucket answering
+    5xx): the image is not at fault, a rerun should try it again."""
+    if any(cls.__name__ in _OUTAGE_CLASSES for cls in type(exc).__mro__):
+        return True
+    response = getattr(exc, "response", None)  # botocore's ClientError
+    if isinstance(response, dict):
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return isinstance(status, int) and status >= 500
+    return False
+
+
+def is_outage_reason(reason: str | None) -> bool:
+    return reason in _OUTAGE_REASONS
+
+
+class _Witness:
+    """The media bucket as one image's lane sees it, keeping the last error
+    it raised (the lane records only its class: a 503 and a 403 are both
+    ``ClientError`` there)."""
+
+    def __init__(self, store: ObjectStore) -> None:
+        self._store = store
+        self.error: Exception | None = None
+
+    def get(self, key: str) -> bytes:
+        try:
+            return self._store.get(key)
+        except Exception as exc:
+            self.error = exc
+            raise
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        try:
+            self._store.put(key, data, content_type)
+        except Exception as exc:
+            self.error = exc
+            raise
+
+
 def _decode(stored: bytes, codec: str) -> bytes:
     if codec == "gzip":
         return gzip.decompress(stored)
@@ -767,15 +828,22 @@ def _mint(
         "reason": None,
     }
 
-    def failed(reason: str) -> dict[str, Any]:
-        record.update(status="failed", reason=reason, seconds=round(rt.monotonic() - start, 3))
+    def failed(reason: str, outage: bool = False) -> dict[str, Any]:
+        # an outage's casualty is 'interrupted': it counts toward the circuit and
+        # a plain rerun retries it; an image's own fault stays 'failed'
+        status = "interrupted" if outage else "failed"
+        record.update(status=status, reason=reason, seconds=round(rt.monotonic() - start, 3))
         return record
 
+    def raised(where: str, exc: Exception) -> dict[str, Any]:
+        return failed(f"{where}:{type(exc).__name__}", is_outage(exc))
+
+    media = _Witness(rt.media_store)
     try:
         settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
         db.rollback()
-        return failed(f"db:{type(exc).__name__}")
+        return raised("db", exc)
     if settled is not None:
         record.update(status="already", mask_status=settled)
         return record
@@ -784,13 +852,13 @@ def _mint(
     try:
         data = _decode(rt.raw_store.get(item.storage_key), item.codec)
     except Exception as exc:
-        return failed(f"fetch:{type(exc).__name__}")
+        return raised("fetch", exc)
     if hashlib.sha256(data).hexdigest() != item.blob_sha256:
         return failed("raw_hash_mismatch")
     try:
         clean = seed_clean_image(
             db,
-            rt.media_store,
+            media,
             data,
             origins=[ImageOrigin(url=item.url, source=item.source)],
             figure_id=item.product_id,
@@ -798,20 +866,24 @@ def _mint(
         clean_sha = clean.sha256
     except Exception as exc:
         db.rollback()
-        return failed(f"seed:{type(exc).__name__}")
+        return raised("seed", exc)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
     try:
         report = settle_clean_copy(
-            db, rt.media_store, clean_sha, backend=backend, batch=batch, retry_failed=retry_failed
+            db, media, clean_sha, backend=backend, batch=batch, retry_failed=retry_failed
         )
     except Exception as exc:
         db.rollback()
-        return failed(f"settle:{type(exc).__name__}")
+        return raised("settle", exc)
     record["mask_seconds"] = round(rt.monotonic() - mask_start, 3)
     if report is None:
         # another original's copy of the same picture was settled first
         record.update(status="already", mask_status=original_settled(db, item.blob_sha256))
+    elif report.status == "failed":
+        # the lane caught it and kept the class name; the bucket's error, if any, says more
+        witnessed = media.error is not None and is_outage(media.error)
+        failed(str(report.reason), is_outage_reason(report.reason) or witnessed)
     else:
         record.update(status=report.status, reason=report.reason, mask_sha256=report.mask_sha256)
     record["seconds"] = round(rt.monotonic() - start, 3)
@@ -909,7 +981,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return 2
     db = rt.open_db()
     totals: dict[str, int] = {}
-    streak: list[dict[str, Any]] = []
+    streak = 0  # outage casualties in a row (an image's own fault neither counts nor resets)
     position = 0
     chunk_no = 0
     loaded = False
@@ -956,16 +1028,14 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     rt.progress.append(record)
                     chunk.records.append(record)
                     position += 1
-                    streak = [*streak, record] if record["status"] == "failed" else []
-                    if len(streak) >= config.max_consecutive_failures:
+                    if record["status"] == "interrupted":
+                        streak += 1
+                    elif record["status"] != "failed":
+                        streak = 0
+                    if streak >= config.max_consecutive_failures:
                         break
             finish_mask_batch(db, batch)
-            circuit_open = len(streak) >= config.max_consecutive_failures
-            if circuit_open:
-                # an outage, not the images: recorded so a plain rerun retries them
-                for record in streak:
-                    record["status"] = "interrupted"
-                    rt.progress.append(record)
+            circuit_open = streak >= config.max_consecutive_failures
             report = chunk.report(sampler.peak_mib, rt.monotonic() - chunk.started)
             report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
             rt.emit(report)
@@ -974,11 +1044,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                 totals[status] = totals.get(status, 0) + n
             if circuit_open:
                 rt.emit(
-                    {
-                        "event": "circuit_open",
-                        "consecutive_failures": len(streak),
-                        "interrupted": len(streak),
-                    }
+                    {"event": "circuit_open", "consecutive_failures": streak, "interrupted": streak}
                 )
                 return 3
             if rt.stop_requested():
@@ -990,7 +1056,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         rt.emit({"event": "gave_up", **gave_up.result.as_dict()})
         return 4
     rt.emit({"event": "done", "counts": totals, "pending": len(pending) - position})
-    return 1 if totals.get("failed") else 0
+    return 1 if totals.get("failed") or totals.get("interrupted") else 0
 
 
 # --------------------------------------------------------------------------
