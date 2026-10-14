@@ -66,14 +66,14 @@ def _port(name: str, inner: str) -> str:
 def stack() -> Generator[dict[str, str], None, None]:
     tag = uuid.uuid4().hex[:8]
     pg, s3_name = f"mm-maskbatch-pg-{tag}", f"mm-maskbatch-s3-{tag}"
-    _docker(
-        "run", "-d", "--rm", "--name", pg, "-e", "POSTGRES_PASSWORD=postgres",
-        "-p", "127.0.0.1::5432", PG_IMAGE,
-    )  # fmt: skip
-    _docker(
-        "run", "-d", "--rm", "--name", s3_name, "-p", "127.0.0.1::8333", S3_IMAGE, "server", "-s3",
-    )  # fmt: skip
     try:
+        _docker(
+            "run", "-d", "--rm", "--name", pg, "-e", "POSTGRES_PASSWORD=postgres",
+            "-p", "127.0.0.1::5432", PG_IMAGE,
+        )  # fmt: skip
+        _docker(
+            "run", "-d", "--rm", "--name", s3_name, "-p", "127.0.0.1::8333", S3_IMAGE, "server", "-s3",
+        )  # fmt: skip
         admin = f"postgresql+psycopg2://postgres:postgres@127.0.0.1:{_port(pg, '5432/tcp')}"
         engine = create_engine(f"{admin}/postgres", isolation_level="AUTOCOMMIT")
         deadline = time.monotonic() + 60
