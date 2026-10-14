@@ -4,7 +4,9 @@ Runs only where ``MASK_BATCH_GPU_IMAGE`` names a built worker image
 (``docker build -f Dockerfile.worker``) and docker can start GPU containers;
 everywhere else (CI included) it skips. A disposable PostgreSQL 17 (pg-spine's
 major) gets the media schema from this repo's alembic chain, a disposable
-MinIO holds a raw bucket and a media bucket, and ``scripts/mask-batch.sh``
+S3 server holds a raw bucket and a media bucket (SeaweedFS: the MinIO images
+are no longer pullable from Docker Hub or quay.io without an account, as of
+2026-10-14), and ``scripts/mask-batch.sh``
 runs the driver in the worker image with ``--gpus all`` on this checkout's
 ``app/`` (``MASK_BATCH_APP_DIR``) over the IMG-SERVER-1 bench set: the nine
 sample originals plus each upscaled to 1200 px wide (JPEG q90), eighteen
@@ -37,8 +39,8 @@ REPO = Path(__file__).resolve().parent.parent
 SAMPLE = REPO / "tests" / "fixtures" / "mask_sample"
 IMAGE = os.environ.get("MASK_BATCH_GPU_IMAGE", "")
 PG_IMAGE = "postgres:17-alpine"
-MINIO_IMAGE = "minio/minio:RELEASE.2024-05-10T01-41-38Z"
-KEY, SECRET = "minioadmin", "minioadmin"
+S3_IMAGE = "chrislusf/seaweedfs:4.48"
+KEY, SECRET = "local-key", "local-secret"  # the local S3 server checks no credentials
 
 #: The IMG-SERVER-1 CPU bench on this box (~/tmp/img-server-1/bench/SUMMARY.txt):
 #: the base-keep pass, median wall seconds per image.
@@ -63,15 +65,13 @@ def _port(name: str, inner: str) -> str:
 @pytest.fixture(scope="module")
 def stack() -> Generator[dict[str, str], None, None]:
     tag = uuid.uuid4().hex[:8]
-    pg, minio = f"mm-maskbatch-pg-{tag}", f"mm-maskbatch-minio-{tag}"
+    pg, s3_name = f"mm-maskbatch-pg-{tag}", f"mm-maskbatch-s3-{tag}"
     _docker(
         "run", "-d", "--rm", "--name", pg, "-e", "POSTGRES_PASSWORD=postgres",
         "-p", "127.0.0.1::5432", PG_IMAGE,
     )  # fmt: skip
     _docker(
-        "run", "-d", "--rm", "--name", minio, "-e", f"MINIO_ROOT_USER={KEY}",
-        "-e", f"MINIO_ROOT_PASSWORD={SECRET}", "-p", "127.0.0.1::9000",
-        MINIO_IMAGE, "server", "/data",
+        "run", "-d", "--rm", "--name", s3_name, "-p", "127.0.0.1::8333", S3_IMAGE, "server", "-s3",
     )  # fmt: skip
     try:
         admin = f"postgresql+psycopg2://postgres:postgres@127.0.0.1:{_port(pg, '5432/tcp')}"
@@ -97,7 +97,7 @@ def stack() -> Generator[dict[str, str], None, None]:
                 capture_output=True,
                 timeout=120,
             )
-        s3_url = f"http://127.0.0.1:{_port(minio, '9000/tcp')}"
+        s3_url = f"http://127.0.0.1:{_port(s3_name, '8333/tcp')}"
         s3 = boto3.client(
             "s3", endpoint_url=s3_url, aws_access_key_id=KEY, aws_secret_access_key=SECRET,
             region_name="us-east-1",
@@ -114,7 +114,7 @@ def stack() -> Generator[dict[str, str], None, None]:
                 time.sleep(0.5)
         yield {"admin": admin, "s3": s3_url}
     finally:
-        subprocess.run(["docker", "rm", "-f", "-v", pg, minio], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", pg, s3_name], capture_output=True)
 
 
 def _bench_set() -> list[tuple[str, bytes, dict[str, Any], int]]:

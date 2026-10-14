@@ -38,7 +38,7 @@ state="$(cd "$state" && pwd)"
 
 args=(run --rm --init --name "${MASK_BATCH_NAME:-mask-batch}" --network host
       --memory "${MASK_BATCH_MEMORY:-8g}" --user "$(id -u):$(id -g)"
-      -v "$state:/state" -w /state)
+      -v "$state:/state" -w /state -e PYTHONPATH=/app)
 gpus="${MASK_BATCH_GPUS:-all}"
 [ "$gpus" = "none" ] || args+=(--gpus "$gpus")
 for name in DATABASE_URL PGPASSWORD PGSSLMODE \
