@@ -25,6 +25,7 @@ import gzip
 import hashlib
 import io
 import json
+import subprocess
 import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -292,6 +293,21 @@ def test_the_gpu_gate_fails_closed() -> None:
     assert mb.GpuGate(query=lambda: "N/A, 1, 2, 3", samples=1).check().ok is False
     assert mb.GpuGate(query=lambda: "1, 2", samples=1).check().ok is False
     assert mb.GpuGate(query=lambda: "", samples=1).check().ok is False
+
+
+def test_with_device_auto_a_box_without_nvidia_smi_passes_the_gpu_gate() -> None:
+    def absent() -> str:
+        raise FileNotFoundError("nvidia-smi")
+
+    def broken() -> str:
+        raise subprocess.CalledProcessError(9, "nvidia-smi")
+
+    passed = mb.GpuGate(query=absent, samples=1, absent_ok=True).check()
+    assert passed.ok is True and "no GPU" in passed.detail
+    assert mb.GpuGate(query=absent, samples=1).check().ok is False  # cuda: closed
+    assert (
+        mb.GpuGate(query=broken, samples=1, absent_ok=True).check().ok is False
+    )  # a GPU that errs
 
 
 def test_the_gpu_reading_keeps_the_used_memory_for_the_baseline() -> None:
