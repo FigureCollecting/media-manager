@@ -1256,3 +1256,39 @@ def test_main_wires_the_gpu_less_pass_to_device_auto_only(
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     plan = next(e for e in out if e["event"] == "plan")
     assert plan["gate"]["ok"] is gate_ok
+
+
+def test_a_copy_just_written_is_read_back_from_memory(tmp_path: Path) -> None:
+    """The lane re-reads the clean copy it just stored (to hash it before the
+    mask); over the WAN that is a Hetzner round trip per image saved."""
+    gets: list[str] = []
+
+    class _Backing(LocalObjectStore):
+        def get(self, key: str) -> bytes:
+            gets.append(key)
+            return super().get(key)
+
+    backing = _Backing(tmp_path / "media")
+    store = mb.RecentWrites(backing, keep=2)
+    for n in range(3):
+        store.put(f"k{n}", bytes([n]), "image/png")
+    assert store.get("k2") == b"\x02" and store.get("k1") == b"\x01"
+    assert gets == []
+    assert store.get("k0") == b"\x00"  # evicted: read from the bucket
+    assert gets == ["k0"]
+    assert backing.get("k2") == b"\x02"  # every write still reaches the bucket
+
+
+def test_the_driver_reads_no_copy_back_from_the_bucket(db_session: Session, tmp_path: Path) -> None:
+    raw = _Raw(tmp_path / "raw")
+    gets: list[str] = []
+
+    class _Backing(LocalObjectStore):
+        def get(self, key: str) -> bytes:
+            gets.append(key)
+            return super().get(key)
+
+    rt = _runtime(db_session, tmp_path, raw)
+    rt.media_store = mb.RecentWrites(_Backing(tmp_path / "media"))
+    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(), rt) == 0
+    assert gets == []
