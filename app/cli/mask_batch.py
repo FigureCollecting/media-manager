@@ -4,7 +4,7 @@
         [--progress FILE] [--chunk-size N] [--limit N] [--retry-failed] [--dry-run]
         [--backend birefnet-basekept|birefnet] [--device cuda|auto|cpu] [--cpu-threads N]
         [--gpu-index N] [--gpu-util-max PCT] [--gpu-free-min-mib MIB] [--gpu-samples N]
-        [--busy-windows SPEC] [--residential-ip IP | --no-residential-check]
+        [--busy-windows SPEC] [--residential-ip IP|CIDR | --no-residential-check]
         [--ip-echo-url URL] [--residential-ttl S] [--poll-seconds S]
         [--max-wait-seconds S] [--max-consecutive-failures N] [--raw-dir DIR]
     python -m app.cli.mask_batch sql ross-heads --user UUID
@@ -36,7 +36,8 @@ window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
 :50-:56; a chunk that runs into one stops before its next image); the GPU idle
 (utilisation < 5 %) OR at least 9 GiB of it free, on every one of
 ``--gpu-samples`` readings; and the box on its residential address (a VPN
-window changes it). While the gate fails the batch waits, polling every
+window moves it; ``--residential-ip`` takes an address or the ISP's block).
+While the gate fails the batch waits, polling every
 ``--poll-seconds``, with the model released (a game gets the GPU back; it is
 loaded again, ~4 s, when the gate passes).
 
@@ -60,6 +61,7 @@ import dataclasses
 import datetime as dt
 import gzip
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -327,8 +329,9 @@ def public_ip(url: str) -> Callable[[], str]:
 
 class ResidentialCheck:
     """The box is on its residential exit when its public address is the
-    expected one (a VPN window moves it). A pass is trusted for ``ttl``
-    seconds; a failure is never cached."""
+    expected one, or inside the expected block (``198.51.100.0/24``: a DHCP
+    renewal stays in the ISP's block, a VPN window leaves it). A pass is
+    trusted for ``ttl`` seconds; a failure is never cached."""
 
     def __init__(
         self,
@@ -338,7 +341,12 @@ class ResidentialCheck:
         ttl: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.expected_ip = expected_ip.strip()
+        try:
+            self.expected = ipaddress.ip_network(expected_ip.strip(), strict=False)
+        except ValueError:
+            raise ValueError(
+                f"the residential address {expected_ip!r} is not an IP or a CIDR"
+            ) from None
         self._fetch = fetch
         self.ttl = ttl
         self._clock = clock
@@ -354,7 +362,11 @@ class ResidentialCheck:
             return GateResult(
                 False, "residential", f"public address unreadable: {type(exc).__name__}"
             )
-        if seen != self.expected_ip:
+        try:
+            home = ipaddress.ip_address(seen) in self.expected
+        except ValueError:
+            home = False
+        if not home:
             return GateResult(
                 False, "residential", f"public address {seen} is not the residential exit (VPN?)"
             )

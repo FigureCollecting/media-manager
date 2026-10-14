@@ -409,7 +409,7 @@ def test_the_gates_are_checked_window_then_gpu_then_residential() -> None:
     gates = mb.Gates(
         windows=((3, 26),),
         gpu=mb.GpuGate(query=gpu, samples=1),
-        residential=mb.ResidentialCheck(expected_ip="x", fetch=lambda: "x"),
+        residential=mb.ResidentialCheck(expected_ip="198.51.100.7", fetch=lambda: "198.51.100.7"),
         now=clock.now,
     )
     first = gates.check()
@@ -857,7 +857,7 @@ def test_waiting_longer_than_allowed_gives_up(db_session: Session, tmp_path: Pat
     gates = mb.Gates(
         windows=(),
         gpu=None,
-        residential=mb.ResidentialCheck(expected_ip="a", fetch=lambda: "b"),
+        residential=mb.ResidentialCheck(expected_ip="198.51.100.7", fetch=lambda: "203.0.113.9"),
         now=clock.now,
     )
     events: list[dict[str, Any]] = []
