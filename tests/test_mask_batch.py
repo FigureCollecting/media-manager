@@ -1292,3 +1292,16 @@ def test_the_driver_reads_no_copy_back_from_the_bucket(db_session: Session, tmp_
     rt.media_store = mb.RecentWrites(_Backing(tmp_path / "media"))
     assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(), rt) == 0
     assert gets == []
+
+
+def test_the_residential_address_may_be_the_isps_block() -> None:
+    """A DHCP renewal moves the box within its ISP's block (seen 2026-10-14:
+    .66 -> .71); a VPN moves it out. A CIDR keeps the first from pausing the
+    batch and still catches the second."""
+    answers = iter(["198.51.100.71", "203.0.113.9", "not-an-address"])
+    check = mb.ResidentialCheck(expected_ip="198.51.100.0/24", fetch=lambda: next(answers), ttl=0)
+    assert check.check().ok is True
+    assert check.check().ok is False
+    assert check.check().ok is False
+    with pytest.raises(ValueError, match="residential"):
+        mb.ResidentialCheck(expected_ip="home", fetch=lambda: "x")
