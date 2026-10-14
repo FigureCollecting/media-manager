@@ -1305,3 +1305,125 @@ def test_the_residential_address_may_be_the_isps_block() -> None:
     assert check.check().ok is False
     with pytest.raises(ValueError, match="residential"):
         mb.ResidentialCheck(expected_ip="home", fetch=lambda: "x")
+
+
+# --------------------------------------------------------------------------
+# the gate does not count the batch's own GPU memory against it
+# --------------------------------------------------------------------------
+
+#: The card as nvidia-smi shows it on Ross's box: ~1.3 GB of desktop, the
+#: model's ~9.2 GB while it is held, a game's ~4 GB on top.
+IDLE = "0, 10800, 1300, 12282"
+HELD = "6, 1400, 10500, 12282"  # our model held; util 6 % is its own tail
+GAME_ON_HELD = "97, 0, 12282, 12282"
+GAME = "97, 6800, 5300, 12282"
+
+
+def test_the_gpu_gate_credits_the_memory_the_batch_itself_holds() -> None:
+    readings = iter([IDLE, HELD, HELD, GAME_ON_HELD, HELD])
+    gate = mb.GpuGate(query=lambda: next(readings), samples=1)
+    assert gate.check().ok is True  # IDLE: before the model is loaded
+    gate.mark_loading()  # baseline 1300 MiB, the model not yet loaded
+    gate.measure_own()  # HELD after the first image: 10500 - 1300 = ours
+    assert gate.own_mib == 9200
+    held = gate.check()  # HELD: 1400 free + 9200 ours >= 9 GiB
+    assert held.ok is True
+    assert "9200 MiB ours" in held.detail
+    assert gate.check().ok is False  # a game: 0 free + 9200 ours < 9 GiB
+    gate.forget_own()  # the model was released
+    assert gate.own_mib == 0
+    assert gate.check().ok is False  # HELD without the credit: busy
+
+
+def test_the_own_memory_is_never_negative_and_needs_a_baseline() -> None:
+    gate = mb.GpuGate(query=lambda: HELD, samples=1)
+    gate.mark_loading()  # no reading yet: no baseline
+    gate.measure_own()
+    assert gate.own_mib == 0
+    shrinking = iter([HELD, IDLE])
+    gate = mb.GpuGate(query=lambda: next(shrinking), samples=1)
+    gate.check()
+    gate.mark_loading()  # baseline 10500 (someone else's memory)
+    gate.measure_own()  # it went away: 1300 - 10500
+    assert gate.own_mib == 0
+
+    def broken() -> str:
+        raise OSError("nvidia-smi")
+
+    gate = mb.GpuGate(query=lambda: IDLE, samples=1)
+    gate.check()
+    gate.mark_loading()
+    gate._query = broken
+    gate.measure_own()  # unreadable: no credit (the gate itself then fails closed)
+    assert gate.own_mib == 0
+
+
+class _Card:
+    """nvidia-smi on the box: what it shows follows the model and a game."""
+
+    def __init__(self, model: _Model) -> None:
+        self.model = model
+        self.game = False
+        self.reads = 0
+
+    def query(self) -> str:
+        self.reads += 1
+        held = self.model.loads > self.model.releases
+        if self.game:
+            return GAME_ON_HELD if held else GAME
+        return HELD if held else IDLE
+
+
+def test_with_the_model_loaded_and_nothing_else_on_the_gpu_the_batch_never_pauses(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    model = _Model()
+    card = _Card(model)
+    gates = mb.Gates(
+        windows=(), gpu=mb.GpuGate(query=card.query, samples=3), residential=None, now=clock.now
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=model, events=events)
+    items = [raw.add(n) for n in range(4)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, poll_seconds=60), rt) == 0
+    assert _events(events, "paused") == []
+    assert (model.loads, model.releases) == (1, 0)
+    chunks = _events(events, "chunk")
+    assert [c["held_vram_mib"] for c in chunks] == [9200] * 4
+    assert clock.slept.count(60) == 0
+
+
+def test_another_process_on_the_gpu_still_pauses_the_batch(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+
+    class _Gamer(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            # a game starts during the second chunk, the model long measured
+            card.game = self.loads == 1 and len(_events(events, "chunk")) == 1
+            return super().predict_alpha(image)
+
+    gamer = _Gamer()
+    card = _Card(gamer)
+
+    def sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        card.game = False  # the game ends while the batch waits
+
+    gates = mb.Gates(
+        windows=(), gpu=mb.GpuGate(query=card.query, samples=1), residential=None, now=clock.now
+    )
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, backend=gamer, events=events)
+    rt.sleep = sleep
+    items = [raw.add(n) for n in range(3)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, poll_seconds=60), rt) == 0
+    paused = _events(events, "paused")
+    assert len(paused) == 1 and paused[0]["gate"] == "gpu"
+    assert "97%" in paused[0]["detail"]
+    assert (gamer.loads, gamer.releases) == (2, 1)  # released for the game, loaded again
+    assert gates.gpu is not None and gates.gpu.own_mib == 9200  # measured again after the reload
