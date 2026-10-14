@@ -35,9 +35,11 @@ lane's own reason); ``--max-consecutive-failures`` in a row stops the batch
 THE GATE, before EVERY chunk (Ross 2026-10-12): not inside a scraper roll
 window (``--busy-windows``, minutes of the hour, default :03-:26, :41-:43,
 :50-:56; a chunk that runs into one stops before its next image); the GPU idle
-(utilisation < 5 %) OR at least 9 GiB of it free -- the memory the batch's
-own model holds counts as free (``GpuGate``) -- on every one of
-``--gpu-samples`` readings; and the box on its residential address (a VPN
+(utilisation < 5 %) OR at least 9 GiB of it free, on every one of
+``--gpu-samples`` readings -- while the model is held, no other consumer
+instead: the card's memory not grown more than 512 MiB since the model was
+measured and its utilisation not at or above 5 % on every reading, taken 2 s
+after the chunk (``GpuGate``); and the box on its residential address (a VPN
 window moves it; ``--residential-ip`` takes an address or the ISP's block).
 While the gate fails the batch waits, polling every
 ``--poll-seconds``, with the model released (a game gets the GPU back; it is
@@ -92,7 +94,7 @@ from ..workers.mask_job import (
 )
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
-from ..workers.matting import MattingBackend
+from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
 
 #: The scraper's roll windows (minutes of the hour): no chunk runs in them.
 DEFAULT_BUSY_WINDOWS = "03-26,41-43,50-56"
@@ -100,6 +102,16 @@ DEFAULT_BUSY_WINDOWS = "03-26,41-43,50-56"
 DEFAULT_GPU_UTIL_MAX = 5
 #: ...or has at least this much memory free (MiB; 9 GiB, "the comfortable mark").
 DEFAULT_GPU_FREE_MIN_MIB = 9 * 1024
+#: While the model is held: the seconds the gate waits after a chunk before
+#: its readings (the batch's own compute has left them by then)...
+DEFAULT_GPU_SETTLE_SECONDS = 2.0
+#: ...and the growth of the card's used memory (MiB) that means another consumer.
+DEFAULT_GPU_GROWTH_MAX_MIB = 512
+#: The most the batch's own model can hold (MiB): both arena caps and ~0.5 GiB
+#: of CUDA context; anything measured beyond it is another consumer's.
+OWN_MAX_MIB = (
+    (BiRefNetMattingBackend.GPU_MEM_LIMIT + IsNetMattingBackend.GPU_MEM_LIMIT) >> 20
+) + 512
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -249,21 +261,31 @@ def nvidia_smi_query(index: int) -> Callable[[], str]:
 
 
 class GpuGate:
-    """Ross's rule: the GPU is free for a chunk when its utilisation is below
-    ``util_max`` percent OR at least ``free_min_mib`` of its memory is free,
-    on each of ``samples`` readings ``interval`` seconds apart (one failing
-    reading fails the gate). An unreadable GPU fails it (closed); with
-    ``absent_ok`` (``--device auto``) a box with no nvidia-smi at all passes:
-    the model then runs on the CPU, and there is no GPU to protect.
+    """Ross's rule (2026-10-12): the GPU is free for a chunk when its
+    utilisation is below ``util_max`` percent OR at least ``free_min_mib`` of
+    its memory is free, on each of ``samples`` readings ``interval`` seconds
+    apart (one failing reading fails the gate). An unreadable GPU fails it
+    (closed); with ``absent_ok`` (``--device auto``) a box with no nvidia-smi
+    at all passes: the model then runs on the CPU, and there is no GPU to
+    protect.
 
-    The batch's OWN memory counts as free: while the model is held, the gate
-    asks whether 9 GiB would be free without it (free + ``own_mib``), so the
-    ~9.2 GB the model holds between chunks never pauses the batch on its own,
-    and another process that takes the memory still does. Under WSL nvidia-smi
-    cannot attribute memory to a process, so ``own_mib`` is measured: the
-    memory in use after the first image the model runs (its arena is full by
-    then: both models take fixed 1024 px inputs) less the reading before it
-    was loaded (``mark_loading``), once per load; ``forget_own`` on release."""
+    That rule holds until the model is loaded. WHILE it is held, the model's
+    own memory (9,453-9,481 MiB measured: more than the 9 GiB mark) would fail
+    it on every check, and crediting that memory as free would pass every
+    check, a game included. So while held the gate looks for ANOTHER consumer
+    instead, after waiting ``settle`` seconds (the chunk has ended: the batch
+    is idle, so its own compute is not in the readings): it pauses when the
+    card's used memory has grown more than ``growth_max_mib`` since the model
+    was measured, or when the utilisation is at or above ``util_max`` on EVERY
+    one of the samples. Under WSL nvidia-smi cannot attribute memory to a
+    process, so the model is measured: the memory in use after the first image
+    it runs (its arena is full by then: both models take fixed 1024 px inputs)
+    less the reading before it was loaded (``mark_loading``), once per load;
+    ``forget_own`` on release. A consumer that starts while the model loads is
+    measured as ours, so no more than ``OWN_MAX_MIB`` is taken as ours: the
+    rest counts as growth. Until the model has run (a chunk of ineligible
+    photos only), or when the measurement fails, Ross's rule applies, after
+    the settle."""
 
     def __init__(
         self,
@@ -273,6 +295,8 @@ class GpuGate:
         free_min_mib: int = DEFAULT_GPU_FREE_MIN_MIB,
         samples: int = 3,
         interval: float = 0.5,
+        settle: float = DEFAULT_GPU_SETTLE_SECONDS,
+        growth_max_mib: int = DEFAULT_GPU_GROWTH_MAX_MIB,
         sleep: Callable[[float], None] = time.sleep,
         absent_ok: bool = False,
     ) -> None:
@@ -282,29 +306,40 @@ class GpuGate:
         self.free_min_mib = free_min_mib
         self.samples = max(1, samples)
         self.interval = interval
+        self.settle = settle
+        self.growth_max_mib = growth_max_mib
         self._sleep = sleep
         self.last: GpuReading | None = None
         self.own_mib = 0
+        self._held = False
         self._baseline_mib: int | None = None
+        self._reference_mib: int | None = None
 
     def mark_loading(self) -> None:
         """The model is about to load: the last reading is the card without it."""
+        self._held = True
         self._baseline_mib = self.last.used_mib if self.last is not None else None
+        self._reference_mib = None
         self.own_mib = 0
 
     def measure_own(self) -> None:
-        """The model has run once: what it added since ``mark_loading`` is ours."""
+        """The model has run once: what it added since ``mark_loading`` is
+        ours (up to ``OWN_MAX_MIB``), and the card as it is now, the reference
+        another consumer is measured against."""
         if self._baseline_mib is None:
             return
         try:
             reading = self.read()
         except Exception:
-            return  # no credit; the next check fails closed if it stays unreadable
+            return  # not measured: Ross's rule stays in force
         self.own_mib = max(0, reading.used_mib - self._baseline_mib)
+        self._reference_mib = self._baseline_mib + min(self.own_mib, OWN_MAX_MIB)
 
     def forget_own(self) -> None:
         self.own_mib = 0
+        self._held = False
         self._baseline_mib = None
+        self._reference_mib = None
 
     def read(self) -> GpuReading:
         parts = [p.strip() for p in self._query().split(",")]
@@ -314,7 +349,10 @@ class GpuGate:
         return GpuReading(util=util, free_mib=free, used_mib=used, total_mib=total)
 
     def check(self) -> GateResult:
+        if self._held:
+            self._sleep(self.settle)
         detail = ""
+        busy = 0
         for n in range(self.samples):
             if n:
                 self._sleep(self.interval)
@@ -327,14 +365,32 @@ class GpuGate:
             except Exception as exc:
                 return GateResult(False, "gpu", f"GPU unreadable: {type(exc).__name__}")
             self.last = reading
-            ours = f" + {self.own_mib} MiB ours" if self.own_mib else ""
+            if self._reference_mib is None:
+                detail = (
+                    f"util {reading.util}% (passes below {self.util_max}%), "
+                    f"free {reading.free_mib} MiB (passes at {self.free_min_mib} MiB)"
+                )
+                if not (reading.util < self.util_max or reading.free_mib >= self.free_min_mib):
+                    return GateResult(False, "gpu", detail)
+                continue
+            # memory another process freed lowers the reference: what it takes next shows
+            self._reference_mib = min(self._reference_mib, reading.used_mib)
+            grown = reading.used_mib - self._reference_mib
             detail = (
-                f"util {reading.util}% (passes below {self.util_max}%), "
-                f"free {reading.free_mib} MiB{ours} (passes at {self.free_min_mib} MiB)"
+                f"util {reading.util}%, used {reading.used_mib} MiB, {grown:+d} MiB since "
+                f"our model ({self.own_mib} MiB) was measured "
+                f"(another consumer above +{self.growth_max_mib} MiB)"
             )
-            available = reading.free_mib + self.own_mib
-            if not (reading.util < self.util_max or available >= self.free_min_mib):
+            if grown > self.growth_max_mib:
                 return GateResult(False, "gpu", detail)
+            busy += reading.util >= self.util_max
+        if self._reference_mib is not None and busy == self.samples:
+            return GateResult(
+                False,
+                "gpu",
+                f"{detail}; util at or above {self.util_max}% on every one of "
+                f"{self.samples} readings with our model idle: another consumer",
+            )
         return GateResult(True, "gpu", detail)
 
 

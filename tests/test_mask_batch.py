@@ -1338,7 +1338,7 @@ OWN = 10770 - 1297
 
 def _held_gate(*after: str, samples: int = 1) -> tuple[mb.GpuGate, list[float]]:
     """A gate that saw IDLE, loaded the model and measured it at HELD; then ``after``."""
-    readings = iter([IDLE, HELD, *after])
+    readings = iter([IDLE] * samples + [HELD, *after])
     slept: list[float] = []
     gate = mb.GpuGate(query=lambda: next(readings), samples=samples, sleep=slept.append)
     assert gate.check().ok is True  # IDLE: before the model is loaded
@@ -1416,7 +1416,7 @@ def test_own_memory_beyond_the_caps_counts_as_another_consumer(excess: int, ok: 
     overhead, so the rest is someone else's."""
     assert mb.OWN_MAX_MIB == 8192 + 2048 + 512
     used = 300 + mb.OWN_MAX_MIB + excess
-    readings = iter(["0, 11900, 300, 12282", f"0, {12282 - used}, {used}, 12282"] * 2)
+    readings = iter(["0, 11900, 300, 12282"] + [f"0, {12282 - used}, {used}, 12282"] * 2)
     gate = mb.GpuGate(query=lambda: next(readings), samples=1, sleep=lambda s: None)
     gate.check()
     gate.mark_loading()
@@ -1547,8 +1547,7 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
 
     def sleep(seconds: float) -> None:
         clock.sleep(seconds)
-        if len(clock.slept) == 2:
-            card.game = False  # it ends while the batch waits, two polls in
+        card.game = False  # it ends while the batch waits
 
     gate = mb.GpuGate(query=card.query, samples=3, sleep=lambda s: None)
     gates = mb.Gates(windows=(), gpu=gate, residential=None, now=clock.now)
@@ -1559,7 +1558,8 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
     paused = _events(events, "paused")
     assert len(paused) == 1 and paused[0]["gate"] == "gpu"
     assert shows in paused[0]["detail"]
-    assert clock.slept == [60, 60]  # released, Ross's rule until it ended
+    assert clock.slept == [60]
+    assert len(_events(events, "resumed")) == 1
     assert (gamer.loads, gamer.releases) == (2, 1)  # released for it, loaded again
     assert gate.own_mib == OWN  # measured again after the reload
 
