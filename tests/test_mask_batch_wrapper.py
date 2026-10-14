@@ -97,6 +97,7 @@ def test_the_run_is_on_the_gpu_with_names_not_values(tmp_path: Path) -> None:
     joined = " ".join(argv)
     assert "--gpus all" in joined and "--network host" in joined and "--init" in joined
     assert "--name mask-batch" in joined
+    assert "PYTHONPATH=/app" in argv  # the image's code, run from /state
     assert f"{state}:/state" in argv
     assert f"{ca}:/run/mask-batch/pg-ca.crt:ro" in argv
     assert "PGSSLROOTCERT=/run/mask-batch/pg-ca.crt" in argv
