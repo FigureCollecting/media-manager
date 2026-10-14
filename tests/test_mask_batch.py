@@ -1661,3 +1661,64 @@ def test_the_stores_etag_is_the_md5_of_the_stored_bytes(tmp_path: Path) -> None:
         s3 = S3ObjectStore(client=client, bucket="images")
         s3.put("derived/ab/abc.png", b"bytes", "image/png")
         assert s3.etag("derived/ab/abc.png") == md5  # HEAD, quotes stripped
+
+
+# --------------------------------------------------------------------------
+# seconds per MASKED image, apart from the cheap ineligible ones
+# --------------------------------------------------------------------------
+
+
+def test_the_chunk_reports_seconds_per_masked_image_apart(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+
+    class _Timed(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(3)  # the model's 3 s; an ineligible photo never reaches it
+            return super().predict_alpha(image)
+
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events)
+    items = [raw.add(1, rank=0), raw.add(2, rank=1, url=PICTURE), raw.add(3, rank=2)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=3), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ok": 2, "ineligible": 1}
+    assert chunk["seconds_per_image"] == 2.0  # (3 + 0 + 3) / 3
+    assert chunk["masked"] == 2
+    assert chunk["seconds_per_masked_image"] == 3.0
+
+    events2: list[dict[str, Any]] = []
+    rt2 = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events2)
+    rt2.progress = mb.Progress(tmp_path / "other.jsonl")
+    assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt2) == 0
+    (only_ineligible,) = _events(events2, "chunk")
+    assert only_ineligible["masked"] == 0
+    assert only_ineligible["seconds_per_masked_image"] is None
+
+
+# --------------------------------------------------------------------------
+# --device cpu: no GPU gate, no VRAM sampler
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("device", "on_gpu"), [("cpu", False), ("auto", True), ("cuda", True)])
+def test_only_a_gpu_run_builds_the_gpu_gate_and_the_vram_sampler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str, on_gpu: bool
+) -> None:
+    seen: list[mb.Runtime] = []
+
+    def capture(items: Any, config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        seen.append(rt)
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", capture)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--device", device, "--no-residential-check"]
+    assert mb.main([*argv, "--dry-run"]) == 0
+    (rt,) = seen
+    assert (rt.gates.gpu is not None) is on_gpu
+    sampler = rt.vram()
+    assert isinstance(sampler, mb.VramSampler)
+    assert (sampler._command is not None) is on_gpu
