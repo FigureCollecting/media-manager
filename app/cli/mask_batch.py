@@ -47,7 +47,7 @@ THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
 flushed per line: a power cut loses at most the image in flight), and a run
 skips what it lists (``--retry-failed`` re-drives its failures). Per chunk one
 JSON line on stdout: count, statuses, seconds per image (and the model's
-share), peak GPU memory used (whole card, sampled), the failures. ``--dry-run``
+share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures. ``--dry-run``
 reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
@@ -107,6 +107,8 @@ _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
 _MAX_RANK = 99
 #: The recorded statuses a run does not count as done.
 _REDO = ("failed", "interrupted")
+#: The statuses of an image that got a mask (published, or held for review).
+_MASKED = ("ok", "held")
 #: The statuses of an image the model ran on (its arena is full afterwards).
 _RAN_MODEL = ("ok", "held", "empty")
 
@@ -651,6 +653,8 @@ class _Chunk:
         minted = [r for r in self.records if r["status"] != "already" and "seconds" in r]
         seconds = [r["seconds"] for r in minted]
         mask_seconds = [r["mask_seconds"] for r in minted if r.get("mask_seconds") is not None]
+        # an ineligible photo costs next to nothing (no model): the real rate
+        masked = [r["seconds"] for r in minted if r["status"] in _MASKED]
         return {
             "event": "chunk",
             "chunk": self.number,
@@ -660,6 +664,8 @@ class _Chunk:
             "ranks": [r["rank"] for r in self.records],
             "seconds_per_image": round(statistics.fmean(seconds), 3) if seconds else None,
             "median_seconds": round(statistics.median(seconds), 3) if seconds else None,
+            "masked": len(masked),
+            "seconds_per_masked_image": round(statistics.fmean(masked), 3) if masked else None,
             "mask_seconds_per_image": (
                 round(statistics.fmean(mask_seconds), 3) if mask_seconds else None
             ),
