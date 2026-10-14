@@ -14,6 +14,8 @@ originals, the nine PNGs ranked as Ross's. Nothing leaves the box: synthetic
 pictures, fixture URLs, local containers removed at the end.
 
 ``MASK_BATCH_GPU_REPORT=FILE`` also writes the measured numbers there.
+``MASK_BATCH_GPU_APP_DIR`` mounts another app/ instead (a differential against
+an older commit).
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from sqlalchemy import create_engine, text
 REPO = Path(__file__).resolve().parent.parent
 SAMPLE = REPO / "tests" / "fixtures" / "mask_sample"
 IMAGE = os.environ.get("MASK_BATCH_GPU_IMAGE", "")
+APP_DIR = os.environ.get("MASK_BATCH_GPU_APP_DIR") or str(REPO / "app")
 PG_IMAGE = "postgres:17-alpine"
 S3_IMAGE = "chrislusf/seaweedfs:4.48"
 KEY, SECRET = "local-key", "local-secret"  # the local S3 server checks no credentials
@@ -80,7 +83,7 @@ def stack() -> Generator[dict[str, str], None, None]:
         while True:
             try:
                 with engine.connect() as conn:
-                    for db in ("media", "media_cpu"):
+                    for db in ("media", "media_cpu", "media_hog"):
                         conn.execute(text(f"CREATE DATABASE {db}"))
                 break
             except Exception:
@@ -88,7 +91,7 @@ def stack() -> Generator[dict[str, str], None, None]:
                     raise
                 time.sleep(0.5)
         engine.dispose()
-        for db in ("media", "media_cpu"):
+        for db in ("media", "media_cpu", "media_hog"):
             subprocess.run(
                 ["alembic", "upgrade", "head"],
                 cwd=REPO,
@@ -105,7 +108,7 @@ def stack() -> Generator[dict[str, str], None, None]:
         deadline = time.monotonic() + 60
         while True:
             try:
-                for bucket in ("raw", "media", "media-cpu"):
+                for bucket in ("raw", "media", "media-cpu", "media-hog"):
                     s3.create_bucket(Bucket=bucket)
                 break
             except Exception:
@@ -162,13 +165,11 @@ def _upload_worklist(stack: dict[str, str], state: Path) -> list[dict[str, Any]]
     return rows
 
 
-def _batch(
-    stack: dict[str, str], state: Path, db: str, bucket: str, *args: str, **env: str
-) -> tuple[int, list[dict[str, Any]]]:
-    full = {
+def _env(stack: dict[str, str], db: str, bucket: str, **env: str) -> dict[str, str]:
+    return {
         **os.environ,
         "MASK_BATCH_IMAGE": IMAGE,
-        "MASK_BATCH_APP_DIR": str(REPO / "app"),
+        "MASK_BATCH_APP_DIR": APP_DIR,
         "MASK_BATCH_NAME": f"mm-maskbatch-run-{uuid.uuid4().hex[:8]}",
         "DATABASE_URL": f"{stack['admin']}/{db}",
         "S3_ENDPOINT_URL": stack["s3"],
@@ -182,6 +183,12 @@ def _batch(
         "RAW_S3_SECRET_KEY": SECRET,
         **env,
     }
+
+
+def _batch(
+    stack: dict[str, str], state: Path, db: str, bucket: str, *args: str, **env: str
+) -> tuple[int, list[dict[str, Any]]]:
+    full = _env(stack, db, bucket, **env)
     done = subprocess.run(
         ["bash", str(REPO / "scripts" / "mask-batch.sh"), str(state), "--worklist",
          "/state/worklist.jsonl", "--no-residential-check", "--busy-windows", "", *args],
@@ -306,3 +313,78 @@ def test_without_a_gpu_auto_falls_back_to_the_cpu_and_cuda_waits(
         path = Path(os.environ["MASK_BATCH_GPU_REPORT"]).with_suffix(".cpu.json")
         path.write_text(json.dumps(chunk, indent=1))
     print(json.dumps(chunk))
+
+
+#: A second GPU consumer standing in for a game: 3000 MiB of the card and a
+#: memset loop at ~100 % utilisation, for HOG_SECONDS.
+HOG = """
+import ctypes, sys, time
+cuda = ctypes.CDLL("libcudart.so.13")
+ptr, size = ctypes.c_void_p(), int(sys.argv[1]) << 20
+assert cuda.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(size)) == 0
+end, n = time.time() + float(sys.argv[2]), 0
+while time.time() < end:
+    cuda.cudaMemset(ptr, n & 0xFF, ctypes.c_size_t(size)); cuda.cudaDeviceSynchronize(); n += 1
+print("iterations", n, flush=True)
+"""
+HOG_MIB, HOG_SECONDS = 3000, 40
+
+
+def test_a_second_gpu_consumer_pauses_the_batch(stack: dict[str, str], tmp_path: Path) -> None:
+    """Ross: pause for gaming. A consumer that starts once the model is held and
+    measured (after the first chunk) pauses the batch; it resumes once it ends."""
+    state = tmp_path / "hog"
+    _upload_worklist(stack, state)
+    hog = f"mm-maskbatch-hog-{uuid.uuid4().hex[:8]}"
+    cmd = ["bash", str(REPO / "scripts" / "mask-batch.sh"), str(state), "--worklist",
+           "/state/worklist.jsonl", "--no-residential-check", "--busy-windows", "",
+           "--chunk-size", "2", "--poll-seconds", "5", "--max-wait-seconds", "900"]  # fmt: skip
+    env = _env(stack, "media_hog", "media-hog", MASK_BATCH_NAME=f"mm-maskbatch-run-{hog[-8:]}")
+    events: list[dict[str, Any]] = []
+    hog_started_at: float | None = None
+    run = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert run.stdout is not None
+        for line in run.stdout:
+            if not line.startswith("{"):
+                continue
+            event = json.loads(line)
+            event["t"] = time.monotonic()
+            events.append(event)
+            if event["event"] == "chunk" and hog_started_at is None:
+                _docker(
+                    "run", "-d", "--rm", "--name", hog, "--gpus", "all", "--entrypoint", "python3",
+                    IMAGE, "-c", HOG, str(HOG_MIB), str(HOG_SECONDS),
+                )  # fmt: skip
+                hog_started_at = time.monotonic()
+        code = run.wait(timeout=1800)
+    finally:
+        if run.poll() is None:
+            run.kill()
+        subprocess.run(["docker", "rm", "-f", "-v", hog], capture_output=True)
+    err = run.stderr.read() if run.stderr else ""
+    paused, resumed = _of(events, "paused"), _of(events, "resumed")
+    report = {
+        "app_dir": APP_DIR,
+        "code": code,
+        "hog_mib": HOG_MIB,
+        "hog_seconds": HOG_SECONDS,
+        "paused": [{k: p[k] for k in ("gate", "detail")} for p in paused],
+        "paused_after_hog_s": [round(p["t"] - (hog_started_at or 0), 1) for p in paused],
+        "resumed": [r["waited_seconds"] for r in resumed],
+        "chunks": [
+            {k: c.get(k) for k in ("chunk", "counts", "seconds_per_image", "held_vram_mib")}
+            for c in _of(events, "chunk")
+        ],  # fmt: skip
+    }
+    if os.environ.get("MASK_BATCH_GPU_REPORT"):
+        Path(os.environ["MASK_BATCH_GPU_REPORT"]).with_suffix(".hog.json").write_text(
+            json.dumps(report, indent=1)
+        )
+    print(json.dumps(report))
+    assert code == 0, err[-3000:]
+    assert hog_started_at is not None
+    assert len(paused) >= 1 and {p["gate"] for p in paused} == {"gpu"}, report
+    assert len(resumed) == len(paused)
+    counts = _of(events, "done")[0]["counts"]
+    assert counts.get("ok", 0) + counts.get("held", 0) == 14 and counts.get("ineligible") == 4
