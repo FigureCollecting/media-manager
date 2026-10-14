@@ -111,8 +111,12 @@ DEFAULT_GPU_FREE_MIN_MIB = 9 * 1024
 DEFAULT_GPU_SETTLE_SECONDS = 2.0
 #: ...and the growth of the card's used memory (MiB) that means another consumer.
 DEFAULT_GPU_GROWTH_MAX_MIB = 512
-#: The most the batch's own model can hold (MiB): both arena caps and ~0.5 GiB
-#: of CUDA context; anything measured beyond it is another consumer's.
+#: The most of the card's growth that counts as the batch's own model (MiB).
+#: Measured on the RTX 4070 Ti: ~9,470 MiB (9.27-9.48 GiB) with BiRefNet plus its
+#: two IS-Net donors loaded. The caps are far higher (BiRefNet 8 GiB + two IS-Net
+#: 2 GiB each = 12 GiB), so this is an empirical bound (8 GiB + 2 GiB + 512 MiB,
+#: ~1.3 GB over the measurement), not the sum of the caps; growth beyond it counts
+#: as another consumer's.
 OWN_MAX_MIB = (
     (BiRefNetMattingBackend.GPU_MEM_LIMIT + IsNetMattingBackend.GPU_MEM_LIMIT) >> 20
 ) + 512
