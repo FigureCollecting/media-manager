@@ -199,13 +199,18 @@ def _of(events: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
 def test_the_bench_set_on_this_gpu(stack: dict[str, str], tmp_path: Path) -> None:
     state = tmp_path / "gpu"
     rows = _upload_worklist(stack, state)
+    # small chunks and a short poll: eight gate checks with the model held
     code, events = _batch(
-        stack, state, "media", "media", "--chunk-size", "6", "--max-wait-seconds", "900"
-    )
+        stack, state, "media", "media", "--chunk-size", "2", "--poll-seconds", "5",
+        "--max-wait-seconds", "900",
+    )  # fmt: skip
     assert code == 0, (state / "run-0.err").read_text()[-3000:]
     chunks = _of(events, "chunk")
-    assert [c["count"] for c in chunks] == [6, 6, 6]
-    assert set(chunks[0]["ranks"]) == {0} and set(chunks[2]["ranks"]) == {9}  # Ross first
+    assert [c["count"] for c in chunks] == [2] * 9
+    assert set(chunks[0]["ranks"]) == {0} and set(chunks[-1]["ranks"]) == {9}  # Ross first
+    # the model's own ~9 GB counts as free: nothing else on the GPU, no pause
+    assert _of(events, "paused") == [], _of(events, "paused")
+    assert all(c["held_vram_mib"] > 4096 for c in chunks)
     assert all(c["provider"] == "CUDAExecutionProvider" for c in chunks)
     assert all(isinstance(c["peak_vram_mib"], int) for c in chunks)
     done = _of(events, "done")[0]
@@ -249,6 +254,9 @@ def test_the_bench_set_on_this_gpu(stack: dict[str, str], tmp_path: Path) -> Non
                     "seconds_per_image",
                     "median_seconds",
                     "mask_seconds_per_image",
+                    "masked",
+                    "seconds_per_masked_image",
+                    "held_vram_mib",
                     "peak_vram_mib",
                     "baseline_vram_mib",
                     "provider",
@@ -285,9 +293,10 @@ def test_without_a_gpu_auto_falls_back_to_the_cpu_and_cuda_waits(
     assert waited == 4
     assert _of(events, "gave_up")[0]["gate"] == "gpu"
     assert _of(events, "chunk") == []
+    # no MASK_BATCH_MEMORY: the wrapper's own CPU default (10g; 8g was OOM-killed)
     code, events = _batch(
         stack, state, "media_cpu", "media-cpu", "--device", "auto", "--cpu-threads", "4",
-        "--limit", "2", "--chunk-size", "2", MASK_BATCH_GPUS="none", MASK_BATCH_MEMORY="10g",
+        "--limit", "2", "--chunk-size", "2", MASK_BATCH_GPUS="none",
     )  # fmt: skip
     assert code == 0, (state / "run-1.err").read_text()[-3000:]
     (chunk,) = _of(events, "chunk")
