@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     # also needs the two IS-Net base donors' ONNX weights.
     matting_isnet_general_path: str | None = None
     matting_isnet_anime_path: str | None = None
+    # Where those sessions run (app.workers.matting.MATTING_DEVICES): "cuda"
+    # requires the CUDA execution provider and refuses a session without it;
+    # "cpu" is an explicit lean CPU session (no CPU arena, no memory pattern);
+    # "auto" asks for CUDA and falls back to that CPU session with a warning.
+    matting_device: Literal["cuda", "auto", "cpu"] = "cuda"
+    # A CPU session's intra-op threads; unset = ONNX Runtime's default.
+    matting_cpu_threads: int | None = None
 
 
 @lru_cache(maxsize=1)

@@ -200,6 +200,16 @@ def test_release_drops_the_session_so_the_next_call_loads_again(fake_ort: _FakeO
     assert len(fake_ort.sessions) == 2
 
 
+def test_release_keeps_an_injected_session() -> None:
+    class _S:
+        def get_providers(self) -> list[str]:
+            return ["CUDAExecutionProvider"]
+
+    backend = BiRefNetMattingBackend(session=_S())
+    backend.release()
+    assert backend.active_provider == "CUDAExecutionProvider"
+
+
 def test_base_keep_releases_and_reports_every_session(fake_ort: _FakeOrt) -> None:
     primary = BiRefNetMattingBackend(model_path="/b.onnx", device="cpu")
     donor = IsNetMattingBackend(model_path="/i.onnx", device="cpu")

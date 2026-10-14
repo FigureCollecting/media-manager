@@ -210,10 +210,11 @@ def test_the_work_list_is_ross_first_then_file_order_each_original_once() -> Non
         "",
         _line(c, 2),
         _line(b, 0),  # b is also one of Ross's: his rank wins
+        _line(c, 9),  # a later, lower-priority copy of c changes nothing
     ]
     items, skipped = mb.parse_worklist(lines)
     assert [(i.blob_sha256, i.rank) for i in items] == [(b, 0), (c, 2), (a, 9)]
-    assert skipped == 4
+    assert skipped == 2  # the psql header and footer; blank lines are not counted
     assert items[0].codec == "identity"
     assert items[0].head_id is None
 
@@ -277,7 +278,10 @@ def test_every_gpu_sample_must_pass() -> None:
         sleep=slept.append,
     )
     assert gate.check().ok is False
-    assert slept == [0.5, 0.5]
+    assert slept == [0.5]  # the second sample already failed: no third
+    calm = mb.GpuGate(query=lambda: "0, 100, 1, 12282", samples=3, interval=0.5, sleep=slept.append)
+    assert calm.check().ok is True
+    assert slept == [0.5, 0.5, 0.5]
 
 
 def test_the_gpu_gate_fails_closed() -> None:
@@ -413,13 +417,18 @@ def test_progress_survives_a_torn_last_line(tmp_path: Path) -> None:
     with path.open("a") as fh:
         fh.write('{"event": "item", "blob_sha256": "b')  # the power went out here
     assert set(progress.load()) == {"a" * 64}
+    progress.append({"event": "item", "blob_sha256": "c" * 64, "status": "ok"})
+    assert set(progress.load()) == {"a" * 64, "c" * 64}  # the torn line swallowed nothing
+    with path.open("a") as fh:
+        fh.write(json.dumps({"event": "item", "blob_sha256": 7}) + "\n")
+    assert set(progress.load()) == {"a" * 64, "c" * 64}
     assert mb.Progress(None).load() == {}
     mb.Progress(None).append({"event": "item"})  # no file: nothing written
 
 
 def test_the_vram_sampler_keeps_the_peak() -> None:
     cmd = [sys.executable, "-c", "print(100); print(250); print('N/A'); print(200)"]
-    with mb.VramSampler(cmd) as sampler:
+    with mb.VramSampler(cmd, grace=10) as sampler:
         pass
     assert sampler.peak_mib == 250
     with mb.VramSampler(None) as none:
@@ -428,6 +437,16 @@ def test_the_vram_sampler_keeps_the_peak() -> None:
     with mb.VramSampler(["/nonexistent/nvidia-smi"]) as missing:
         pass
     assert missing.peak_mib is None
+    forever = [sys.executable, "-c", "import time\nwhile True: time.sleep(1)"]
+    with mb.VramSampler(forever) as endless:  # nvidia-smi -lms never ends by itself
+        pass
+    assert endless.peak_mib is None
+    assert mb.vram_command(1)[0] == "nvidia-smi" and mb.vram_command(1)[-4:] == [
+        "-i",
+        "1",
+        "-lms",
+        "200",
+    ]
 
 
 def test_the_raw_bucket_is_read_only(tmp_path: Path) -> None:
@@ -664,6 +683,65 @@ def test_a_seed_failure_is_one_images_failure(db_session: Session, tmp_path: Pat
     (chunk,) = _events(events, "chunk")
     assert chunk["failures"][0]["reason"].startswith("seed:")
     assert chunk["counts"]["ok"] == 1
+
+
+def test_database_trouble_is_named_per_image(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    first, second = raw.add(1), raw.add(2)
+
+    def lookup_down(*a: object, **k: object) -> str | None:
+        raise ConnectionError("server closed the connection")
+
+    def settle_down(*a: object, **k: object) -> None:
+        raise TimeoutError("statement timeout")
+
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(mb, "original_settled", lookup_down)
+    assert (
+        mb.run_batch([first], mb.BatchConfig(), _runtime(db_session, tmp_path, raw, events=events))
+        == 1
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(mb, "settle_clean_copy", settle_down)
+    assert (
+        mb.run_batch([second], mb.BatchConfig(), _runtime(db_session, tmp_path, raw, events=events))
+        == 1
+    )
+    reasons = [f["reason"] for c in _events(events, "chunk") for f in c["failures"]]
+    assert reasons == ["db:ConnectionError", "settle:TimeoutError"]
+
+
+def test_a_second_capture_of_a_masked_picture_is_already_done(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    first = raw.add(1)
+    # the same pixels, other bytes: a re-save with a text chunk
+    from PIL import PngImagePlugin
+
+    meta = PngImagePlugin.PngInfo()
+    meta.add_text("Comment", "captured again")
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(_photo(1))).save(buf, format="PNG", pnginfo=meta)
+    again = buf.getvalue()
+    sha = hashlib.sha256(again).hexdigest()
+    raw.store.put(f"raw-img/sha256/{sha[:2]}/{sha}.png", again, "image/png")
+    twin = mb.WorkItem(
+        blob_sha256=sha,
+        storage_key=f"raw-img/sha256/{sha[:2]}/{sha}.png",
+        url=ITEM.format(n=1),
+        product_id="p2",
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch([first, twin], mb.BatchConfig(), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ok": 1, "already": 1}
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[sha]
+    assert (record["status"], record["mask_status"]) == ("already", "ok")
+    assert db_session.execute(select(func.count()).select_from(ImageMask)).scalar_one() == 1
 
 
 def test_a_mask_failure_recorded_by_the_lane_counts_as_a_failure(
@@ -956,7 +1034,10 @@ def _worklist_file(tmp_path: Path, items: list[mb.WorkItem]) -> Path:
     return path
 
 
-def test_main_refuses_without_the_residential_address(tmp_path: Path) -> None:
+def test_main_refuses_without_the_residential_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MASK_BATCH_RESIDENTIAL_IP", raising=False)
     wl = _worklist_file(tmp_path, [])
     assert mb.main(["run", "--worklist", str(wl), "--device", "cpu", "--dry-run"]) == 2
 
@@ -1030,6 +1111,58 @@ def test_main_runs_a_sandbox_batch_end_to_end(
     assert mb.main(argv) == 0  # resumed: nothing left
     again = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert next(e for e in again if e["event"] == "start")["pending"] == 0
+
+
+def test_main_reads_originals_from_the_raw_bucket_named_in_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wl = _worklist_file(tmp_path, [])
+    argv = ["--sandbox", str(tmp_path / "sb"), "run", "--worklist", str(wl), "--device", "cpu"]
+    argv += ["--no-residential-check", "--busy-windows", ""]
+    for name in ("RAW_S3_ENDPOINT_URL", "RAW_S3_BUCKET", "RAW_S3_ACCESS_KEY", "RAW_S3_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    assert mb.main(argv) == 2
+    assert "RAW_S3_ENDPOINT_URL" in capsys.readouterr().err
+    monkeypatch.setenv("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("RAW_S3_BUCKET", "raw")
+    monkeypatch.setenv("RAW_S3_ACCESS_KEY", "k")
+    monkeypatch.setenv("RAW_S3_SECRET_KEY", "s")
+    args = mb._parser().parse_args(argv)
+    store = mb._raw_store(args.__class__(**{**vars(args), "raw_dir": None}))
+    assert isinstance(store, mb.ReadOnlyStore)
+    with pytest.raises(PermissionError):
+        store.put("raw-img/x", b"", "image/png")
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Model())
+    assert mb.main(argv) == 0  # an empty work list touches no bucket
+
+
+def test_main_stops_cleanly_on_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import signal
+
+    class _Terminated(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            signal.raise_signal(signal.SIGTERM)  # `docker stop` mid-image
+            return super().predict_alpha(image)
+
+    raw = _Raw(tmp_path / "raw")
+    path = tmp_path / "worklist.jsonl"
+    path.write_text(
+        "##### banner\n" + "".join(json.dumps(raw.add(n).as_row()) + "\n" for n in (1, 2))
+    )
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Terminated())
+    before = signal.getsignal(signal.SIGTERM)
+    argv = ["--sandbox", str(tmp_path / "sb"), "run", "--worklist", str(path), "--raw-dir"]
+    argv += [str(tmp_path / "raw"), "--progress", str(tmp_path / "p.jsonl"), "--device", "cpu"]
+    argv += ["--no-residential-check", "--busy-windows", ""]
+    assert mb.main(argv) == 130
+    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert next(e for e in out if e["event"] == "worklist")["skipped_lines"] == 1
+    assert (
+        next(e for e in out if e["event"] == "chunk")["count"] == 1
+    )  # the image in flight finished
+    assert signal.getsignal(signal.SIGTERM) == before  # handlers put back
 
 
 def test_main_prints_the_sql(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

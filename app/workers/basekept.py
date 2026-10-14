@@ -127,6 +127,20 @@ class BaseKeptMattingBackend(MattingBackend):
         self.primary = primary
         self.donors = list(donors)
 
+    def load(self) -> None:
+        self.primary.load()
+        for donor in self.donors:
+            donor.load()
+
+    def release(self) -> None:
+        self.primary.release()
+        for donor in self.donors:
+            donor.release()
+
+    @property
+    def active_provider(self) -> str | None:
+        return self.primary.active_provider
+
     def predict_alpha(self, image: Image.Image) -> np.ndarray:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
         answers = {f"{n}:{d.name}": d.predict_alpha(rgba) for n, d in enumerate(self.donors)}

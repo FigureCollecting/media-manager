@@ -24,7 +24,9 @@ route depend on. Always work in RGBA.
 from __future__ import annotations
 
 import io
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -34,6 +36,18 @@ from ..hashing import detect_mime
 
 if TYPE_CHECKING:
     from ..config import Settings
+
+logger = logging.getLogger(__name__)
+
+#: Where the ONNX sessions run (``Settings.matting_device``, env MATTING_DEVICE):
+#: ``cuda`` requires the CUDA execution provider and refuses a session without
+#: it; ``cpu`` runs on the CPU provider alone, lean (no CPU arena, no memory
+#: pattern); ``auto`` asks for CUDA and falls back to that lean CPU session.
+MATTING_DEVICES = ("cuda", "auto", "cpu")
+
+#: The CUDA execution provider options every GPU session shares; each model
+#: adds its own arena cap (``GPU_MEM_LIMIT``).
+CUDA_PROVIDER_OPTIONS: dict[str, Any] = {"device_id": 0}
 
 
 class MattingBackend(ABC):
@@ -64,6 +78,22 @@ class MattingBackend(ABC):
         """
         cutout = self.matte(image.convert("RGBA"))
         return np.asarray(cutout.convert("RGBA"))[..., 3].copy()
+
+    def load(self) -> None:
+        """Open every model session now, so a broken runtime is refused before
+        any image is judged. Nothing to open for a backend without a model."""
+        return None
+
+    def release(self) -> None:
+        """Drop every model session this backend opened (frees the GPU memory
+        it held); the next inference opens them again."""
+        return None
+
+    @property
+    def active_provider(self) -> str | None:
+        """The execution provider the (primary) model session runs on, once
+        open; None before, or for a backend without a model."""
+        return None
 
 
 class StubMattingBackend(MattingBackend):
@@ -156,6 +186,12 @@ class BiRefNetMattingBackend(MattingBackend):
 
     name: ClassVar[str] = "birefnet"
     publishes_masks: ClassVar[bool] = True
+    #: The CUDA arena cap (bytes). Measured on the RTX 4070 Ti (12 GB,
+    #: MASK-BATCH-1): unbounded, BiRefNet's arena grows to the whole card and
+    #: the base-keep pass spills into shared memory (~5.5 s per image instead
+    #: of ~0.7 s); a 6 or 7 GiB cap fails (one decoder tensor is 784 MiB);
+    #: 8 GiB runs, with the same masks as unbounded.
+    GPU_MEM_LIMIT: ClassVar[int] = 8 << 30
     #: ImageNet normalization stats used by the model's own preprocessor.
     MEAN = (0.485, 0.456, 0.406)
     STD = (0.229, 0.224, 0.225)
@@ -165,6 +201,8 @@ class BiRefNetMattingBackend(MattingBackend):
         *,
         model_path: str | None = None,
         session: Any | None = None,
+        device: str = "cuda",
+        cpu_threads: int | None = None,
     ) -> None:
         """``model_path`` is the deploy-time ONNX weights path
         (Settings.matting_model_path / env MATTING_MODEL_PATH), only
@@ -172,10 +210,61 @@ class BiRefNetMattingBackend(MattingBackend):
         object duck-typing onnxruntime's ``InferenceSession`` (a
         ``get_inputs()`` returning objects with a ``.name``, and a
         ``run(output_names, input_feed)``) can be injected directly,
-        bypassing onnxruntime and the model path entirely.
+        bypassing onnxruntime and the model path entirely. ``device`` is one
+        of ``MATTING_DEVICES``; ``cpu_threads`` sets a CPU session's
+        intra-op threads (None: ONNX Runtime's default).
         """
+        if device not in MATTING_DEVICES:
+            raise ValueError(f"unknown matting device {device!r}: one of {MATTING_DEVICES}")
         self._model_path = model_path
         self._session = session
+        self.device = device
+        self.cpu_threads = cpu_threads
+
+    def cuda_provider_options(self) -> dict[str, Any]:
+        """This model's CUDA execution provider options."""
+        return {**CUDA_PROVIDER_OPTIONS, "gpu_mem_limit": self.GPU_MEM_LIMIT}
+
+    def load(self) -> None:
+        self._get_session()
+
+    def release(self) -> None:
+        # Only a session this backend opened itself: an injected one has no
+        # weights to reopen it from.
+        if self._model_path:
+            self._session = None
+
+    @property
+    def active_provider(self) -> str | None:
+        get_providers = getattr(self._session, "get_providers", None)
+        if not callable(get_providers):
+            return None
+        providers = get_providers()
+        return str(providers[0]) if providers else None
+
+    def _open(self, factory: Callable[[], Any]) -> Any:
+        try:
+            return factory()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{type(self).__name__} failed to load ONNX weights from "
+                f"{self._model_path!r}: {exc}"
+            ) from exc
+
+    def _cpu_session(self, ort: Any) -> Any:
+        """The lean CPU session: no CPU arena and no memory pattern (the
+        IMG-SERVER-1 bench: BiRefNet peaks at 7.1 GB this way, 13 GB with
+        ONNX Runtime's defaults)."""
+        options = ort.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
+        if self.cpu_threads:
+            options.intra_op_num_threads = self.cpu_threads
+        return self._open(
+            lambda: ort.InferenceSession(
+                self._model_path, sess_options=options, providers=["CPUExecutionProvider"]
+            )
+        )
 
     def _get_session(self) -> Any:
         """Lazily resolve the inference session. Only imports onnxruntime
@@ -198,29 +287,46 @@ class BiRefNetMattingBackend(MattingBackend):
         # application code and tests never need the GPU-only dependency.
         import onnxruntime as ort  # type: ignore[import-not-found]
 
-        try:
-            session = ort.InferenceSession(
-                self._model_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"BiRefNetMattingBackend failed to load ONNX weights from "
-                f"{self._model_path!r}: {exc}"
-            ) from exc
+        if self.device == "cpu":
+            self._session = self._cpu_session(ort)
+            return self._session
 
-        if "CUDAExecutionProvider" not in session.get_providers():
-            # Never silently degrade to CPU: onnxruntime falls back
-            # quietly on a CUDA/cuDNN version mismatch (same hazard class
-            # as ultralytics' cu12/cu13 wheel collisions), which would
-            # make matting orders of magnitude too slow without any error
-            # -- refuse instead so the deploy-time pin gets fixed.
-            raise RuntimeError(
-                "BiRefNetMattingBackend: onnxruntime session loaded "
-                "without CUDAExecutionProvider (silent CPU fallback -- "
-                "check the CUDA/cuDNN pin in Dockerfile.worker matches "
-                "the installed onnxruntime-gpu build)."
+        providers = [
+            ("CUDAExecutionProvider", self.cuda_provider_options()),
+            "CPUExecutionProvider",
+        ]
+
+        def cuda_session() -> Any:
+            return ort.InferenceSession(self._model_path, providers=providers)
+
+        session: Any | None
+        if self.device == "cuda":
+            session = self._open(cuda_session)
+        else:
+            try:
+                session = cuda_session()
+            except Exception:
+                session = None
+
+        if session is None or "CUDAExecutionProvider" not in session.get_providers():
+            if self.device == "cuda":
+                # Never silently degrade to CPU: onnxruntime falls back
+                # quietly on a CUDA/cuDNN version mismatch (same hazard class
+                # as ultralytics' cu12/cu13 wheel collisions), which would
+                # make matting orders of magnitude too slow without any error
+                # -- refuse instead so the deploy-time pin gets fixed.
+                raise RuntimeError(
+                    "BiRefNetMattingBackend: onnxruntime session loaded "
+                    "without CUDAExecutionProvider (silent CPU fallback -- "
+                    "check the CUDA/cuDNN pin in Dockerfile.worker matches "
+                    "the installed onnxruntime-gpu build)."
+                )
+            # device "auto": the fallback is explicit, lean, and said out loud.
+            logger.warning(
+                "matting_cpu_fallback",
+                extra={"backend": type(self).__name__, "model_path": self._model_path},
             )
+            session = self._cpu_session(ort)
 
         self._session = session
         return self._session
@@ -304,6 +410,9 @@ class IsNetMattingBackend(BiRefNetMattingBackend):
     STD = (1.0, 1.0, 1.0)
 
     name: ClassVar[str] = "isnet"
+    #: Measured (MASK-BATCH-1): an IS-Net session runs within a 1 GiB arena;
+    #: 2 GiB leaves room, and adds nothing to the measured peak.
+    GPU_MEM_LIMIT: ClassVar[int] = 2 << 30
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
@@ -344,26 +453,26 @@ def get_matting_backend(name: str | None = None) -> MattingBackend:
         name = getattr(settings, "matting_backend", "stub")
 
     key = (name or "stub").lower()
-    if key == "birefnet_basekept":
+    if key in ("birefnet", "birefnet_basekept"):
+        if settings is None:
+            from ..config import get_settings
+
+            settings = get_settings()
+        placement: dict[str, Any] = {
+            "device": settings.matting_device,
+            "cpu_threads": settings.matting_cpu_threads,
+        }
+        if key == "birefnet":
+            return BiRefNetMattingBackend(model_path=settings.matting_model_path, **placement)
         from .basekept import BaseKeptMattingBackend
 
-        if settings is None:
-            from ..config import get_settings
-
-            settings = get_settings()
         return BaseKeptMattingBackend(
-            primary=BiRefNetMattingBackend(model_path=settings.matting_model_path),
+            primary=BiRefNetMattingBackend(model_path=settings.matting_model_path, **placement),
             donors=[
-                IsNetMattingBackend(model_path=settings.matting_isnet_general_path),
-                IsNetMattingBackend(model_path=settings.matting_isnet_anime_path),
+                IsNetMattingBackend(model_path=settings.matting_isnet_general_path, **placement),
+                IsNetMattingBackend(model_path=settings.matting_isnet_anime_path, **placement),
             ],
         )
-    if key == "birefnet":
-        if settings is None:
-            from ..config import get_settings
-
-            settings = get_settings()
-        return BiRefNetMattingBackend(model_path=getattr(settings, "matting_model_path", None))
 
     backend_cls = _BACKENDS.get(key, StubMattingBackend)
     return backend_cls()
