@@ -533,6 +533,12 @@ def test_a_failed_copy_is_redriven_only_when_asked(db_session: Session, tmp_path
     assert failed is not None and failed.status == "failed"
     assert mask_job.original_settled(db_session, hashlib.sha256(_photo(1)).hexdigest()) == "failed"
     assert (
+        mask_job.original_settled(
+            db_session, hashlib.sha256(_photo(1)).hexdigest(), retry_failed=True
+        )
+        is None
+    )  # a failure re-driven is not settled
+    assert (
         mask_job.settle_clean_copy(db_session, store, obj.sha256, backend=_Model(), batch=batch)
         is None
     )
@@ -624,7 +630,16 @@ def test_a_rerun_is_idempotent_per_image_sha(db_session: Session, tmp_path: Path
     rt2 = _runtime(
         db_session, tmp_path, raw, events=events2, progress=tmp_path / "fresh.jsonl", backend=model
     )
+    reads: list[str] = []
+
+    class _Counting(mb.ReadOnlyStore):
+        def get(self, key: str) -> bytes:
+            reads.append(key)
+            return super().get(key)
+
+    rt2.raw_store = _Counting(raw.store)
     assert mb.run_batch(items, mb.BatchConfig(), rt2) == 0
+    assert reads == []  # a settled original's bytes are not even read
     (chunk,) = _events(events2, "chunk")
     assert chunk["counts"]["already"] == 2 and chunk["count"] == 2
     assert chunk["seconds_per_image"] is None  # nothing was minted
@@ -847,10 +862,10 @@ def test_waiting_longer_than_allowed_gives_up(db_session: Session, tmp_path: Pat
     )
     events: list[dict[str, Any]] = []
     rt = _runtime(db_session, tmp_path, raw, clock=clock, gates=gates, events=events)
-    config = mb.BatchConfig(poll_seconds=60, max_wait_seconds=150)
+    config = mb.BatchConfig(poll_seconds=60, max_wait_seconds=120)
     assert mb.run_batch([raw.add(1)], config, rt) == 4
     assert _events(events, "gave_up")[0]["gate"] == "residential"
-    assert clock.slept == [60, 60, 60]
+    assert clock.slept == [60, 60]  # gives up once it has waited the full 120 s
 
 
 def test_a_chunk_never_starts_in_a_busy_window_and_yields_when_one_begins(
@@ -1030,6 +1045,10 @@ def test_the_ross_worklist_query_carries_only_validated_heads() -> None:
     with pytest.raises(ValueError, match="rank"):
         mb.ross_worklist_sql(
             [json.dumps({"head_id": "11111111-1111-4111-8111-111111111111", "rank": "0); --"})]
+        )
+    with pytest.raises(ValueError, match="rank"):
+        mb.ross_worklist_sql(
+            [json.dumps({"head_id": "11111111-1111-4111-8111-111111111111", "rank": 10})]
         )
     with pytest.raises(ValueError, match="no heads"):
         mb.ross_worklist_sql(["(0 rows)"])

@@ -348,7 +348,6 @@ class ResidentialCheck:
         now = self._clock()
         if self._ok_until is not None and now < self._ok_until:
             return GateResult(True, "residential", "residential address (checked recently)")
-        self._ok_until = None
         try:
             seen = self._fetch().strip()
         except Exception as exc:
