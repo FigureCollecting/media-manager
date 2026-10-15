@@ -385,7 +385,7 @@ def test_an_original_the_spine_has_no_depiction_for_is_an_orphan_not_a_failure(
     a = seed_copy(
         db_session,
         "a",
-        extra_originals=("a2",),
+        extra_originals=("a2", "a3", "a4", "a5"),
         masks=(("mask-v1", "ok", "m"), ("mask-v2", "ok", "n")),
     )
     code, lines = _run(db_session, url, attempts=5)
@@ -397,7 +397,7 @@ def test_an_original_the_spine_has_no_depiction_for_is_an_orphan_not_a_failure(
     assert batch["ReportMask"]["orphan"] == 2
     assert batch["ReportMask"]["unregistered"] == 0 and batch["ReportMask"]["refused"] == {}
     counts = db_session.execute(select(SpineReportRun)).scalar_one().counts
-    assert counts["orphan"] == 2 and counts["ReportMask.orphan"] == 2
+    assert counts["orphan"] == 5 and counts["ReportMask.orphan"] == 2
     assert "ReportMask.unregistered" not in counts
 
 
@@ -1138,3 +1138,34 @@ def test_a_resumed_run_ends_1_for_a_mask_an_earlier_attempt_left_unregistered(
     assert lines[0]["event"] == "resume"
     assert all(b["ReportMask"]["unregistered"] == 0 for b in _batches(lines))
     assert code == rp.EXIT_REFUSED and lines[-1]["exit"] == rp.EXIT_REFUSED
+
+
+def test_a_failed_precondition_on_any_other_call_is_a_refusal_not_an_orphan(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=())
+    fake.depict(a["origin"])
+    fake.fail("ReportDerivative", C.FAILED_PRECONDITION)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    batch = _batches(lines)[0]
+    assert batch["ReportDerivative"]["refused"] == {"FAILED_PRECONDITION": 1}
+    assert batch["orphans"] == [] and batch["ReportMask"]["orphan"] == 0
+
+
+@pytest.mark.parametrize(
+    ("counts", "failed"),
+    [
+        ({}, False),
+        ({"ReportMask.ok": 3, "orphan": 2, "ReportMask.orphan": 1, "leased": 4}, False),
+        ({"ReportDerivative.refused.INVALID_ARGUMENT": 0, "ReportMask.unregistered": 0}, False),
+        ({"WithdrawMask.refused.NOT_FOUND": 1}, True),
+        ({"local.refused.mask_object": 1}, True),
+        ({"ReportMask.unregistered": 2}, True),
+    ],
+)
+def test_the_exit_reads_failures_from_the_persisted_counts(
+    counts: dict[str, int], failed: bool
+) -> None:
+    assert rp._failed(counts) is failed
