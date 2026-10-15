@@ -377,17 +377,49 @@ def test_a_withdrawal_is_recorded_before_it_is_sent_and_a_restore_follows_it(
     assert _total(lines, "RestoreMask", "calls") == 1
 
 
-def test_a_mask_whose_derivative_the_spine_lacks_is_counted_not_retried(
+def test_an_original_the_spine_has_no_depiction_for_is_an_orphan_not_a_failure(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
     fake, url = spine
-    seed_copy(db_session, "a")  # the spine never captured its original
+    # the spine never captured either original: nothing to lease, nothing registered
+    a = seed_copy(
+        db_session,
+        "a",
+        extra_originals=("a2",),
+        masks=(("mask-v1", "ok", "m"), ("mask-v2", "ok", "n")),
+    )
     code, lines = _run(db_session, url, attempts=5)
-    assert code == rp.EXIT_REFUSED  # a mask that never landed is not a clean run
-    assert lines[-1]["exit"] == rp.EXIT_REFUSED
-    assert len(fake.sent("ReportMask")) == 1
+    assert code == rp.EXIT_DONE  # expected (ruling 10-15): counted, never exit 1
+    assert lines[-1]["exit"] == rp.EXIT_DONE
+    assert len(fake.sent("ReportMask")) == 2  # not retried
     batch = _batches(lines)[0]
-    assert batch["ReportMask"]["unregistered"] == 1 and batch["ReportMask"]["refused"] == {}
+    assert batch["orphans"] == sorted([a["origin"], *a["others"]])  # the blobs, once each
+    assert batch["ReportMask"]["orphan"] == 2
+    assert batch["ReportMask"]["unregistered"] == 0 and batch["ReportMask"]["refused"] == {}
+    counts = db_session.execute(select(SpineReportRun)).scalar_one().counts
+    assert counts["orphan"] == 2 and counts["ReportMask.orphan"] == 2
+    assert "ReportMask.unregistered" not in counts
+
+
+def test_a_mask_whose_landed_derivative_the_spine_still_lacks_is_unregistered_exit_1(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    b = seed_copy(db_session, "b")
+    fake.depict(a["origin"])
+    fake.depict(b["origin"])
+    fake.fail("ReportMask", C.FAILED_PRECONDITION, C.FAILED_PRECONDITION)  # the first mask's
+    code, lines = _run(db_session, url, attempts=2)
+    assert code == rp.EXIT_REFUSED  # this run reported the derivative: a mask never landed
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    assert run.status == "done"  # counted, the run went on
+    batch = _batches(lines)[0]
+    assert batch["ReportMask"]["unregistered"] == 1 and batch["ReportMask"]["orphan"] == 0
+    assert batch["orphans"] == [] and batch["ReportMask"]["ok"] == 1
+    assert len(fake.sent("ReportMask")) == 3  # the first retried once, the second sent
+    first_copy = min(a["clean"], b["clean"])  # copies are reported in sha order
+    assert fake.sent("ReportMask")[0].derivative_sha256 == bytes.fromhex(first_copy)
 
 
 def test_a_mask_whose_derivative_landed_is_retried_on_failed_precondition(
@@ -746,10 +778,12 @@ def test_a_pod_killed_in_a_later_lease_round_has_that_rounds_hold_committed(
         db_session.rollback()  # what the killed pod had not committed is gone
         run = db_session.execute(select(SpineReportRun)).scalar_one()
         assert run.resume_not_before is not None
-        assert rp._aware(run.resume_not_before) == T0 + dt.timedelta(seconds=145)
+        # round 2 leased at T0+80: 60 s of hold, 5 s of margin, and the call's
+        # own worst case (one attempt of a 10 s deadline)
+        assert rp._aware(run.resume_not_before) == T0 + dt.timedelta(seconds=155)
         code, lines = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60)
     assert code == rp.EXIT_DONE
-    assert lines[0]["wait_seconds"] == 65.0
+    assert lines[0]["wait_seconds"] == 75.0
     assert {fake.depictions[p]["state"] for p in pids} == {"derived"}
 
 
@@ -932,3 +966,175 @@ def test_a_repeated_warning_is_counted_every_time_and_quoted_once(
         batch["warnings_sample"].count("local: dominant_color off the contract spelling: dropped")
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# close-out 3: a hold taken inside one lease call's retries; the exit read
+# from the persisted ledger; an orphan original
+# ---------------------------------------------------------------------------
+
+
+class _SlowLeaseSpine(LapsingSpine):
+    """The first lease attempt is slow: ``slow_seconds`` pass on the clock,
+    the rows are held from then, and the client's deadline has passed
+    (DEADLINE_EXCEEDED). Later attempts answer."""
+
+    def __init__(self, clock: Clock, slow_seconds: float) -> None:
+        super().__init__(clock)
+        self.slow = [slow_seconds]
+
+    def LeasePendingImages(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
+        if self.slow:
+            self.clock.now += dt.timedelta(seconds=self.slow.pop())
+            self.hold_then_fail.append(C.DEADLINE_EXCEEDED)
+        return super().LeasePendingImages(request, context)
+
+
+def _run_production_policy(db: Session, url: str, clock: Clock) -> tuple[int, list[dict[str, Any]]]:
+    lines: list[dict[str, Any]] = []
+    code = rp.run_replay(
+        db,
+        rp.ReplayConfig(lease_seconds=60),
+        connect=lambda: SpineMediaClient(
+            open_channel(url), policy=RetryPolicy(), sleep=clock.sleep
+        ),
+        emit=lines.append,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    return code, lines
+
+
+@pytest.mark.parametrize("slow", [10.0, 30.0])
+def test_a_rerun_waits_out_a_hold_a_slow_attempt_took_inside_one_lease_call(
+    db_session: Session, slow: float
+) -> None:
+    clock = Clock()
+    fake = _SlowLeaseSpine(clock, slow)
+    a = seed_copy(db_session, "a", masks=())
+    pids = [fake.depict(a["origin"]) for _ in range(2)]
+    with serve(fake) as url:
+        code, lines = _run_production_policy(db_session, url, clock)
+        assert code == rp.EXIT_STOPPED
+        assert _batches(lines)[0]["lease_failed_attempts"] == 1
+        run = db_session.execute(select(SpineReportRun)).scalar_one()
+        held_until = rp._aware(run.resume_not_before)
+        code, lines = _run_production_policy(db_session, url, clock)
+    assert code == rp.EXIT_DONE
+    assert {fake.depictions[p]["state"] for p in pids} == {"derived"}
+    # the slow attempt holds until T0+slow+60; the call ended at T0+slow+0.5
+    assert held_until == T0 + dt.timedelta(seconds=slow + 0.5 + 65)
+
+
+def test_a_pod_killed_inside_a_lease_call_leaves_a_hold_covering_all_its_retries(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock, fake, _ = _three_depictions_of_one_original(db_session, monkeypatch)
+    with serve(fake) as url:
+
+        def connect() -> SpineMediaClient:
+            return _KilledAtLease(
+                open_channel(url), kill_at=1, policy=RetryPolicy(), sleep=lambda s: None
+            )
+
+        with pytest.raises(_PodKilled):
+            rp.run_replay(
+                db_session,
+                rp.ReplayConfig(lease_seconds=60),
+                connect=connect,
+                emit=lambda line: None,
+                now=clock,
+                sleep=clock.sleep,
+            )
+        db_session.rollback()
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    # 60 s of hold and 5 of margin, after 5 attempts of 10 s and 0.5+1+2+4 s of backoff
+    assert rp._aware(run.resume_not_before) == T0 + dt.timedelta(seconds=122.5)
+
+
+def test_after_a_clean_lease_call_the_hold_is_counted_from_its_answer(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=())
+    fake.depict(a["origin"])
+    fake.fail("ReportDerivative", C.UNIMPLEMENTED)  # the run stops after the lease
+    code, _ = _run(db_session, url, attempts=2)
+    assert code == rp.EXIT_STOPPED
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    # the call has ended, so its retries no longer count: the default 120 s + 5
+    assert rp._aware(run.resume_not_before) == T0 + dt.timedelta(
+        seconds=rp.DEFAULT_LEASE_SECONDS + rp.LEASE_MARGIN_SECONDS
+    )
+
+
+def test_a_failed_attempt_in_an_early_full_round_still_stops_the_batch(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    fake = LapsingSpine(clock)
+    a = seed_copy(db_session, "a", masks=())
+    pids = [fake.depict(a["origin"]) for _ in range(5)]
+    monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 2)
+    fake.hold_then_fail.append(C.UNAVAILABLE)  # round 1, attempt 1: holds 2, answer lost
+    with serve(fake) as url:
+        code, lines = _run(db_session, url, clock=clock, attempts=2, lease_seconds=60)
+    assert code == rp.EXIT_STOPPED
+    assert sorted(fake.depictions[p]["state"] for p in pids) == [
+        "captured",
+        "captured",
+        "derived",
+        "derived",
+        "derived",
+    ]
+    assert _batches(lines)[0]["lease_failed_attempts"] == 1
+
+
+def _two_batches(db: Session, fake: FakeSpine, *, masked_first: bool) -> list[dict[str, Any]]:
+    copies = sorted(
+        (
+            seed_copy(db, "a", masks=(("mask-v1", "ok", "m"),) if masked_first else ()),
+            seed_copy(db, "b", masks=()),
+        ),
+        key=lambda c: c["origin"],
+    )
+    if masked_first and copies[0]["origin"] != sha("orig:a"):
+        pytest.fail("the fixture expects orig:a to sort first")
+    for c in copies:
+        fake.depict(c["origin"])
+    return copies
+
+
+def test_a_resumed_run_ends_1_for_a_refusal_its_earlier_attempt_counted(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    _two_batches(db_session, fake, masked_first=False)
+    fake.fail("ReportDerivative", C.INVALID_ARGUMENT)  # batch 0's derivative: refused
+    fake.fail("LeasePendingImages", None, C.UNAVAILABLE)  # batch 1's lease: down
+    clock = Clock()
+    code, lines = _run(db_session, url, clock=clock, attempts=1, batch_size=1)
+    assert code == rp.EXIT_STOPPED
+    assert _batches(lines)[0]["ReportDerivative"]["refused"] == {"INVALID_ARGUMENT": 1}
+    code, lines = _run(db_session, url, clock=clock, attempts=1, batch_size=1)
+    assert lines[0]["event"] == "resume"
+    assert [b["batch"] for b in _batches(lines)] == [0, 1]  # batch 1 of the plan, and the tail
+    assert all(b["ReportDerivative"]["refused"] == {} for b in _batches(lines))
+    assert code == rp.EXIT_REFUSED and lines[-1]["exit"] == rp.EXIT_REFUSED
+
+
+def test_a_resumed_run_ends_1_for_a_mask_an_earlier_attempt_left_unregistered(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    _two_batches(db_session, fake, masked_first=True)
+    fake.fail("ReportMask", C.FAILED_PRECONDITION, C.FAILED_PRECONDITION)
+    fake.fail("LeasePendingImages", None, C.UNAVAILABLE, C.UNAVAILABLE)  # batch 1's lease
+    clock = Clock()
+    code, lines = _run(db_session, url, clock=clock, attempts=2, batch_size=1)
+    assert code == rp.EXIT_STOPPED
+    assert _batches(lines)[0]["ReportMask"]["unregistered"] == 1
+    code, lines = _run(db_session, url, clock=clock, attempts=2, batch_size=1)
+    assert lines[0]["event"] == "resume"
+    assert all(b["ReportMask"]["unregistered"] == 0 for b in _batches(lines))
+    assert code == rp.EXIT_REFUSED and lines[-1]["exit"] == rp.EXIT_REFUSED

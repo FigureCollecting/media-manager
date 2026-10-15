@@ -315,3 +315,16 @@ def test_the_channel_leaves_retrying_to_the_client(monkeypatch: pytest.MonkeyPat
         "target": "ingest-server.fc.svc.cluster.local:50063",
         "options": [("grpc.enable_retries", 0)],
     }
+
+
+def test_a_calls_worst_case_is_every_attempt_at_its_deadline_and_every_backoff() -> None:
+    channel = grpc.insecure_channel("127.0.0.1:1")
+    try:
+        default = mc.SpineMediaClient(channel, deadline_seconds=10, policy=mc.RetryPolicy())
+        assert default.worst_case_seconds == 5 * 10 + (0.5 + 1 + 2 + 4)
+        capped = mc.SpineMediaClient(channel, deadline_seconds=3, policy=mc.RetryPolicy(7))
+        assert capped.worst_case_seconds == 7 * 3 + (0.5 + 1 + 2 + 4 + 8 + 8)
+        once = mc.SpineMediaClient(channel, deadline_seconds=2.5, policy=mc.RetryPolicy(1))
+        assert once.worst_case_seconds == 2.5
+    finally:
+        channel.close()
