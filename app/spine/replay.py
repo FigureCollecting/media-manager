@@ -734,6 +734,8 @@ def _open_ledger(
     if running is not None:
         running.status, running.finished_at = "abandoned", now
     run = SpineReportRun(status="running", counts={}, batch_size=config.batch_size, started_at=now)
+    if running is not None:
+        run.resume_not_before = running.resume_not_before  # its holds still bind
     db.add(run)
     db.commit()
     return run, False
@@ -778,7 +780,7 @@ def run_replay(
     else:
         ledger, resumed = _open_ledger(db, config, started)
         cursor = ledger.cursor_sha256
-        if resumed:
+        if resumed or ledger.resume_not_before is not None:
             wait = 0.0
             if ledger.resume_not_before is not None:
                 wait = (_aware(ledger.resume_not_before) - started).total_seconds()
