@@ -401,6 +401,44 @@ def test_a_copy_of_unknown_width_lands_and_so_does_its_mask(
     assert all(i.get("mask", {}).get("url") == mask_url for i in spine["images_of"](world["pA"]))
 
 
+def test_originals_the_spine_has_no_live_depiction_for_are_orphans_not_failures(
+    spine: dict[str, Any], world: dict[str, Any]
+) -> None:
+    db, pg, site = world["db"], spine["pg"], world["site"]
+    run = site.removeprefix("mmreport-")
+    never = seed_copy(db, f"{run}-N", masks=(("mask-v1", "ok", f"{run}-mN"),))
+    stamped = seed_copy(db, f"{run}-T", masks=(("mask-v1", "ok", f"{run}-mT"),))
+    # T's only depiction carries a takedown stamp: the spine never leases it
+    pid = _q(pg, "INSERT INTO product (name_en) VALUES (%s) RETURNING id", f"{site} T")[0][0]
+    _q(
+        pg,
+        "INSERT INTO raw.blob (sha256, bytes, storage_key) VALUES (decode(%s, 'hex'), 2048, %s) "
+        "ON CONFLICT (sha256) DO NOTHING",
+        stamped["origin"],
+        f"raw-img/sha256/{stamped['origin'][:2]}/{stamped['origin']}.jpg",
+    )
+    _q(
+        pg,
+        "INSERT INTO product_image (product_id, source_id, blob_sha256, role, position, "
+        "first_seen_at, last_seen_at, suppressed_at) VALUES (%s, (SELECT id FROM source "
+        "WHERE site = %s), decode(%s, 'hex'), 'gallery', 0, now(), now(), now())",
+        pid,
+        site,
+        stamped["origin"],
+    )
+    code, lines = _replay(db, spine["url"])
+    assert code == rp.EXIT_DONE, lines
+    batches = [line for line in lines if line["event"] == "batch"]
+    assert sorted(o for b in batches for o in b["orphans"]) == sorted(
+        [never["origin"], stamped["origin"]]
+    )
+    assert _sum(lines, "ReportMask", "orphan") == 2
+    assert _sum(lines, "ReportMask", "unregistered") == 0
+    assert all(b["ReportMask"]["refused"] == {} for b in batches)
+    assert any("FAILED_PRECONDITION" in w for b in batches for w in b["warnings_sample"])
+    assert _sum(lines, "ReportMask", "stored") >= 1  # A's mask still lands
+
+
 def test_a_caller_without_a_mesh_identity_is_refused_and_the_run_stops(
     spine: dict[str, Any], world: dict[str, Any]
 ) -> None:
