@@ -164,6 +164,12 @@ class SpineMediaClient:
         self._policy = policy or RetryPolicy()
         self._sleep = sleep
 
+    @property
+    def worst_case_seconds(self) -> float:
+        """The longest one call can take: every attempt at its deadline, and
+        every backoff between them."""
+        return self._policy.max_attempts * self._deadline + sum(self._policy.delays())
+
     def _call(self, rpc: str, request: Any, *, derivative_landed: bool = False) -> tuple[Any, int]:
         method = getattr(self._stub, rpc)
         delays = self._policy.delays()

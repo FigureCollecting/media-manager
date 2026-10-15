@@ -29,6 +29,12 @@ PER BATCH of at most 200 originals, in sha order:
      (thumbhash, dominant colour; a grounding only for a transparent copy).
   3. ReportMask for each published mask row of the copies whose LAST
      original is in this batch (so their derivatives have been reported).
+     FAILED_PRECONDITION (no derivative registered for the copy): when this
+     run reported that derivative it is retried, and if it persists the mask
+     is ``unregistered`` (exit 1); when no original of the copy had a
+     depiction to lease (the spine never captured it, or it is suppressed)
+     it is an ``orphan``: expected, counted, the originals named in the
+     batch line, never a failure.
   4. A restore (WithdrawMask restore=true) for each published mask whose
      withdrawal this replay once sent (``spine_mask_withdrawals``).
   5. WithdrawMask for each withdrawn mask, recorded in
@@ -40,17 +46,21 @@ IDEMPOTENT AND RESUMABLE. Every call is retry-safe by contract, so a rerun
 stores nothing new. The run ledger is ``spine_report_runs``: the cursor is
 the last original of the last finished batch. Before EVERY lease call
 (each round of a batch), ``resume_not_before`` is set and committed to when
-that lease's hold will have lapsed (the lease seconds asked for, plus a
-margin); it is cleared when the batch finishes. A run that stops mid-batch -- a fatal status, a spine that stays
-down, a lease with a failed attempt (which may hold rows a retry cannot see),
-or a killed pod -- leaves it set, and the rerun waits for it before it
+that call's hold will have lapsed, whichever attempt inside it takes it: the
+lease seconds asked for, a margin, and the call's worst case (every attempt
+at its deadline and every backoff). Once the call has answered or failed it
+is set again, from that instant. It is cleared when the batch finishes. A run
+that stops mid-batch -- a fatal status, a spine that stays down, a lease with
+a failed attempt (which may hold rows a retry cannot see), or a killed pod --
+leaves it set, and the rerun waits for it before it
 leases that batch again: a held depiction is invisible to a lease, and
 reading that as "nothing pending" would skip it.
 
 Exit status: 0 done; 1 done, but not everything landed (a spine refusal, a
-value the field rule would not send, a mask with no public object, or a mask
-whose derivative the spine never registered -- FAILED_PRECONDITION at the
-end); 3 stopped, resumable (rerun); 2 is the CLI's (bad arguments).
+value the field rule would not send, a mask with no public object, or an
+``unregistered`` mask); 3 stopped, resumable (rerun); 2 is the CLI's (bad
+arguments). Exit 1 is read from the run's PERSISTED counts, so a resumed run
+reports what an earlier attempt of it could not land. Orphans never make it 1.
 """
 
 from __future__ import annotations
@@ -132,7 +142,17 @@ class Plan:
     #: every copy with a mask row (live or not)
     masked: set[str] = field(default_factory=set)
     #: copy -> published mask bytes with no ``mask`` public object (never sent)
-    orphans: dict[str, list[str]] = field(default_factory=dict)
+    objectless: dict[str, list[str]] = field(default_factory=dict)
+    _originals: dict[str, list[str]] | None = field(default=None, init=False, repr=False)
+
+    def originals_of(self, copy: str) -> list[str]:
+        """The planned originals whose depictions report ``copy``."""
+        if self._originals is None:
+            inverse: dict[str, list[str]] = {}
+            for origin, mapped in self.copy_of.items():
+                inverse.setdefault(mapped, []).append(origin)
+            self._originals = inverse
+        return self._originals.get(copy, [])
 
     def reports_for(self, copy: str) -> list[msg.MaskRecord]:
         return self.reports.get(copy, [])
@@ -255,7 +275,7 @@ def load_plan(db: Session) -> Plan:
         if row.status == "ok" and row.source_sha256 in live:
             mask_obj = mask_objects.get(row.mask_sha256)
             if mask_obj is None:
-                plan.orphans.setdefault(row.source_sha256, []).append(row.mask_sha256)
+                plan.objectless.setdefault(row.source_sha256, []).append(row.mask_sha256)
                 continue
             plan.reports.setdefault(row.source_sha256, []).append(
                 msg.MaskRecord(
@@ -362,6 +382,10 @@ class _BatchReport:
     )
     states: Counter[str] = field(default_factory=Counter)
     unregistered: int = 0
+    #: masks the spine would not take because no original of their copy had
+    #: a depiction to lease, and those originals
+    orphan_masks: int = 0
+    orphans: set[str] = field(default_factory=set)
     local_refused: Counter[str] = field(default_factory=Counter)
     local_warnings: int = 0
     quoted: list[str] = field(default_factory=list)
@@ -370,11 +394,6 @@ class _BatchReport:
         for text in texts:
             if len(self.quoted) < WARNINGS_QUOTED and text not in self.quoted:
                 self.quoted.append(text)
-
-    def refusals(self) -> int:
-        return sum(sum(c["refused"].values()) for c in self.rpc.values()) + sum(
-            self.local_refused.values()
-        )
 
     def line(self, run_id: int | None) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -390,12 +409,14 @@ class _BatchReport:
             "lease_rounds": self.lease_rounds,
             "lease_failed_attempts": self.lease_failed_attempts,
             "local": {"refused": dict(self.local_refused), "warnings": self.local_warnings},
+            "orphans": sorted(self.orphans),
             "warnings_sample": self.quoted,
         }
         for rpc, c in self.rpc.items():
             out[rpc] = {**c, "refused": dict(c["refused"])}
         out["ReportDerivative"]["states"] = dict(self.states)
         out["ReportMask"]["unregistered"] = self.unregistered
+        out["ReportMask"]["orphan"] = self.orphan_masks
         return out
 
     def flat(self) -> Counter[str]:
@@ -410,6 +431,8 @@ class _BatchReport:
         for name, n in self.local_refused.items():
             flat[f"local.refused.{name}"] += n
         flat["ReportMask.unregistered"] += self.unregistered
+        flat["ReportMask.orphan"] += self.orphan_masks
+        flat["orphan"] += len(self.orphans)
         flat["leased"] += self.leased
         flat["unrequested"] += self.unrequested
         flat["local.warnings"] += self.local_warnings
@@ -437,31 +460,47 @@ class _Run:
         report: _BatchReport,
         rpc: str,
         call: Callable[[], Any],
+        *,
+        copy: str | None = None,
     ) -> Any | None:
+        """``copy``: the clean copy a ReportMask is for."""
         counts = report.rpc[rpc]
         counts["calls"] += 1
         try:
             ack = call()
         except SpineCallError as exc:
-            if exc.verdict is Verdict.REFUSED:
-                if rpc == "ReportMask" and exc.code is grpc.StatusCode.FAILED_PRECONDITION:
-                    report.unregistered += 1
-                else:
-                    counts["refused"][exc.code.name] += 1
-                report.warn([f"{rpc} {exc.code.name}: {exc.details[:200]}"])
-                return None
-            raise _Stop(str(exc)) from exc
+            if copy is not None and exc.code is grpc.StatusCode.FAILED_PRECONDITION:
+                self._unlanded(report, copy)
+            elif exc.verdict is Verdict.REFUSED:
+                counts["refused"][exc.code.name] += 1
+            else:
+                raise _Stop(str(exc)) from exc
+            report.warn([f"{rpc} {exc.code.name}: {exc.details[:200]}"])
+            return None
         counts["ok"] += 1
         counts["warnings"] += len(ack.warnings)
         report.warn(f"{rpc}: {w}" for w in ack.warnings)
         return ack
 
+    def _unlanded(self, report: _BatchReport, copy: str) -> None:
+        """A mask the spine would not take: it has no derivative registered
+        for ``copy`` (FAILED_PRECONDITION). This run reported that derivative
+        (the call was retried): the mask never landed, ``unregistered``,
+        exit 1. Otherwise no original of the copy had a depiction to lease --
+        the spine never captured it, or it is suppressed -- and that is
+        expected: an ``orphan``, its originals named in the batch line."""
+        if copy in self.landed:
+            report.unregistered += 1
+        else:
+            report.orphan_masks += 1
+            report.orphans.update(self.plan.originals_of(copy))
+
     def _local(self, report: _BatchReport, exc: FieldRefused) -> None:
         report.local_refused[exc.field] += 1
         report.warn([f"not sent: {exc}"])
 
-    def _orphans(self, report: _BatchReport, copy: str) -> None:
-        for sha in self.plan.orphans.get(copy, []):
+    def _objectless(self, report: _BatchReport, copy: str) -> None:
+        for sha in self.plan.objectless.get(copy, []):
             self._local(report, FieldRefused("mask_object", f"{sha} has no public object"))
 
     def _local_warnings(self, report: _BatchReport, warnings: list[str]) -> None:
@@ -469,6 +508,15 @@ class _Run:
         report.warn(f"local: {w}" for w in warnings)
 
     # ----- the steps ----------------------------------------------------------
+
+    def _hold(self, *, call_seconds: float = 0.0) -> None:
+        """Set, and commit, when a lease taken now (or within ``call_seconds``)
+        has lapsed: a rerun waits for it."""
+        assert self.ledger is not None
+        self.ledger.resume_not_before = self.now() + dt.timedelta(
+            seconds=call_seconds + self.config.lease_seconds + LEASE_MARGIN_SECONDS
+        )
+        self.db.commit()
 
     def _lease_and_report(self, report: _BatchReport) -> bool:
         """Steps 1-2. Returns False when a lease attempt failed (the batch
@@ -478,12 +526,11 @@ class _Run:
         wanted = {bytes.fromhex(o): o for o in report.batch.origins}
         clean = True
         for _ in range(MAX_LEASE_ROUNDS):
-            # Every round holds rows of its own: a rerun must wait out the
-            # LAST round's hold, so it is set, and committed, before each call.
-            self.ledger.resume_not_before = self.now() + dt.timedelta(
-                seconds=self.config.lease_seconds + LEASE_MARGIN_SECONDS
-            )
-            self.db.commit()
+            # Every round holds rows of its own, and so may every attempt
+            # inside its call: a rerun must wait out the LAST hold. Before the
+            # call, the hold covers the call's worst case (a pod killed during
+            # it); once it has answered or failed, it runs from that instant.
+            self._hold(call_seconds=self.client.worst_case_seconds)
             try:
                 out = self.client.lease(
                     list(wanted),
@@ -492,8 +539,10 @@ class _Run:
                     lease_seconds=self.config.lease_seconds,
                 )
             except SpineCallError as exc:
+                self._hold()
                 report.lease_failed_attempts += exc.attempts
                 raise _Stop(f"lease: {exc}") from exc
+            self._hold()
             report.lease_rounds += 1
             report.lease_failed_attempts += out.failed_attempts
             clean = clean and out.failed_attempts == 0
@@ -543,7 +592,7 @@ class _Run:
     def _report_masks(self, report: _BatchReport, copy: str) -> None:
         assert self.client is not None
         client = self.client
-        self._orphans(report, copy)
+        self._objectless(report, copy)
         for mask in self.plan.reports_for(copy):
             try:
                 built = msg.mask_report(mask)
@@ -556,6 +605,7 @@ class _Run:
                 report,
                 "ReportMask",
                 partial(client.report_mask, built.message, derivative_landed=landed),
+                copy=copy,
             )
             if ack is not None:
                 report.rpc["ReportMask"]["stored"] += ack.stored
@@ -651,7 +701,7 @@ class _Run:
                     per="each pending depiction of the origin",
                 )
         for copy in batch.copies_due:
-            self._orphans(report, copy)
+            self._objectless(report, copy)
             for mask in self.plan.reports_for(copy):
                 would(
                     "ReportMask",
@@ -687,6 +737,16 @@ def _open_ledger(
     db.add(run)
     db.commit()
     return run, False
+
+
+def _failed(counts: dict[str, int]) -> bool:
+    """Whether the run's PERSISTED counts -- every attempt of it, a resumed
+    one included -- hold something that did not land: a refusal, the spine's
+    or a local one, or an unregistered mask. An orphan is not a failure."""
+    return any(
+        n > 0 and (".refused." in key or key == "ReportMask.unregistered")
+        for key, n in counts.items()
+    )
 
 
 def _aware(value: dt.datetime) -> dt.datetime:
@@ -756,14 +816,12 @@ def run_replay(
             "cursor": cursor,
         }
     )
-    refused = 0
     for batch in batches:
         if config.dry_run:
             emit(run.plan_only(batch).line(None))
             continue
         assert ledger is not None
         report, stop = run.batch(batch)
-        refused += report.refusals() + report.unregistered
         ledger.counts = dict(Counter(ledger.counts) + report.flat())
         emit(report.line(ledger.id))
         if stop is not None:
@@ -774,7 +832,7 @@ def run_replay(
             ledger.cursor_sha256 = batch.origins[-1]
         ledger.resume_not_before = None
         db.commit()
-    code = EXIT_REFUSED if refused else EXIT_DONE
+    code = EXIT_REFUSED if ledger is not None and _failed(ledger.counts) else EXIT_DONE
     if ledger is not None:
         ledger.status, ledger.finished_at = "done", now()
         db.commit()
