@@ -232,3 +232,8 @@ def test_the_mime_lists_are_the_contracts() -> None:
 def test_a_whole_number_fraction_keeps_its_decimal_point() -> None:
     assert fr.decimal_text(1e16) == "10000000000000000.0"
     assert fr.decimal_text(1e40) is None  # over 32 characters
+
+
+def test_a_fraction_of_exactly_32_characters_is_sent_and_one_more_is_not() -> None:
+    assert fr.decimal_text(1.2345678901234567e-14) == "0.000000000000012345678901234567"
+    assert fr.decimal_text(1.2345678901234568e-15) is None  # 33 characters

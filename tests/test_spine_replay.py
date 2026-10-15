@@ -786,6 +786,7 @@ def test_the_mask_carries_its_masked_appearance_and_the_copy_its_plain_one(
     mask_obj = db_session.get(PublicObject, a["masks"][0])
     assert mask_obj is not None
     mask_obj.created_at = AT + dt.timedelta(minutes=2)  # neither the row's created nor updated
+    mask_obj.mime = "image/webp"  # the object's own type, never assumed
     db_session.commit()
     code, _ = _run(db_session, url)
     assert code == rp.EXIT_DONE
@@ -798,7 +799,7 @@ def test_the_mask_carries_its_masked_appearance_and_the_copy_its_plain_one(
     assert mask.thumbhash == base64.b64decode("CQgHBgUEAwIBAA==")
     assert mask.dominant_color == "#445566"
     assert mask.generated_at == "2026-10-14T09:02:00.000000Z"  # the mask object's instant
-    assert mask.mime == "image/png"
+    assert mask.mime == "image/webp"
 
 
 def test_a_transparent_copy_is_reported_with_its_own_grounding(
