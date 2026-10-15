@@ -20,6 +20,8 @@ from .media_v1 import media_pb2
 M = TypeVar("M")
 
 #: DerivativeReport.width / height: a value outside this range is unknown.
+#: A DERIVED report must carry both, so such a value is sent as 0, which the
+#: spine ABSORBS (stored as unknown, warned) rather than refusing the report.
 _DIMENSION = range(1, 2**31)
 
 
@@ -77,10 +79,12 @@ def derivative_report(
         generated_at=fr.identity("generated_at", fr.instant(copy.generated_at)),
         outcome=media_pb2.DERIVE_OUTCOME_DERIVED,
     )
-    if copy.width in _DIMENSION:
-        message.width = copy.width
-    if copy.height in _DIMENSION:
-        message.height = copy.height
+    for name in ("width", "height"):
+        value = getattr(copy, name)
+        if value not in _DIMENSION:
+            warnings.append(f"{name} {value} outside 1..{_DIMENSION[-1]}: sent as 0 (unknown)")
+            value = 0
+        setattr(message, name, value)
     thumb, why = fr.thumbhash(copy.thumbhash)
     warnings += why
     if thumb is not None:

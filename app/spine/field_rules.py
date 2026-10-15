@@ -62,7 +62,6 @@ _HALF_OPEN = (
 
 _SHA_HEX = re.compile(r"[0-9a-f]{64}")
 _COLOR = re.compile(r"#[0-9a-f]{6}")
-_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
@@ -168,14 +167,15 @@ def thumbhash(value: str | None) -> tuple[bytes | None, list[str]]:
 
 def decimal_text(value: float | None) -> str | None:
     """A measured fraction as the contract's decimal text ("0.0125"): the
-    float's shortest round-trip digits, never an exponent. None when it has
-    no such spelling (absent, negative, NaN, infinite, over 32 characters)."""
+    float's shortest round-trip digits, never an exponent or a sign (-0.0 is
+    zero, "0.0"). None when it has no such spelling (absent, negative, NaN,
+    infinite, over 32 characters)."""
     if value is None or not math.isfinite(value) or value < 0:
         return None
-    text = format(Decimal(repr(float(value))), "f")
+    text = format(Decimal(repr(abs(float(value)))), "f")
     if "." not in text:
         text += ".0"
-    if len(text) > DECIMAL_MAX_CHARS or not _DECIMAL.fullmatch(text):
+    if len(text) > DECIMAL_MAX_CHARS:
         return None
     return text
 

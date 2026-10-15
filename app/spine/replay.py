@@ -11,14 +11,19 @@ origin serves them: PUBLISHED when some ``ok`` row of a live copy carries
 them; otherwise WITHDRAWN -- a ``withdrawn`` row with its reason and instant,
 or an ``ok`` row of a dead copy (reason ``deleted``, as
 app.publication.mask_refusal says). ``held`` and other rows are never sent.
+A published row whose mask bytes have no ``mask`` public object is never
+reported (the origin would answer 404 for it): it is refused locally by name
+(``mask_object``).
 Store eligibility is NOT re-judged here: run ``masks reevaluate --apply``
 first, as for the origin.
 
 PER BATCH of at most 200 originals, in sha order:
   1. LeasePendingImages{origin_sha256: the batch}, repeated until the batch's
      pending depictions are drained. Every returned origin_sha256 is checked
-     against the batch: anything else (a server before 0.10.0 ignores the
-     filter) is left alone to lapse, and leasing stops.
+     against the batch. Anything else means the spine is not honouring the
+     filter (a server before 0.10.0 ignores it): a DEPLOYMENT FAULT. The
+     batch's own depictions in that answer are reported, the strays are left
+     to lapse, and the run STOPS (exit 3) rather than walk the shared queue.
   2. ReportDerivative for each depiction: the clean copy, its mime and size,
      the clean pipeline's version, its instant, and its own appearance
      (thumbhash, dominant colour; a grounding only for a transparent copy).
@@ -33,18 +38,19 @@ withdrawals only.
 
 IDEMPOTENT AND RESUMABLE. Every call is retry-safe by contract, so a rerun
 stores nothing new. The run ledger is ``spine_report_runs``: the cursor is
-the last original of the last finished batch. Before each lease,
-``resume_not_before`` is set to when the lease's hold will have lapsed (the
-lease seconds asked for, plus a margin); it is cleared when the batch
-finishes. A run that stops mid-batch -- a fatal status, a spine that stays
+the last original of the last finished batch. Before EVERY lease call
+(each round of a batch), ``resume_not_before`` is set and committed to when
+that lease's hold will have lapsed (the lease seconds asked for, plus a
+margin); it is cleared when the batch finishes. A run that stops mid-batch -- a fatal status, a spine that stays
 down, a lease with a failed attempt (which may hold rows a retry cannot see),
 or a killed pod -- leaves it set, and the rerun waits for it before it
 leases that batch again: a held depiction is invisible to a lease, and
 reading that as "nothing pending" would skip it.
 
-Exit status: 0 done; 1 done, with calls refused (a spine refusal, or a value
-the field rule would not send); 3 stopped, resumable (rerun); 2 is the
-CLI's (bad arguments).
+Exit status: 0 done; 1 done, but not everything landed (a spine refusal, a
+value the field rule would not send, a mask with no public object, or a mask
+whose derivative the spine never registered -- FAILED_PRECONDITION at the
+end); 3 stopped, resumable (rerun); 2 is the CLI's (bad arguments).
 """
 
 from __future__ import annotations
@@ -125,6 +131,8 @@ class Plan:
     withdrawals: dict[str, list[Withdrawal]] = field(default_factory=dict)
     #: every copy with a mask row (live or not)
     masked: set[str] = field(default_factory=set)
+    #: copy -> published mask bytes with no ``mask`` public object (never sent)
+    orphans: dict[str, list[str]] = field(default_factory=dict)
 
     def reports_for(self, copy: str) -> list[msg.MaskRecord]:
         return self.reports.get(copy, [])
@@ -240,13 +248,16 @@ def load_plan(db: Session) -> Plan:
         plan.masked.add(row.source_sha256)
         if row.status == "ok" and row.source_sha256 in live:
             mask_obj = mask_objects.get(row.mask_sha256)
+            if mask_obj is None:
+                plan.orphans.setdefault(row.source_sha256, []).append(row.mask_sha256)
+                continue
             plan.reports.setdefault(row.source_sha256, []).append(
                 msg.MaskRecord(
                     clean_sha256=row.source_sha256,
                     pipeline_version=row.pipeline_version,
                     mask_sha256=row.mask_sha256,
-                    mime=mask_obj.mime if mask_obj else "image/png",
-                    generated_at=mask_obj.created_at if mask_obj else row.created_at,
+                    mime=mask_obj.mime,
+                    generated_at=mask_obj.created_at,
                     grounding={name: getattr(row, name) for name in GROUNDING_FIELDS},
                     thumbhash=row.masked_thumbhash,
                     dominant_color=row.masked_dominant_color,
@@ -443,6 +454,10 @@ class _Run:
         report.local_refused[exc.field] += 1
         report.warn([f"not sent: {exc}"])
 
+    def _orphans(self, report: _BatchReport, copy: str) -> None:
+        for sha in self.plan.orphans.get(copy, []):
+            self._local(report, FieldRefused("mask_object", f"{sha} has no public object"))
+
     def _local_warnings(self, report: _BatchReport, warnings: list[str]) -> None:
         report.local_warnings += len(warnings)
         report.warn(f"local: {w}" for w in warnings)
@@ -453,9 +468,16 @@ class _Run:
         """Steps 1-2. Returns False when a lease attempt failed (the batch
         may have rows held that no lease can see until they lapse)."""
         assert self.client is not None
+        assert self.ledger is not None
         wanted = {bytes.fromhex(o): o for o in report.batch.origins}
         clean = True
         for _ in range(MAX_LEASE_ROUNDS):
+            # Every round holds rows of its own: a rerun must wait out the
+            # LAST round's hold, so it is set, and committed, before each call.
+            self.ledger.resume_not_before = self.now() + dt.timedelta(
+                seconds=self.config.lease_seconds + LEASE_MARGIN_SECONDS
+            )
+            self.db.commit()
             try:
                 out = self.client.lease(
                     list(wanted),
@@ -475,13 +497,18 @@ class _Run:
             report.leased += len(images)
             mine = [i for i in images if i.origin_sha256 in wanted]
             stray = len(images) - len(mine)
-            if stray:
-                report.unrequested += stray
-                report.warn([f"lease returned {stray} depiction(s) not requested: left to lapse"])
+            report.unrequested += stray
             report.matched += len(mine)
             for image in mine:
                 self._report_derivative(report, image.product_image_id, wanted[image.origin_sha256])
-            if stray or len(images) < LEASE_MAX_ITEMS:
+            if stray:
+                raise _Stop(
+                    f"lease: the spine returned {stray} depiction(s) of originals not "
+                    "requested, so it is not honouring origin_sha256 (a server before "
+                    "0.10.0?): a deployment fault. They were left to lapse; rerun once "
+                    "the spine honours the filter"
+                )
+            if len(images) < LEASE_MAX_ITEMS:
                 return clean
         report.warn([f"lease still returning after {MAX_LEASE_ROUNDS} rounds"])
         return False
@@ -510,6 +537,7 @@ class _Run:
     def _report_masks(self, report: _BatchReport, copy: str) -> None:
         assert self.client is not None
         client = self.client
+        self._orphans(report, copy)
         for mask in self.plan.reports_for(copy):
             try:
                 built = msg.mask_report(mask)
@@ -580,12 +608,6 @@ class _Run:
         clean = True
         try:
             if batch.origins:
-                assert self.ledger is not None
-                lapse = self.now() + dt.timedelta(
-                    seconds=self.config.lease_seconds + LEASE_MARGIN_SECONDS
-                )
-                self.ledger.resume_not_before = lapse
-                self.db.commit()
                 clean = self._lease_and_report(report)
             for copy in batch.copies_due:
                 self._report_masks(report, copy)
@@ -623,6 +645,7 @@ class _Run:
                     per="each pending depiction of the origin",
                 )
         for copy in batch.copies_due:
+            self._orphans(report, copy)
             for mask in self.plan.reports_for(copy):
                 would(
                     "ReportMask",
@@ -734,7 +757,7 @@ def run_replay(
             continue
         assert ledger is not None
         report, stop = run.batch(batch)
-        refused += report.refusals()
+        refused += report.refusals() + report.unregistered
         ledger.counts = dict(Counter(ledger.counts) + report.flat())
         emit(report.line(ledger.id))
         if stop is not None:

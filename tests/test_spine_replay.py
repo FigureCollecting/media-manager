@@ -336,7 +336,7 @@ def test_restart_closes_an_open_run_and_starts_over(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
     _, url = spine
-    seed_copy(db_session, "a")
+    seed_copy(db_session, "a", masks=())
     open_run = SpineReportRun(
         status="running", cursor_sha256="f" * 64, counts={}, batch_size=200, started_at=AT
     )
@@ -566,8 +566,10 @@ def test_one_mask_shared_by_two_copies_is_withdrawn_and_restored_once(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
     fake, url = spine
-    seed_copy(db_session, "a", masks=(("mask-v1", "withdrawn", "shared"),))
-    seed_copy(db_session, "b", masks=(("mask-v1", "withdrawn", "shared"),))
+    for tag in ("a", "b"):
+        fake.depict(
+            seed_copy(db_session, tag, masks=(("mask-v1", "withdrawn", "shared"),))["origin"]
+        )
     code, _ = _run(db_session, url)
     assert code == rp.EXIT_DONE
     assert len(fake.sent("WithdrawMask")) == 1
@@ -614,7 +616,7 @@ def test_a_resumed_run_with_no_hold_left_does_not_wait(
     db_session: Session, spine: tuple[FakeSpine, str], pause: float | None
 ) -> None:
     _, url = spine
-    seed_copy(db_session, "a")
+    seed_copy(db_session, "a", masks=())
     clock = Clock()
     resume = None if pause is None else T0 + dt.timedelta(seconds=pause)
     db_session.add(
