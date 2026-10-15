@@ -1,3 +1,14 @@
+# media.v1 stubs (MM-REPORT-1): generated from the vendored, sha-256-pinned
+# proto in a throwaway stage, so grpcio-tools never ships in the image.
+FROM python:3.12-slim AS spine-stubs
+WORKDIR /src
+RUN pip install --no-cache-dir grpcio-tools==1.84.0
+COPY proto /src/proto
+COPY app/__init__.py /src/app/__init__.py
+COPY app/spine /src/app/spine
+COPY scripts/gen_spine_stubs.py /src/scripts/gen_spine_stubs.py
+RUN python scripts/gen_spine_stubs.py /src
+
 FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -19,6 +30,7 @@ RUN pip install --no-cache-dir poetry==1.8.3 && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY app /app/app
+COPY --from=spine-stubs /src/app/spine/media_v1/ /app/app/spine/media_v1/
 COPY alembic.ini /app/
 COPY migrations /app/migrations
 
