@@ -90,6 +90,9 @@ MAX_LEASE_ROUNDS = 50
 LEASE_MARGIN_SECONDS = 5
 #: Warnings quoted per batch line (all are counted).
 WARNINGS_QUOTED = 5
+#: The reason sent for a withdrawn row that records none: the spine refuses
+#: a withdrawal without one, and the withdrawal must still reach it.
+NO_REASON = "withdrawn (no reason recorded)"
 
 GROUNDING_FIELDS = tuple(f.name for f in AlphaGrounding.__dataclass_fields__.values())
 
@@ -251,7 +254,7 @@ def load_plan(db: Session) -> Plan:
             )
         elif row.mask_sha256 not in published:
             if row.status == "withdrawn":
-                withdrawn = Withdrawal(row.mask_sha256, row.reason, row.updated_at)
+                withdrawn = Withdrawal(row.mask_sha256, row.reason or NO_REASON, row.updated_at)
             else:
                 withdrawn = Withdrawal(row.mask_sha256, "deleted", None)
             plan.withdrawals.setdefault(row.source_sha256, []).append(withdrawn)

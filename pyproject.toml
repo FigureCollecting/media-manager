@@ -61,6 +61,10 @@ strict_equality = true
 plugins = []
 exclude = ["migrations/", "alembic.ini"]
 
+[tool.coverage.run]
+# Generated in the build from the pinned proto (scripts/gen_spine_stubs.py).
+omit = ["app/spine/media_v1/media_pb2*"]
+
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
