@@ -438,6 +438,52 @@ class ImageMask(Base):
     )
 
 
+class SpineReportRun(Base):
+    """One run of the media.v1 replay (``python -m app.cli.mask_report``),
+    the ledger that makes it resumable. ``cursor_sha256`` is the last
+    original of the last batch that finished; a rerun resumes after it.
+    ``resume_not_before`` is set before every lease and cleared when its
+    batch finishes: a run that stopped mid-batch may still hold that batch's
+    depictions on the spine, so its rerun waits for the hold to lapse rather
+    than lease nothing and move on. Dry runs are never stored."""
+
+    __tablename__ = "spine_report_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    cursor_sha256: Mapped[str | None] = mapped_column(String(64))
+    resume_not_before: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('running','done','abandoned')", name="ck_spine_report_run_status"
+        ),
+    )
+
+
+class SpineMaskWithdrawal(Base):
+    """A mask withdrawal the replay has sent to the spine (recorded BEFORE
+    the call, so a crash can only over-record). When the mask's bytes are
+    published again in media-manager, the replay sends the spine a restore
+    and deletes the row: WithdrawMask carries a state, and this is how a
+    replay knows the spine may hold the old one."""
+
+    __tablename__ = "spine_mask_withdrawals"
+
+    mask_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    withdrawn_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sent_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+
 # Useful indexes
 Index("ix_image_versions_image_id_visibility", ImageVersion.image_id, ImageVersion.visibility)
 Index("ix_album_title_trgm", Album.title)

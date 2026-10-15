@@ -202,6 +202,7 @@ def seed_copy(
             created_at=AT,
         )
     )
+    db.flush()
     db.add(PublicObjectImage(sha256=clean, image_id=image.id))
     others = []
     for extra in extra_originals:

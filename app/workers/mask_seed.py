@@ -29,6 +29,13 @@ from .mask_policy import ImageOrigin
 
 PUBLIC_KINDS = ("sanitized", "matted", "mask")
 
+#: The pipeline that makes ``make_clean_copy``'s clean copies, as the
+#: media.v1 replay reports it (DerivativeReport.pipeline_version). Bump it
+#: when the encoding changes: the spine keeps a new version's derivative
+#: beside the old one (app.spine.replay). The full sanitize contract (I8)
+#: will report under its own version.
+CLEAN_PIPELINE_VERSION = "mm-seed-clean-v1"
+
 
 def _picture(original: bytes) -> Image.Image:
     """The pixels ``original`` shows -- EXIF orientation baked in, RGBA when
