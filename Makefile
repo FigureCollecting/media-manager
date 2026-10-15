@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 export PYTHONWARNINGS=ignore
 
-.PHONY: dev-up dev-down db-upgrade logs test token
+.PHONY: dev-up dev-down db-upgrade logs stubs test token
 
 dev-up:
 	docker compose up -d --build
@@ -16,7 +16,10 @@ db-upgrade:
 logs:
 	docker compose logs -f --tail=200 api worker
 
-test:
+stubs:
+	poetry run python scripts/gen_spine_stubs.py
+
+test: stubs
 	poetry run pytest -q
 
 token:
