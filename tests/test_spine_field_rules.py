@@ -225,3 +225,8 @@ def test_the_mime_lists_are_the_contracts() -> None:
         fr.mask_mime("image/jpeg")  # no alpha, so never a mask
     with pytest.raises(fr.FieldRefused, match="mime"):
         fr.derivative_mime("image/gif")
+
+
+def test_a_whole_number_fraction_keeps_its_decimal_point() -> None:
+    assert fr.decimal_text(1e16) == "10000000000000000.0"
+    assert fr.decimal_text(1e40) is None  # over 32 characters

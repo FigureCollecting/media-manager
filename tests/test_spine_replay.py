@@ -457,3 +457,163 @@ def test_config_is_checked_before_anything_runs(db_session: Session) -> None:
     for bad in ({"batch_size": 201}, {"lease_seconds": 0}, {"lease_seconds": 3601}):
         with pytest.raises(ValueError):
             rp.ReplayConfig(**bad)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# edges
+# ---------------------------------------------------------------------------
+
+
+def test_a_withdrawn_row_with_no_reason_is_withdrawn_with_a_stated_one(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    seed_copy(db_session, "a", masks=(("mask-v1", "withdrawn", "ma"),))
+    row = db_session.execute(select(ImageMask)).scalar_one()
+    row.reason = None
+    db_session.commit()
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    assert [w.reason for w in fake.sent("WithdrawMask")] == [rp.NO_REASON]
+    assert _batches(lines)[0]["local"]["refused"] == {}
+
+
+def test_a_copy_with_no_mask_rows_is_reported_without_an_appearance(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=())
+    fake.depict(a["origin"])
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    sent = fake.sent("ReportDerivative")[0]
+    assert not sent.HasField("thumbhash") and not sent.HasField("dominant_color")
+
+
+def test_a_lease_the_mesh_refuses_stops_the_run(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    seed_copy(db_session, "a")
+    fake.fail("LeasePendingImages", C.PERMISSION_DENIED)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_STOPPED
+    assert lines[-1]["why"].startswith("lease: LeasePendingImages PERMISSION_DENIED")
+    assert _batches(lines)[0]["lease_failed_attempts"] == 1
+
+
+def test_a_lease_that_never_drains_stops_the_run(
+    db_session: Session, spine: tuple[FakeSpine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    for _ in range(3):
+        fake.depict(a["origin"])
+    monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 1)
+    monkeypatch.setattr(rp, "MAX_LEASE_ROUNDS", 2)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_STOPPED
+    batch = _batches(lines)[0]
+    assert batch["lease_rounds"] == 2 and batch["matched"] == 2
+    assert any("after 2 rounds" in w for w in batch["warnings_sample"])
+
+
+def test_a_copy_the_field_rule_will_not_send_is_refused_locally(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    from app.models import PublicObject
+
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=())
+    db_session.get(PublicObject, a["clean"]).mime = "image/gif"  # type: ignore[union-attr]
+    db_session.commit()
+    fake.depict(a["origin"])
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    assert fake.sent("ReportDerivative") == []
+    assert _batches(lines)[0]["local"]["refused"] == {"mime": 1}
+
+
+def test_a_withdrawn_mask_with_unsendable_bytes_is_refused_locally(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    seed_copy(db_session, "a", masks=(("mask-v1", "withdrawn", "ma"),))
+    row = db_session.execute(select(ImageMask)).scalar_one()
+    row.mask_sha256 = row.mask_sha256.upper()  # type: ignore[union-attr]
+    db_session.commit()
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    assert fake.sent("WithdrawMask") == []
+    assert _batches(lines)[0]["local"]["refused"] == {"mask_sha256": 1}
+
+
+def test_one_mask_shared_by_two_copies_is_withdrawn_and_restored_once(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    seed_copy(db_session, "a", masks=(("mask-v1", "withdrawn", "shared"),))
+    seed_copy(db_session, "b", masks=(("mask-v1", "withdrawn", "shared"),))
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    assert len(fake.sent("WithdrawMask")) == 1
+    for row in db_session.execute(select(ImageMask)).scalars():
+        row.status, row.reason = "ok", None
+    db_session.commit()
+    fake.calls.clear()
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    assert [w.restore for w in fake.sent("WithdrawMask")] == [True]
+
+
+def test_refused_withdrawals_and_restores_are_counted_and_kept(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=(("mask-v1", "withdrawn", "ma"),))
+    fake.fail("WithdrawMask", C.INVALID_ARGUMENT)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    assert _batches(lines)[0]["WithdrawMask"]["refused"] == {"INVALID_ARGUMENT": 1}
+    row = db_session.execute(select(ImageMask)).scalar_one()
+    row.status, row.reason = "ok", None
+    db_session.commit()
+    fake.fail("WithdrawMask", C.INVALID_ARGUMENT)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    assert sum(b["RestoreMask"]["refused"].get("INVALID_ARGUMENT", 0) for b in _batches(lines)) == 1
+    # the restore is still owed: the ledger keeps the withdrawal
+    assert db_session.get(SpineMaskWithdrawal, a["masks"][0]) is not None
+
+
+def test_a_dry_run_lists_a_restore_it_owes(db_session: Session) -> None:
+    a = seed_copy(db_session, "a")
+    db_session.add(SpineMaskWithdrawal(mask_sha256=a["masks"][0], reason="r", withdrawn_at=AT))
+    db_session.commit()
+    _, lines = _run(db_session, None, dry_run=True)
+    restores = [x for x in lines if x.get("rpc") == "WithdrawMask" and x.get("restore")]
+    assert [r["mask_sha256"] for r in restores] == [a["masks"][0]]
+
+
+@pytest.mark.parametrize("pause", [None, -30.0])
+def test_a_resumed_run_with_no_hold_left_does_not_wait(
+    db_session: Session, spine: tuple[FakeSpine, str], pause: float | None
+) -> None:
+    _, url = spine
+    seed_copy(db_session, "a")
+    clock = Clock()
+    resume = None if pause is None else T0 + dt.timedelta(seconds=pause)
+    db_session.add(
+        SpineReportRun(
+            status="running",
+            counts={},
+            batch_size=200,
+            started_at=AT,
+            resume_not_before=resume,
+        )
+    )
+    db_session.commit()
+    code, lines = _run(db_session, url, clock=clock)
+    assert code == rp.EXIT_DONE
+    assert clock.slept == []
+    assert lines[0] == {"event": "resume", "run": 1, "cursor": None, "wait_seconds": 0.0}

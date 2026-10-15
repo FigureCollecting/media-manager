@@ -167,3 +167,10 @@ def test_a_long_withdrawal_reason_is_cut_and_warned() -> None:
     built = msg.withdrawal(MASK, reason="r" * 80, withdrawn_at=AT)
     assert built.message.reason == "r" * 64
     assert built.warnings == ["reason: cut to 64 characters"]
+
+
+def test_an_unmeasured_masked_appearance_is_sent_absent() -> None:
+    built = msg.mask_report(_mask(thumbhash=None, dominant_color=None))
+    assert not built.message.HasField("thumbhash")
+    assert not built.message.HasField("dominant_color")
+    assert built.warnings == []

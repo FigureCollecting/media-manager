@@ -93,3 +93,16 @@ def test_an_unknown_option_is_refused(capsys: pytest.CaptureFixture[str]) -> Non
     with pytest.raises(SystemExit) as caught:
         cli.main(["--dry"])  # no abbreviations
     assert caught.value.code == 2
+
+
+def test_without_a_sandbox_the_configured_database_is_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.db
+
+    sandbox, _ = _sandbox(tmp_path, "a")
+    engine = create_engine(f"sqlite:///{Path(sandbox) / 'masks.db'}")
+    monkeypatch.setattr(app.db, "SessionLocal", lambda: Session(engine, expire_on_commit=False))
+    assert cli.main(["--dry-run"]) == 0
+    assert _lines(capsys.readouterr().out)[0]["originals"] == 1
+    engine.dispose()
