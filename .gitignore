@@ -33,6 +33,8 @@ poetry.lock
 data/
 uploads/
 media/
+# ...but not the vendored media.v1 contract (MM-REPORT-1)
+!/proto/media/
 
 # Test artifacts
 *.db
@@ -41,3 +43,7 @@ test_debug*.db
 # Serena
 .serena/
 
+
+# media.v1 stubs, generated in the build (scripts/gen_spine_stubs.py)
+app/spine/media_v1/media_pb2*.py
+app/spine/media_v1/media_pb2*.pyi

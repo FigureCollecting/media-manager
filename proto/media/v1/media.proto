@@ -1,0 +1,746 @@
+// ============================================================================
+// media.v1 — the wire contract between the fc-aggregation spine and the
+// derivative pipeline that sanitizes captured originals.
+//
+// One consumer-facing service, SpineMedia, with four RPCs:
+//   LeasePendingImages(...) -> pending originals to sanitize
+//   ReportDerivative(...)   -> one sanitized derivative, registered
+//   ReportMask(...)         -> one published alpha mask over a derivative
+//   WithdrawMask(...)       -> a mask withdrawn, or restored
+// The two mask RPCs arrived in 0.10.0.
+//
+// WHY A SEPARATE PACKAGE, AND NOT A THIRD RPC ON SpineIngest. The caller here
+// is not a producer of observations; it is a WORKER that consumes the spine's
+// queue. It runs in its own namespace under its own mesh identity, and the
+// estate's zero-trust pattern is one listener per caller class — which is what
+// lets the mesh authorize this worker WITHOUT also granting it the ingest or
+// the read surface. A package is the grain that authorization can name.
+//
+// THIS FILE IMPORTS NOTHING, deliberately. Consumers vendor `proto/` and
+// generate in their own CI rather than depending on a published stub, so the
+// media worker must be able to vendor ONE file. An import of ingest.v1 would
+// drag the entire producer surface into a repo that produces nothing.
+//
+// SAME FIDELITY DOCTRINE as ingest.v1 and read.v1, with no exception: every
+// instant is a RAW STRING TOKEN (never google.protobuf.Timestamp), every
+// content address is raw BYTES (never a hex spelling), no payload is a Struct,
+// and no float appears anywhere: a fraction is DECIMAL TEXT (Grounding,
+// 0.10.0).
+//
+// THE FIELD RULE (0.10.0). Every field a caller sends says, in its own
+// comment, whether a bad value is REFUSED or ABSORBED:
+//   * REFUSED -> INVALID_ARGUMENT (or the status the field names), nothing
+//     written. An IDENTITY string (a key, a vocabulary value, a version, an
+//     instant the server keys on) is REFUSED when it is empty where required,
+//     carries a NUL (U+0000), or is over 256 bytes of UTF-8. It is never
+//     repaired: a NUL stripped or a tail cut off would make it name something
+//     else.
+//   * ABSORBED -> the call proceeds, and the answer carries a warning for each
+//     repair. FREE TEXT (a reason, a label for an operator) has its NUL
+//     characters removed and is cut to its stated bound at a character
+//     boundary.
+//   * A DATA-SHAPED PROBLEM IS NEVER INTERNAL. INTERNAL and UNAVAILABLE say
+//     the spine failed, and a worker retries them; a value the spine cannot
+//     store is the request's fault, so it is answered by one of the two rules
+//     above, before anything is written.
+//
+// THE PULL DIRECTION IS THE POINT. The spine does not push work at this
+// worker. A push would put a deploy-gated service on the ingest write path, so
+// a media outage would become an ingest outage; and the worker reading the
+// spine's tables directly would couple a second service to spine internals.
+// A bounded pull over this contract is the only shape that leaves ingest
+// running when the worker is down, suspended, or not deployed at all.
+// ============================================================================
+
+syntax = "proto3";
+
+package media.v1;
+
+// ---------------------------------------------------------------------------
+// PendingImage — one captured original awaiting its derivative.
+//
+// WHAT THE WORKER IS TOLD: where the bytes are, what they hash to, and the
+// coordinates that let the spine correlate the answer. That is the whole job.
+//
+// WHAT THE WORKER IS NOT TOLD, and why it matters more than what it is:
+// the source's DERIVATION-RIGHTS STATE is deliberately absent. Sanitization is
+// UNCONDITIONAL and rights-blind by doctrine — the safety re-render happens to
+// every captured original whatever its terms say, and the rights gate governs
+// DISPLAY only, at row construction on the read surface. Handing this worker
+// the rights verdict would give it something to branch on, in the one place
+// the gate must not live; the first such branch would move the gate here by
+// accident and nobody would notice, because the result would look right.
+// The suppression state is absent for the same reason.
+// ---------------------------------------------------------------------------
+message PendingImage {
+  // The depiction row's uuid. THIS is the correlation key the report comes
+  // back on — not the sha, because one object can be depicted by many items
+  // and a report must name which depiction it settled.
+  string product_image_id = 1;
+
+  // sha-256 of the ORIGINAL bytes, raw. The worker MUST verify the bytes it
+  // fetched hash to this BEFORE it decodes them: the store is content
+  // addressed, so a mismatch means it is holding something other than what the
+  // spine recorded, and a decoder is the wrong place to discover that.
+  bytes origin_sha256 = 2;
+
+  // The raw-store object key, under the `sha256-v1` scheme. The worker asserts
+  // the scheme rather than trusting the string, and it holds a READ-ONLY
+  // credential for that bucket — it can never write back over an original.
+  string storage_key = 3;
+
+  // Which site observed the bytes. Provenance the derivative carries forward;
+  // NOT a rights input.
+  string source_site = 4;
+
+  // Contract role vocabulary: 'gallery' | 'other' | 'thumbnail' | 'user' |
+  // 'unknown'.
+  string role = 5;
+
+  // Position within the gallery, 0-based. ABSENT means the metadata was shed —
+  // a different fact from position zero, which is why this carries explicit
+  // presence.
+  optional uint32 position = 6;
+
+  // 'manufacturer_press' | 'retailer_studio' | 'user_photo' | 'unknown',
+  // absent when the source offers no signal to classify by. Carried so the
+  // derivative records what it was made from, never so the worker can decide
+  // what to make.
+  optional string source_class = 7;
+
+  // 'general' | 'intermediate' | 'explicit' | 'controversial' | 'nsfw' |
+  // 'nsfw+' | 'unknown' — the ingest.v1 vocabulary verbatim, where the last
+  // three are UNPLACEABLE on the ladder and gate as the most restrictive
+  // value. ABSENT means the source has no content-level concept at all, NOT
+  // that this item could not be classified; that case is 'unknown'.
+  //
+  // Carried for provenance ONLY: this worker does not gate on it, has no
+  // ceiling to compare it against, and must not acquire one. Sanitization is
+  // unconditional at every level, and the ceiling is applied where the rows
+  // are built for a caller. A worker that ever branches on this value has
+  // moved the gate into the one place the doctrine says it must not live.
+  optional string content_level = 8;
+}
+
+// ---------------------------------------------------------------------------
+// LeasePendingImagesRequest — ask for a bounded batch of work.
+// ---------------------------------------------------------------------------
+message LeasePendingImagesRequest {
+  // How many rows the worker wants. 0 = the server's default, currently 50,
+  // CAPPED AT 200. Both CLAMP silently rather than reject, because a batch
+  // size is a statement about the worker's own buffer, not an assertion about
+  // the data — read the batch you were handed, never assume you got the size
+  // you asked for.
+  // ABSORBED, silently: every value is served, clamped as above.
+  uint32 max_items = 1;
+
+  // WHO is asking: a pod name, a run id, anything stable enough for an
+  // operator to ask "which run is sitting on these?". RECORDED, NEVER
+  // ENFORCED — it is not a credential and the mesh already established
+  // identity. A report is accepted whatever this said, and whoever sent it.
+  // ABSORBED: NUL characters removed and the value cut to 256 bytes of UTF-8,
+  // each warned on the response (0.10.0). It is a label, never an identity,
+  // so it is never refused.
+  string lease_owner = 2;
+
+  // How long the worker expects to need, in seconds. 0 = the server's default,
+  // currently 300, CAPPED AT 3600; both clamp. It is a HINT about how long to
+  // hold the rows back from another caller, never a lock the worker can extend
+  // by asking for more.
+  // ABSORBED, silently: every value is served, clamped as above.
+  uint32 lease_seconds = 3;
+
+  // There is deliberately NO caller clock here, though every other instant in
+  // these contracts is caller-supplied. That rule exists so the spine never
+  // fabricates an OBSERVATION's time. A lease expiry is not an observation, it
+  // is a lock, and a lock whose expiry the holder supplies is a lock the
+  // holder can hold forever. The lease clock is the SERVER's, by design, and
+  // this is the only place in the estate's contracts where that is true.
+
+  // ONLY THESE ORIGINALS (0.10.0). Empty = no filter: the lease walks the
+  // pending queue oldest first, exactly as before. Non-empty = the lease
+  // returns only pending depictions whose origin_sha256 is one of these,
+  // still oldest first, still bounded by max_items, and held like any other
+  // lease. It exists for a REPLAY client that has already minted derivatives
+  // for known originals and needs their depiction ids to report them, which
+  // it could otherwise find only by leasing, and holding, the whole queue.
+  //
+  // A sha with no pending depiction contributes nothing and is not an error:
+  // its depictions may be derived already, or not captured yet. One original
+  // depicted by several items yields one PendingImage per depiction.
+  //
+  // REFUSED: more than 200 entries, or an entry that is not exactly 32 bytes
+  // -> INVALID_ARGUMENT, nothing leased. A filter is an assertion about the
+  // data, not a statement about the caller's buffer, so it is refused rather
+  // than clamped. ABSORBED: a repeated entry counts once, warned.
+  //
+  // A server built before 0.10.0 does not know this field and IGNORES it,
+  // leasing unfiltered. So a replay client must check every returned
+  // origin_sha256 against its list and report only the matches; the rest it
+  // leaves alone, and their holds lapse.
+  repeated bytes origin_sha256 = 4;
+}
+
+// ---------------------------------------------------------------------------
+// LeasePendingImagesResponse — the batch, and how long it is yours-ish.
+// ---------------------------------------------------------------------------
+message LeasePendingImagesResponse {
+  // Oldest first, so a backlog drains in the order it arrived rather than
+  // starving its own tail. EMPTY means there is no pending work — a normal,
+  // expected answer that a scheduled worker will get most of the time.
+  repeated PendingImage images = 1;
+
+  // When another caller may be handed these same rows, as a RAW STRING TOKEN
+  // on the SERVER's clock. The worker uses it to bound its own batch: if it
+  // cannot finish by then it should report what it has and lease again, rather
+  // than sit on work no one else can see.
+  //
+  // A CONFORMING SERVER MAY RETURN AN INSTANT THAT HAS ALREADY EXPIRED. That
+  // is the honest answer from an implementation that guards only the SELECT
+  // (an advisory lock serialising two concurrent leases) and records no
+  // per-row hold: such a server offers no exclusivity at all beyond the
+  // instant of the call. The client's behaviour is IDENTICAL either way,
+  // because this RPC is at-least-once by contract — which is exactly why a
+  // recorded hold can be added later as a pure improvement, with no wire
+  // change and no client change.
+  string lease_expires_at = 2;
+
+  // What the lease ABSORBED from the request (0.10.0): a lease_owner cleaned
+  // or cut, a repeated filter entry. Each truncated to 1 KB. A server built
+  // before 0.10.0 never sends any.
+  repeated string warnings = 3;
+}
+
+// ---------------------------------------------------------------------------
+// DeriveOutcome — did a derivative come out the other side.
+//
+// TWO VALUES, deliberately. A "permanently unprocessable" third value was
+// considered and rejected: both outcomes put the depiction row in the same
+// terminal state, which the lease never selects again, so nothing would ever
+// branch on the distinction — and a field nothing branches on is a field
+// inviting a branch. A poison original is re-driven the same way any other
+// failure is: an operator moves the row back, having read failure_reason.
+// ---------------------------------------------------------------------------
+enum DeriveOutcome {
+  DERIVE_OUTCOME_UNSPECIFIED = 0;
+
+  // A derivative exists, its bytes are AT REST in the derived store, and the
+  // fields describing it are populated.
+  DERIVE_OUTCOME_DERIVED = 1;
+
+  // The pipeline produced nothing for these bytes. The depiction row becomes
+  // terminal and stops being leased.
+  DERIVE_OUTCOME_FAILED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// DerivativeReport — one derivative, or one refusal.
+//
+// UNARY, ONE PER CALL, where captures are batched. The asymmetry is about
+// DURABILITY GRANULARITY, not round trips: the expensive thing in this lane is
+// the decode and the re-encode, so a batched report loses every finished image
+// in the batch when the worker dies partway. A capture batch loses nothing on
+// a retry, because the bytes were already stored before the call was made.
+// ---------------------------------------------------------------------------
+message DerivativeReport {
+  // The depiction this settles, as leased.
+  // REFUSED: anything but a uuid, or a uuid no depiction has -> INVALID_ARGUMENT.
+  // An IDENTITY, never repaired.
+  string product_image_id = 1;
+
+  // ----- present IF AND ONLY IF outcome = DERIVED ---------------------------
+  // sha-256 of OUR OUTPUT BYTES, raw — the derivative's own identity, not the
+  // original's. It is the content address the serve path answers on, so it is
+  // computed over the bytes that were actually stored, never over a buffer
+  // that was about to be.
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT.
+  optional bytes derivative_sha256 = 2;
+
+  // The media type of the bytes we produced: 'image/jpeg' | 'image/png' |
+  // 'image/webp', the three a sanitized derivative is encoded as.
+  // REFUSED: on a DERIVED report, any other value, an empty one included ->
+  // INVALID_ARGUMENT.
+  optional string mime = 3;
+
+  // Pixel dimensions of the derivative. The sanitize contract re-encodes at
+  // UNCHANGED resolution, so these should equal the original's; they are
+  // reported rather than assumed so that a pipeline that ever stops doing
+  // that cannot do it silently.
+  // ABSORBED: a value outside 1..2147483647 is stored as unknown, warned.
+  optional uint32 width = 4;
+  // ABSORBED: as width.
+  optional uint32 height = 5;
+
+  // ----- reported on BOTH outcomes ------------------------------------------
+  // What kind of derivative this is or would have been: 'sanitized' |
+  // 'matted'. Part of the derivative's identity, so a later kind lands beside
+  // the earlier one instead of replacing it.
+  // REFUSED: empty, or any value but 'sanitized' or 'matted' -> INVALID_ARGUMENT.
+  string derive_kind = 6;
+
+  // Which pipeline produced it. Also part of the identity: a bumped version
+  // mints a NEW derivative beside the old one, and the old one stays
+  // addressable forever — which is what makes a content address safe to cache
+  // forever on a device.
+  //
+  // A version bump does NOT re-open already-derived rows. Those are terminal
+  // and the lease does not return them; re-deriving an existing corpus at a
+  // new version is an explicit operator action, not something this RPC does by
+  // itself.
+  // REFUSED: empty, a NUL, or over 256 bytes of UTF-8 -> INVALID_ARGUMENT, on
+  // both outcomes.
+  string pipeline_version = 7;
+
+  // WHEN the attempt happened, as a raw string token. Meaningful on a failure
+  // too: "version X refused these bytes at time T" is most of what makes a
+  // failure triageable.
+  // REFUSED: empty, a NUL, or over 256 bytes of UTF-8 -> INVALID_ARGUMENT, on
+  // both outcomes. ABSORBED: on a DERIVED report, a token PostgreSQL does not
+  // read as an instant is stored as unknown, warned; on a FAILED report the
+  // token is recorded verbatim, read or not.
+  string generated_at = 8;
+
+  // What happened.
+  // REFUSED: UNSPECIFIED, or a number DeriveOutcome does not declare ->
+  // INVALID_ARGUMENT.
+  DeriveOutcome outcome = 9;
+
+  // Why it failed, for the operator. Truncated to 1 KB by the server; the
+  // worker sanitizes before sending — never a credential, a signed URL, a
+  // header, THE RAW-STORE KEY, or an original's address. Absent on success.
+  //
+  // The raw-store entries in that list are the load-bearing ones, and they are
+  // the easy mistake: `storage_key` and `origin_sha256` reach this worker on
+  // PendingImage and travel back on NOTHING, so this free-text field is the
+  // only channel that can carry an original's address into the spine. Passing
+  // the object store client's exception message through verbatim — the obvious
+  // implementation — ships the bucket and key of an original into a column an
+  // operator surface will render. Report WHAT failed, never WHERE the bytes
+  // were.
+  //
+  // It exists because a FAILED report with no reason is unactionable, and the
+  // failure would then live only as a log line in the pod that saw it — the
+  // exact problem the failure ledger was built to end.
+  //
+  // ABSORBED: NUL characters removed and the value cut to 1 KB, each warned.
+  // On a DERIVED report it is ignored, warned; a FAILED report without one is
+  // recorded without one, warned.
+  optional string failure_reason = 10;
+
+  // ----- the derivative's OWN appearance (0.10.0): DERIVED only -----------
+  // What the clean copy looks like with NO mask applied, measured by the
+  // pipeline that made it: the placeholder and the grounding for a caller
+  // who is not sent a mask. The three are optional and independent: absent
+  // means not measured, and the spine stores NULL, never a default.
+  //
+  // WRITE ONCE, FILL IF ABSENT. The report that inserts the registry row
+  // stores what it carries. A REPEAT report (stored=false) fills any of the
+  // three the row does not hold yet, so a derivative reported before 0.10.0
+  // gains its appearance by being reported again; a value DIFFERENT from one
+  // the row already holds is ABSORBED: warned, and the held value stands,
+  // because an appearance a device may have cached is never edited in place.
+  //
+  // On a FAILED report, carrying any of the three is INVALID_ARGUMENT, by the
+  // same rule as the four fields that describe a derivative.
+
+  // ThumbHash of the clean copy as it is, raw bytes.
+  // REFUSED: present with fewer than 5 or more than 64 bytes -> INVALID_ARGUMENT.
+  optional bytes thumbhash = 11;
+
+  // The dominant colour of the clean copy as it is, as lowercase '#rrggbb'
+  // (the spelling a client parses).
+  // REFUSED: present in any other spelling (uppercase, '#rgb', a name, a NUL)
+  // -> INVALID_ARGUMENT.
+  optional string dominant_color = 12;
+
+  // The grounding measured on the clean copy's OWN alpha channel: a
+  // transparent clean copy, or the 'matted' cut-out. ABSENT on an opaque
+  // clean copy, which has no alpha to stand a figure by. One Grounding rather
+  // than eight optional fields, because the eight are all or none.
+  // REFUSED: Grounding's own rule.
+  Grounding grounding = 13;
+}
+
+// ---------------------------------------------------------------------------
+// DerivativeAck — what the spine did with the report.
+//
+// It names no URL, no ceiling, and nothing about whether the derivative became
+// a product's primary image. The worker is display-blind for the same reason
+// it is rights-blind: facts it cannot act on are facts it might act on.
+// ---------------------------------------------------------------------------
+message DerivativeAck {
+  // TRUE when THIS call inserted the derivative registry row. FALSE means an
+  // identical derivative was already registered — the normal answer to a
+  // duplicate, never an error.
+  //
+  // FALSE MEANS THE REGISTRY WRITE WAS A NO-OP. IT DOES NOT MEAN THE CALL WAS.
+  // The depiction row still transitions, and it must: one blob depicted by two
+  // products yields TWO product_image rows, both leased and both reported,
+  // while the registry is keyed by the ORIGIN blob and therefore holds one row
+  // for the pair. The second report finds the registry row present and returns
+  // stored=false — and if that were read as "nothing to do", the second
+  // depiction would stay pending and be re-leased and re-derived forever. That
+  // is the spec's own "same bytes, different item" case, so it is the common
+  // one, not an edge. product_image_state below is the field that proves the
+  // transition happened.
+  bool stored = 1;
+
+  // The derivative registry row's uuid. Present on any DERIVED report,
+  // whether or not this call was the one that created it.
+  optional string image_id = 2;
+
+  // What the depiction row is NOW: 'derived' | 'failed' | 'suppressed'. A
+  // worker that reported a derivative for a row that had meanwhile been
+  // suppressed sees that here, and must not treat it as an error — the report
+  // was accepted, the row is simply terminal for a different reason.
+  string product_image_state = 3;
+
+  // Data-shaped anomalies absorbed on the way in, each truncated to 1 KB.
+  repeated string warnings = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Grounding — where a figure stands in an image, as eight fractions of the
+// image's own size (0.10.0). Measured on an alpha channel, where opaque means
+// alpha above 10 of 255. A MaskReport carries the grounding WITH the mask
+// applied; a DerivativeReport carries the clean copy's own, when it has an
+// alpha channel to measure.
+//
+// EVERY FRACTION IS DECIMAL TEXT, never a float: the spine stores the number
+// the pipeline measured, exactly (PostgreSQL numeric), and a float would
+// round it on the way. The grammar: ASCII digits, optionally one '.' and more
+// digits ("0", "0.25", "0.0625"); no sign, no exponent, no whitespace, no NaN
+// or Infinity, at most 32 characters.
+//
+// ALL EIGHT OR NONE. A half-measured grounding would stand a figure on a
+// number nobody measured, so presence lives on the message: a Grounding is
+// sent whole or not at all, and one with any field empty is refused.
+//
+// REFUSED, every field: empty, off the grammar, or out of its range below ->
+// INVALID_ARGUMENT, nothing written. Nothing here is ABSORBED: a number
+// repaired by the server is a number nobody measured.
+// ---------------------------------------------------------------------------
+message Grounding {
+  // The clear margin below the opaque extent, as a fraction of the height.
+  // In [0, 1). REFUSED: off the grammar or out of range.
+  string bottom_margin_frac = 1;
+
+  // The clear margin above the opaque extent, as a fraction of the height.
+  // In [0, 1). REFUSED: off the grammar or out of range.
+  string top_margin_frac = 2;
+
+  // The opaque extent as a half-open box. Its top and bottom edges, as
+  // fractions of the height: 0 <= box_top_frac < box_bottom_frac <= 1.
+  // REFUSED: off the grammar or out of that order.
+  string box_top_frac = 3;
+
+  // The box's bottom edge; see box_top_frac.
+  // REFUSED: off the grammar or out of that order.
+  string box_bottom_frac = 4;
+
+  // Its left and right edges, as fractions of the width:
+  // 0 <= box_left_frac < box_right_frac <= 1.
+  // REFUSED: off the grammar or out of that order.
+  string box_left_frac = 5;
+
+  // The box's right edge; see box_left_frac.
+  // REFUSED: off the grammar or out of that order.
+  string box_right_frac = 6;
+
+  // Where the figure meets its shelf: the centre of the contact band, as a
+  // fraction of the width. In [0, 1). REFUSED: off the grammar or out of range.
+  string contact_band_center_x_frac = 7;
+
+  // The contact band's width, as a fraction of the image's width. In [0, 1).
+  // REFUSED: off the grammar or out of range.
+  string contact_band_width_frac = 8;
+}
+
+// ---------------------------------------------------------------------------
+// MaskReport — one alpha mask media-manager PUBLISHED over one derivative
+// (0.10.0).
+//
+// WHAT A MASK IS. Background removal is a NON-DESTRUCTIVE, display-time
+// overlay: the clean derivative is served byte for byte as it is, and this
+// separate image, whose alpha channel is the mask, is composited over it by
+// the client. It is never a cut-out.
+//
+// A MASK NAMES DERIVATIVE BYTES, not a depiction: it is computed from the
+// clean copy, so every registry row carrying those bytes gains it (two
+// products depicting one picture are two rows with the same bytes).
+//
+// ONE IDENTITY: (derivative_sha256, pipeline_version). That pair names a
+// mask; the spine stores it PER REGISTRY ROW, one mask row for each registry
+// row carrying the derivative bytes, and a report is idempotent on the pair.
+// A new version is a new row beside the old one, and the read sends the
+// newest PUBLISHED one. mask_sha256 is the mask's ADDRESS, never its
+// identity: two versions may mint the same bytes, and a withdrawal reaches
+// every row carrying them.
+//
+// LATE REGISTRY ROWS INHERIT. A registry row can gain derivative bytes after
+// their masks were reported: a derivative pipeline bump that re-derives an
+// origin to the same bytes, or a second origin that sanitizes to them. A
+// ReportDerivative that creates a registry row whose derivative bytes already
+// carry masks gives the new row those masks AS THEY STAND: published or
+// withdrawn, a withdrawn one with its reason and instant. A repeat ReportMask
+// stores the mask on the registry rows that gained those bytes since
+// (stored = those rows, by the same absorb and withdrawn-bytes rules) and
+// changes nothing else. So every registry row carrying the bytes holds the
+// same mask for a pipeline_version.
+//
+// ONLY A PUBLISHED MASK IS REPORTED. A mask media-manager's quality gate held
+// for review is never sent here; this message has no status to say so.
+//
+// A REPORT NEVER CHANGES A STATUS. A new mask lands published, unless its
+// bytes are withdrawn (below). A mask the spine already holds keeps its
+// status whatever this report says, and in particular a withdrawn mask is
+// NEVER RESURRECTED by a report: a replayed report of it is ABSORBED, warned,
+// and the row stays withdrawn. Only WithdrawMask changes a status, in either
+// direction.
+//
+// WITHDRAWN BYTES STAY WITHDRAWN, WHATEVER THE VERSION. A report whose
+// mask_sha256 is carried by any withdrawn mask row (any derivative, any
+// pipeline_version) or by a withdrawal tombstone (see MaskWithdrawal) is
+// ABSORBED: its new rows land WITHDRAWN, inheriting the reason and instant
+// those bytes were withdrawn with, the answer carries a warning, and the mask
+// is never published by it. The origin answers a withdrawn address with a 404
+// whichever version minted the bytes, so only a restore publishes them again,
+// and every row carrying one mask_sha256 has one status.
+//
+// NEVER EDITED IN PLACE. Different mask bytes for a (derivative,
+// pipeline_version) that already has a mask are ABSORBED: warned, and the
+// held mask stands, because its address may be cached on a phone; a registry
+// row that gained the bytes since gains the HELD mask, never the new bytes,
+// so one pair names one mask. A changed mask is a new pipeline_version.
+// ---------------------------------------------------------------------------
+message MaskReport {
+  // The clean derivative the mask was computed over: the derivative_sha256 its
+  // own DerivativeReport carried, raw. An IDENTITY.
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT. No registered
+  // derivative has these bytes -> FAILED_PRECONDITION, nothing written: the
+  // derivative's own report has not landed yet, and the same call succeeds
+  // once it has, so the caller reports the derivative and then retries this.
+  bytes derivative_sha256 = 1;
+
+  // Which mask pipeline minted it. An IDENTITY: with the derivative, the key
+  // of the mask's row.
+  // REFUSED: empty, a NUL, or over 256 bytes of UTF-8 -> INVALID_ARGUMENT.
+  string pipeline_version = 2;
+
+  // sha-256 of the MASK bytes, raw: its content address on the public origin,
+  // the same grammar as a derivative's, computed over the bytes that were
+  // stored. Its ADDRESS, not its identity (see above): what a withdrawal, a
+  // takedown and an edge purge name.
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT.
+  bytes mask_sha256 = 3;
+
+  // The mask's media type: 'image/png' | 'image/webp', the two that carry an
+  // alpha channel (JPEG has none, and the alpha channel IS the mask).
+  // REFUSED: any other value -> INVALID_ARGUMENT.
+  string mime = 4;
+
+  // When the mask was minted, a RAW STRING TOKEN.
+  // REFUSED: empty, a NUL, over 256 bytes of UTF-8, or a token PostgreSQL does
+  // not read as an instant -> INVALID_ARGUMENT. Unlike a derivative's, an
+  // unreadable instant is not absorbed here: a mask row has no unknown
+  // instant to store it as.
+  string generated_at = 5;
+
+  // The grounding WITH the mask applied: what the case view stands the
+  // figure by.
+  // REFUSED: absent -> INVALID_ARGUMENT, and Grounding's own rule.
+  Grounding grounding = 6;
+
+  // ThumbHash of the derivative WITH the mask applied: the placeholder for a
+  // caller who is sent the mask. Absent = not measured.
+  // REFUSED: present with fewer than 5 or more than 64 bytes -> INVALID_ARGUMENT.
+  optional bytes thumbhash = 7;
+
+  // The dominant colour WITH the mask applied, as lowercase '#rrggbb'.
+  // Absent = not measured.
+  // REFUSED: present in any other spelling (uppercase, '#rgb', a name, a NUL)
+  // -> INVALID_ARGUMENT.
+  optional string dominant_color = 8;
+}
+
+// ---------------------------------------------------------------------------
+// MaskAck — what the spine did with a mask report or a withdrawal (0.10.0).
+// COUNTS, not a bool: a mask names derivative bytes, so one call can reach
+// several registry rows, and the caller is told how many. Like DerivativeAck,
+// it names no URL and nothing about display.
+// ---------------------------------------------------------------------------
+message MaskAck {
+  // Rows THIS call changed. ReportMask: registry rows that gained a mask row,
+  // published, or withdrawn when its bytes are withdrawn. WithdrawMask: mask
+  // rows whose status it set, plus 1 when it recorded or cleared a withdrawal
+  // tombstone. 0 on a repeat: the normal answer to a duplicate, never an error.
+  uint32 stored = 1;
+
+  // Rows the call reached. ReportMask: registry rows carrying the derivative
+  // bytes (at least 1, or the call was refused). WithdrawMask: mask rows
+  // carrying the mask bytes (0 = no row carries them yet).
+  uint32 matched = 2;
+
+  // Data-shaped anomalies ABSORBED on the way in, each truncated to 1 KB.
+  repeated string warnings = 3;
+}
+
+// ---------------------------------------------------------------------------
+// MaskWithdrawal — set a published mask's status (0.10.0): withdraw it, or
+// restore it. WithdrawMask is the ONLY path that changes one; a report never
+// does.
+//
+// WHY. Cut-out masks are allowed for every store's listing photos, and each
+// store is revocable: when media-manager withdraws a mask (its store revoked,
+// its image deleted or no longer eligible) its origin answers the mask's
+// address with a 404, so the read must stop sending that address.
+//
+// STATE, NOT EVENT. The message carries the status media-manager's own row
+// has NOW: restore=false says withdrawn, restore=true says published. A
+// caller sends the current status, so a replay converges on media-manager's
+// state, and a call that repeats the status a row already has changes nothing.
+//
+// BY MASK BYTES. Every mask row carrying mask_sha256 is set (every registry
+// row the mask reached, and any pipeline version that minted the same bytes),
+// because the origin answers that one address for all of them.
+//
+// A WITHDRAWAL NEVER DELETES. The row is the record of an address a phone or
+// the edge may have cached, and a takedown or a purge reaches it by its
+// bytes; the read simply stops sending it.
+//
+// OUT OF ORDER, A TOMBSTONE. A withdrawal of bytes no mask row carries yet
+// (their report has not landed, or was refused and will be retried) is not
+// dropped: the spine records a WITHDRAWAL TOMBSTONE for those bytes, with the
+// reason and instant, and answers OK with matched=0, stored=1 and a warning.
+// Every later ReportMask carrying those bytes honours it and lands withdrawn
+// (see MaskReport). The tombstone stands until a restore clears it.
+// ---------------------------------------------------------------------------
+message MaskWithdrawal {
+  // The mask's content address, raw. An IDENTITY.
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT. No mask row has these
+  // bytes: a withdrawal records a tombstone (matched=0, stored=1, warned; a
+  // repeat stores 0); a restore clears the tombstone (matched=0, stored=1).
+  // A restore of bytes the spine holds neither a row nor a tombstone for
+  // answers OK with matched=0 and stored=0: there is nothing to refuse, since
+  // a later ReportMask of them lands published anyway. So the same restore,
+  // retried after it cleared a tombstone, answers OK with stored=0.
+  bytes mask_sha256 = 1;
+
+  // Why media-manager withdrew it, as media-manager records it
+  // ('store_revoked', an image deleted or no longer eligible). FREE TEXT,
+  // kept on the row for an audit.
+  // REFUSED on a withdrawal: empty, or nothing left once cleaned ->
+  // INVALID_ARGUMENT; a withdrawal nobody can explain cannot be audited.
+  // ABSORBED: NUL characters removed and the value cut to 64 characters, each
+  // warned. IGNORED on a restore: the row clears it.
+  string reason = 2;
+
+  // When media-manager withdrew it, a RAW STRING TOKEN.
+  // REFUSED on a withdrawal: empty, a NUL, over 256 bytes of UTF-8, or a token
+  // PostgreSQL does not read as an instant -> INVALID_ARGUMENT. IGNORED on a
+  // restore: the row clears it.
+  string withdrawn_at = 3;
+
+  // false = withdraw. true = RESTORE: the rows go back to published, their
+  // reason and instant cleared, a tombstone for the bytes is cleared too, and
+  // the read may send the mask again.
+  // Neither value is REFUSED.
+  bool restore = 4;
+}
+
+// ---------------------------------------------------------------------------
+// SpineMedia — the derivative pipeline's whole surface.
+//
+// LEASE SEMANTICS, decided and stated rather than left to the implementation:
+//
+//   * AT-LEAST-ONCE. Two callers may be handed the same row, and that is
+//     ACCEPTED rather than prevented. The derivative's identity is
+//     (origin sha, derive_kind, pipeline_version), so a duplicate is a
+//     database no-op, and the derivative's bytes are content addressed, so a
+//     duplicate PUT writes the identical object at the identical key. The cost
+//     of a double-derive is CPU — but SAY WHOSE. A server that records no hold
+//     (permitted, see lease_expires_at) combined with "oldest first" hands two
+//     concurrent callers the SAME batch every time, not occasionally, and the
+//     duplicated work is a full decode and re-encode per image on an estate
+//     that buys no hardware. So a deployment that ships the no-hold lease MUST
+//     serialise its callers instead — one scheduled consumer, non-overlapping
+//     — and that setting is load-bearing rather than defensive. A server that
+//     DOES record a hold makes it merely prudent. Either is conforming; only
+//     one of them is free.
+//     The cost of at-most-once is a fencing token
+//     and a report the server can REFUSE because the lease expired mid-work —
+//     which throws away the one genuinely expensive thing in this lane. A
+//     lease that can invalidate finished work is worse than no lease.
+//
+//   * A REPORT IS NEVER REFUSED FOR A STALE LEASE. ReportDerivative is
+//     judged on its own contents alone; it does not carry a lease token and
+//     could not be fenced by one. A worker that overran its lease still lands
+//     its work.
+//
+//   * A LOST LEASE COSTS NOTHING, and needs no sweeper. A worker that dies
+//     mid-batch leaves its rows exactly where an un-leased pending row already
+//     sits; once the hold lapses they are leased again by whoever asks next.
+//     There is deliberately no Release RPC and no "leased" state to get stuck
+//     in, so there is no stuck-lease alert for an operator to wake up to. This
+//     is the direct payoff of choosing at-least-once, and it is why that
+//     choice is right for a lane whose work is idempotent.
+//
+//   * REPEATED LEASES ARE NOT IDEMPOTENT, and a caller must not treat them as
+//     such. A retried lease returns a DIFFERENT batch, because the first one
+//     is now held. Nothing is lost — the first batch's hold lapses on its own
+//     — but a timed-out lease call must NOT be read as "there was no work".
+//
+// ERROR CONTRACT:
+//   * STRUCTURAL faults -> INVALID_ARGUMENT, nothing written: an unknown
+//     product_image_id, an outcome left UNSPECIFIED, an empty derive_kind,
+//     pipeline_version or generated_at, a derivative_sha256 that is not
+//     exactly 32 bytes, a DERIVED report MISSING any of the four fields that
+//     describe a derivative, or a FAILED report CARRYING any of them.
+//
+//     That last rule is the one worth stating twice. A message that says both
+//     "this failed" and "here is its sha" is self-contradictory, and the
+//     server cannot know which half to believe — so it believes neither. The
+//     case it actually catches is a worker whose decode succeeded and whose
+//     upload then did not: it holds a sha and dimensions for bytes that never
+//     reached the store, and registering that derivative would put a content
+//     address into the read surface that resolves to nothing, forever, cached
+//     immutably on every device that asked.
+//
+//   * Data-shaped problems are ABSORBED and warned, as everywhere in these
+//     contracts. Each field's comment says which of the two rules it follows
+//     (THE FIELD RULE, 0.10.0).
+//   * FAILED_PRECONDITION, nothing written (0.10.0): a ReportMask over
+//     derivative bytes no registered derivative has. It is RETRYABLE once
+//     the derivative's own report (ReportDerivative) lands, and the same call
+//     then succeeds. Nothing else in media.v1 is FAILED_PRECONDITION: a
+//     WithdrawMask never is (a restore of bytes the spine holds neither a
+//     mask row nor a withdrawal tombstone for is OK, matched=0, stored=0).
+//   * Infrastructure faults -> UNAVAILABLE/INTERNAL, nothing written.
+//   * RETRY SAFETY: ReportDerivative is idempotent on
+//     (product_image_id, derivative_sha256) and may be retried on any status;
+//     a repeat returns stored=false and changes nothing but an appearance the
+//     registry row does not hold yet (0.10.0, see DerivativeReport).
+//     LeasePendingImages is safe to retry but not idempotent — see above.
+//     ReportMask is idempotent on (derivative_sha256, pipeline_version), the
+//     mask's identity: a repeat stores on the registry rows that gained the
+//     derivative bytes since, if any (stored = those rows, see MaskReport), and
+//     changes nothing else; with none it returns stored=0. WithdrawMask is
+//     idempotent on (mask_sha256, restore): a repeat returns stored=0, and a
+//     row already withdrawn keeps the reason and instant it was withdrawn with.
+//     A RETRIED RESTORE IS SAFE: a withdrawal of bytes no row carries (OK,
+//     stored=1, a tombstone), then a restore (OK, stored=1, the tombstone
+//     cleared), then that same restore again (OK, matched=0, stored=0). Both
+//     may be retried on UNAVAILABLE, DEADLINE_EXCEEDED and INTERNAL, and
+//     ReportMask on FAILED_PRECONDITION once the derivative's report has
+//     landed; never unchanged on INVALID_ARGUMENT.
+//     ORDER BETWEEN THEM IS SAFE: a withdrawal that arrives before its report
+//     is kept as a tombstone, so that report, landing or retried later, lands
+//     withdrawn; a caller need not re-read a mask's status before retrying a
+//     ReportMask.
+// ---------------------------------------------------------------------------
+service SpineMedia {
+  rpc LeasePendingImages(LeasePendingImagesRequest) returns (LeasePendingImagesResponse);
+  rpc ReportDerivative(DerivativeReport) returns (DerivativeAck);
+  rpc ReportMask(MaskReport) returns (MaskAck);
+  rpc WithdrawMask(MaskWithdrawal) returns (MaskAck);
+}
