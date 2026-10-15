@@ -216,7 +216,8 @@ def test_every_call_carries_the_deadline_and_a_slow_answer_is_retried(
     assert client.report_mask(_mask(), derivative_landed=False).stored == 1
     remaining = [s[3] for s in servicer.calls("ReportMask")]
     assert len(remaining) == 2
-    assert all(r is not None and 0 < r <= 0.3 for r in remaining)
+    # the deadline (0.3 s), plus the timers' own slack; the default would be 10 s
+    assert all(r is not None and 0 < r <= 0.35 for r in remaining), remaining
     assert slept == [0.5]
 
 
