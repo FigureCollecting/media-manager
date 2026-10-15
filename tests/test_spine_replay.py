@@ -617,3 +617,38 @@ def test_a_resumed_run_with_no_hold_left_does_not_wait(
     assert code == rp.EXIT_DONE
     assert clock.slept == []
     assert lines[0] == {"event": "resume", "run": 1, "cursor": None, "wait_seconds": 0.0}
+
+
+def test_leasing_stops_at_the_first_stray_even_in_a_full_answer(
+    db_session: Session, spine: tuple[FakeSpine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake, url = spine
+    fake.ignore_filter = True
+    a = seed_copy(db_session, "a")
+    fake.depict(sha("orig:stranger-1"))
+    fake.depict(a["origin"])
+    fake.depict(sha("orig:stranger-2"))
+    monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 2)
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    batch = _batches(lines)[0]
+    assert batch["lease_rounds"] == 1 and batch["unrequested"] == 1
+    assert len(fake.sent("LeasePendingImages")) == 1  # never walks the stranger's queue
+
+
+def test_the_cursor_is_the_last_original_of_the_last_finished_batch(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    for i in range(4):
+        fake.depict(seed_copy(db_session, f"c{i}")["origin"])
+    fake.fail("ReportDerivative", None, None, C.UNIMPLEMENTED)  # the second batch's first
+    code, _ = _run(db_session, url, batch_size=2)
+    assert code == rp.EXIT_STOPPED
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    first_batch = sorted(fake.depictions[p]["origin"].hex() for p in fake.depictions)[:2]
+    assert run.cursor_sha256 == first_batch[-1]
+    fake.held.clear()
+    code, lines = _run(db_session, url, batch_size=2)
+    assert code == rp.EXIT_DONE
+    assert [b["origins"] for b in _batches(lines)] == [2, 0]

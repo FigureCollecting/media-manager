@@ -69,6 +69,7 @@ def test_a_withdrawal_reason_is_cut_to_64_characters() -> None:
     reason, warnings = fr.withdraw_reason("é" * 70)
     assert reason == "é" * 64 and warnings == ["cut to 64 characters"]
     assert fr.withdraw_reason("deleted") == ("deleted", [])
+    assert fr.withdraw_reason("r" * 64) == ("r" * 64, [])  # the bound itself is kept
 
 
 @pytest.mark.parametrize("value", ["", "\x00\x00", None])

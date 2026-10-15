@@ -292,3 +292,26 @@ def test_the_target_is_plaintext_to_the_local_mesh_proxy() -> None:
 def test_any_other_target_is_refused(url: str, why: str) -> None:
     with pytest.raises(ValueError, match=why):
         mc.target_from_url(url)
+
+
+def test_a_lease_filter_of_exactly_200_is_sent(spine: tuple[Scripted, str]) -> None:
+    servicer, url = spine
+    servicer.script("LeasePendingImages", media_pb2.LeasePendingImagesResponse())
+    client, _ = _client(url)
+    client.lease([i.to_bytes(32, "big") for i in range(200)], max_items=200, lease_owner="r")
+    assert len(servicer.calls("LeasePendingImages")[0][1].origin_sha256) == 200
+
+
+def test_the_channel_leaves_retrying_to_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def capture(target: str, options: Any = None) -> str:
+        seen.update(target=target, options=options)
+        return "channel"
+
+    monkeypatch.setattr(mc.grpc, "insecure_channel", capture)
+    assert mc.open_channel("http://ingest-server.fc.svc.cluster.local:50063") == "channel"
+    assert seen == {
+        "target": "ingest-server.fc.svc.cluster.local:50063",
+        "options": [("grpc.enable_retries", 0)],
+    }

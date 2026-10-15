@@ -412,7 +412,6 @@ class _Run:
     owner: str
     landed: set[str] = field(default_factory=set)
     withdrawn_now: set[str] = field(default_factory=set)
-    restored_now: set[str] = field(default_factory=set)
 
     # ----- one call, counted -------------------------------------------------
 
@@ -506,8 +505,7 @@ class _Run:
             return
         report.rpc["ReportDerivative"]["stored"] += int(ack.stored)
         report.states[ack.product_image_state] += 1
-        if ack.HasField("image_id"):
-            self.landed.add(copy.sha256)
+        self.landed.add(copy.sha256)  # an OK DERIVED report: the derivative is registered
 
     def _report_masks(self, report: _BatchReport, copy: str) -> None:
         assert self.client is not None
@@ -534,8 +532,6 @@ class _Run:
         client = self.client
         for mask in self.plan.reports_for(copy):
             sha = mask.mask_sha256
-            if sha in self.restored_now:
-                continue
             sent = self.db.get(SpineMaskWithdrawal, sha)
             if sent is None:
                 continue
@@ -543,7 +539,6 @@ class _Run:
             if ack is not None:
                 report.rpc["RestoreMask"]["stored"] += ack.stored
                 report.rpc["RestoreMask"]["matched"] += ack.matched
-                self.restored_now.add(sha)
                 self.db.delete(sent)
                 self.db.commit()
 
