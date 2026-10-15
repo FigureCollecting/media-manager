@@ -19,8 +19,10 @@ of DATABASE_URL. One JSON line per event on stdout: ``plan``, ``resume``,
 ``would_send`` (dry run), ``batch`` (counts per RPC, stored/matched,
 warnings, refusals by status), ``stopped``, ``done``.
 
-Exit status: 0 done; 1 done, with calls refused; 2 bad arguments (nothing
-ran); 3 stopped, resumable: run it again.
+Exit status: 0 done; 1 done, but something did not land (a refusal, a value
+not sent, a mask with no public object, or a mask whose derivative the spine
+never registered); 2 bad arguments (nothing ran); 3 stopped, resumable: run
+it again (a spine that ignores the origin filter stops it too).
 """
 
 from __future__ import annotations
