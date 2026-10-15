@@ -657,6 +657,20 @@ def test_refused_withdrawals_and_restores_are_counted_and_kept(
     assert db_session.get(SpineMaskWithdrawal, a["masks"][0]) is not None
 
 
+def test_a_refusal_in_a_run_whose_batches_carry_no_originals_still_ends_1(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    seed_copy(db_session, "dead", deleted=True)  # only the tail: withdraw its mask
+    fake.fail("WithdrawMask", C.INVALID_ARGUMENT)
+    code, lines = _run(db_session, url)
+    assert [b["origins"] for b in _batches(lines)] == [0]
+    assert _batches(lines)[0]["WithdrawMask"]["refused"] == {"INVALID_ARGUMENT": 1}
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    assert run.cursor_sha256 is None
+    assert code == rp.EXIT_REFUSED and lines[-1]["exit"] == rp.EXIT_REFUSED
+
+
 def test_a_dry_run_lists_a_restore_it_owes(db_session: Session) -> None:
     a = seed_copy(db_session, "a")
     db_session.add(SpineMaskWithdrawal(mask_sha256=a["masks"][0], reason="r", withdrawn_at=AT))
