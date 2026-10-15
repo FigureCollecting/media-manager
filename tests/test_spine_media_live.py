@@ -40,7 +40,7 @@ from typing import Any
 
 import grpc
 import pytest
-from app.models import Base, ImageMask
+from app.models import Base, ImageMask, PublicObject
 from app.spine import replay as rp
 from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
 from sqlalchemy import create_engine, select
@@ -381,6 +381,24 @@ def test_the_replay_lands_on_the_real_spine_and_the_read_sends_it(
         world["site"],
     )
     assert leases == [(0,)]
+
+
+def test_a_copy_of_unknown_width_lands_and_so_does_its_mask(
+    spine: dict[str, Any], world: dict[str, Any]
+) -> None:
+    db, a = world["db"], world["a"]
+    copy = db.get(PublicObject, a["clean"])
+    assert copy is not None
+    copy.width = 0  # the real spine refuses a DERIVED report with no width
+    db.commit()
+    code, lines = _replay(db, spine["url"])
+    assert code == rp.EXIT_DONE, lines
+    batch = next(line for line in lines if line["event"] == "batch")
+    assert batch["ReportDerivative"]["refused"] == {} and batch["ReportMask"]["unregistered"] == 0
+    assert batch["ReportMask"]["stored"] >= 1
+    assert any("stored as unknown" in w for w in batch["warnings_sample"]), batch
+    mask_url = f"{BASE}/{a['masks'][0]}"
+    assert all(i.get("mask", {}).get("url") == mask_url for i in spine["images_of"](world["pA"]))
 
 
 def test_a_caller_without_a_mesh_identity_is_refused_and_the_run_stops(
