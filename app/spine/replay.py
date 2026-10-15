@@ -65,7 +65,7 @@ from functools import partial
 from typing import Any
 
 import grpc
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from ..models import Image as ImageModel
@@ -143,7 +143,9 @@ class Plan:
 
 def _dead_copies(db: Session) -> set[str]:
     """Clean copies app.publication.images_behind calls not live, in one query:
-    no version, a deleted version, or a deleted image behind it."""
+    no version, a deleted version, or a deleted image behind it. Each EXISTS
+    selects a named column, never ``*``: the Job's role holds column grants
+    on ``images`` and Postgres checks every column a query names."""
     owner = aliased(ImageModel)
     linked = aliased(ImageModel)
     query = (
@@ -154,12 +156,16 @@ def _dead_copies(db: Session) -> set[str]:
             or_(
                 ImageVersion.id.is_(None),
                 ImageVersion.deleted_at.is_not(None),
-                exists().where(owner.id == ImageVersion.image_id, owner.deleted_at.is_not(None)),
-                exists().where(
+                select(owner.id)
+                .where(owner.id == ImageVersion.image_id, owner.deleted_at.is_not(None))
+                .exists(),
+                select(linked.id)
+                .where(
                     PublicObjectImage.sha256 == PublicObject.sha256,
                     linked.id == PublicObjectImage.image_id,
                     linked.deleted_at.is_not(None),
-                ),
+                )
+                .exists(),
             ),
         )
     )

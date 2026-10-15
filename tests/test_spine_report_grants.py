@@ -40,6 +40,10 @@ GRANT USAGE ON SEQUENCE spine_report_runs_id_seq TO media_report;
 """
 
 
+def _no_channel() -> SpineMediaClient:
+    raise AssertionError("a dry run opens no channel")
+
+
 @pytest.fixture()
 def as_media_report(empty_database_url: str) -> Iterator[tuple[str, str]]:  # noqa: F811
     up = _run_alembic("upgrade", "head", database_url=empty_database_url)
@@ -87,7 +91,7 @@ def test_the_replay_reads_only_what_the_jobs_role_is_granted(
             batch = next(line for line in lines if line["event"] == "batch")
             assert batch["matched"] == 3 and batch["ReportMask"]["stored"] == 1
             dry = rp.run_replay(
-                db, rp.ReplayConfig(dry_run=True), connect=lambda: None, emit=lines.append
+                db, rp.ReplayConfig(dry_run=True), connect=_no_channel, emit=lines.append
             )
             assert dry == rp.EXIT_DONE
         with report.connect() as conn:
