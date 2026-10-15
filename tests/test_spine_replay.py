@@ -349,6 +349,29 @@ def test_restart_closes_an_open_run_and_starts_over(
     assert _batches(lines)[0]["origins"] == 1
 
 
+def test_a_restart_inside_the_abandoned_runs_hold_waits_it_out_and_lands_the_mask(
+    db_session: Session,
+) -> None:
+    clock = Clock()
+    fake = LapsingSpine(clock)
+    a = seed_copy(db_session, "a")
+    pid = fake.depict(a["origin"])
+    fake.hold_then_fail.append(C.UNAVAILABLE)  # run 1's lease holds the row, then fails
+    with serve(fake) as url:
+        code, _ = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60)
+        assert code == rp.EXIT_STOPPED
+        held = db_session.execute(select(SpineReportRun)).scalar_one().resume_not_before
+        assert held is not None
+        hold = rp._aware(held)
+        assert hold > clock.now
+        code, lines = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60, restart=True)
+    # never 'done' while the depiction stays captured and the mask never landed
+    assert not (code == rp.EXIT_DONE and fake.depictions[pid]["state"] == "captured")
+    assert code == rp.EXIT_DONE and clock.now >= hold
+    assert fake.depictions[pid]["state"] == "derived" and len(fake.masks) == 1
+    assert _batches(lines)[0]["orphans"] == []
+
+
 def test_a_withdrawal_is_recorded_before_it_is_sent_and_a_restore_follows_it(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
