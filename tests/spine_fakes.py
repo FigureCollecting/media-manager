@@ -248,3 +248,46 @@ def seed_copy(
         mask_shas.append(mask_sha)
     db.commit()
     return {"origin": origin, "clean": clean, "masks": mask_shas, "others": others}
+
+
+class LapsingSpine(FakeSpine):
+    """A FakeSpine whose holds lapse on ``clock`` (``lease_seconds`` after the
+    lease), whose ReportDerivative takes ``report_seconds`` of that clock, and
+    whose lease can hold its rows and THEN fail (the answer lost), as the
+    contract says a failed lease attempt may: ``hold_then_fail`` is, per lease
+    call, a status to fail with after holding, or None to answer."""
+
+    def __init__(self, clock: Any, *, report_seconds: float = 0.0) -> None:
+        super().__init__()
+        self.clock = clock
+        self.report_seconds = report_seconds
+        self.until: dict[str, dt.datetime] = {}
+        self.hold_then_fail: deque[grpc.StatusCode | None] = deque()
+
+    def held_now(self, pid: str) -> bool:
+        return pid in self.until and self.until[pid] > self.clock.now
+
+    def LeasePendingImages(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
+        self.calls.append(("LeasePendingImages", request))
+        wanted = set(request.origin_sha256)
+        out = []
+        for pid, d in self.depictions.items():
+            if d["state"] != "captured" or self.held_now(pid):
+                continue
+            if not self.ignore_filter and d["origin"] not in wanted:
+                continue
+            out.append(media_pb2.PendingImage(product_image_id=pid, origin_sha256=d["origin"]))
+            if len(out) == min(request.max_items or 50, 200):
+                break
+        for image in out:
+            self.until[image.product_image_id] = self.clock.now + dt.timedelta(
+                seconds=request.lease_seconds
+            )
+        code = self.hold_then_fail.popleft() if self.hold_then_fail else None
+        if code is not None:
+            context.abort(code, "the rows were held, then the answer was lost")
+        return media_pb2.LeasePendingImagesResponse(images=out, lease_expires_at="x")
+
+    def ReportDerivative(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
+        self.clock.now += dt.timedelta(seconds=self.report_seconds)
+        return super().ReportDerivative(request, context)

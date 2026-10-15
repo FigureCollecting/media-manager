@@ -8,19 +8,27 @@ against a stateful fake spine over real gRPC (tests/spine_fakes.py)."""
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 from collections.abc import Iterator
 from typing import Any
 
 import grpc
 import pytest
-from app.models import Image, ImageMask, ImageVersion, SpineMaskWithdrawal, SpineReportRun
+from app.models import (
+    Image,
+    ImageMask,
+    ImageVersion,
+    PublicObject,
+    SpineMaskWithdrawal,
+    SpineReportRun,
+)
 from app.spine import replay as rp
 from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from spine_fakes import AT, FakeSpine, seed_copy, serve, sha
+from spine_fakes import AT, GROUND, FakeSpine, LapsingSpine, seed_copy, serve, sha
 
 C = grpc.StatusCode
 T0 = dt.datetime(2026, 10, 15, 1, 0, tzinfo=dt.UTC)
@@ -234,7 +242,7 @@ def test_a_run_reports_every_copy_and_mask_and_a_rerun_stores_nothing(
     assert len(db_session.execute(select(SpineReportRun)).scalars().all()) == 2
 
 
-def test_only_the_named_originals_are_reported(
+def test_a_spine_that_ignores_the_filter_is_a_deployment_fault_that_stops_the_run(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
     fake, url = spine
@@ -243,12 +251,17 @@ def test_only_the_named_originals_are_reported(
     stranger = fake.depict(sha("orig:stranger"))
     mine = fake.depict(a["origin"])
     code, lines = _run(db_session, url)
-    assert code == rp.EXIT_DONE
-    assert fake.depictions[mine]["state"] == "derived"
-    assert fake.depictions[stranger]["state"] == "captured"
+    assert code == rp.EXIT_STOPPED
+    assert fake.depictions[mine]["state"] == "derived"  # ours in that answer still land
+    assert fake.depictions[stranger]["state"] == "captured"  # never reported
     batch = _batches(lines)[0]
     assert batch["unrequested"] == 1 and batch["lease_rounds"] == 1
-    assert any("not requested" in w for w in batch["warnings_sample"])
+    assert batch["ReportMask"]["calls"] == 0  # the batch stops before its masks
+    stop = lines[-1]
+    assert stop["event"] == "stopped" and "not honouring origin_sha256" in stop["why"]
+    run = db_session.execute(select(SpineReportRun)).scalar_one()
+    assert run.status == "running" and run.cursor_sha256 is None
+    assert run.resume_not_before is not None  # the stranger's hold is waited out
 
 
 def test_the_lease_is_repeated_until_the_batchs_depictions_are_drained(
@@ -370,7 +383,8 @@ def test_a_mask_whose_derivative_the_spine_lacks_is_counted_not_retried(
     fake, url = spine
     seed_copy(db_session, "a")  # the spine never captured its original
     code, lines = _run(db_session, url, attempts=5)
-    assert code == rp.EXIT_DONE
+    assert code == rp.EXIT_REFUSED  # a mask that never landed is not a clean run
+    assert lines[-1]["exit"] == rp.EXIT_REFUSED
     assert len(fake.sent("ReportMask")) == 1
     batch = _batches(lines)[0]
     assert batch["ReportMask"]["unregistered"] == 1 and batch["ReportMask"]["refused"] == {}
@@ -630,7 +644,7 @@ def test_leasing_stops_at_the_first_stray_even_in_a_full_answer(
     fake.depict(sha("orig:stranger-2"))
     monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 2)
     code, lines = _run(db_session, url)
-    assert code == rp.EXIT_DONE
+    assert code == rp.EXIT_STOPPED
     batch = _batches(lines)[0]
     assert batch["lease_rounds"] == 1 and batch["unrequested"] == 1
     assert len(fake.sent("LeasePendingImages")) == 1  # never walks the stranger's queue
@@ -652,3 +666,243 @@ def test_the_cursor_is_the_last_original_of_the_last_finished_batch(
     code, lines = _run(db_session, url, batch_size=2)
     assert code == rp.EXIT_DONE
     assert [b["origins"] for b in _batches(lines)] == [2, 0]
+
+
+# ---------------------------------------------------------------------------
+# close-out 2: every lease round's hold, a spine that ignores the filter
+# ---------------------------------------------------------------------------
+
+
+class _PodKilled(BaseException):
+    """The pod is killed: nothing after it runs, nothing uncommitted survives."""
+
+
+class _KilledAtLease(SpineMediaClient):
+    def __init__(self, *args: Any, kill_at: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.kill_at = kill_at
+        self.leases = 0
+
+    def lease(self, *args: Any, **kwargs: Any) -> Any:
+        self.leases += 1
+        out = super().lease(*args, **kwargs)
+        if self.leases == self.kill_at:
+            raise _PodKilled  # after the spine held the rows
+        return out
+
+
+def _three_depictions_of_one_original(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Clock, LapsingSpine, list[str]]:
+    clock = Clock()
+    fake = LapsingSpine(clock, report_seconds=40)
+    a = seed_copy(db, "a")
+    pids = [fake.depict(a["origin"]) for _ in range(3)]
+    monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 2)
+    return clock, fake, pids
+
+
+def test_a_rerun_waits_out_the_hold_of_a_later_lease_round_that_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock, fake, pids = _three_depictions_of_one_original(db_session, monkeypatch)
+    fake.hold_then_fail.extend([None, C.UNAVAILABLE])  # round 2 holds, then fails
+    with serve(fake) as url:
+        code, lines = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60)
+        assert code == rp.EXIT_STOPPED and "lease" in lines[-1]["why"]
+        assert clock.now == T0 + dt.timedelta(seconds=80)  # two reports of 40 s
+        code, lines = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60)
+    assert code == rp.EXIT_DONE
+    # round 2 leased at T0+80: its hold lapses at T0+140, the rerun waits to T0+145
+    assert lines[0]["event"] == "resume" and lines[0]["wait_seconds"] == 65.0
+    assert {fake.depictions[p]["state"] for p in pids} == {"derived"}
+
+
+def test_a_pod_killed_in_a_later_lease_round_has_that_rounds_hold_committed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock, fake, pids = _three_depictions_of_one_original(db_session, monkeypatch)
+    with serve(fake) as url:
+
+        def connect() -> SpineMediaClient:
+            return _KilledAtLease(
+                open_channel(url),
+                kill_at=2,
+                policy=RetryPolicy(max_attempts=1),
+                sleep=lambda s: None,
+            )
+
+        with pytest.raises(_PodKilled):
+            rp.run_replay(
+                db_session,
+                rp.ReplayConfig(lease_seconds=60),
+                connect=connect,
+                emit=lambda line: None,
+                now=clock,
+                sleep=clock.sleep,
+            )
+        db_session.rollback()  # what the killed pod had not committed is gone
+        run = db_session.execute(select(SpineReportRun)).scalar_one()
+        assert run.resume_not_before is not None
+        assert rp._aware(run.resume_not_before) == T0 + dt.timedelta(seconds=145)
+        code, lines = _run(db_session, url, clock=clock, attempts=1, lease_seconds=60)
+    assert code == rp.EXIT_DONE
+    assert lines[0]["wait_seconds"] == 65.0
+    assert {fake.depictions[p]["state"] for p in pids} == {"derived"}
+
+
+def test_a_spine_that_ignores_the_filter_never_has_its_queue_walked(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    fake = LapsingSpine(clock)
+    fake.ignore_filter = True
+    mine = [seed_copy(db_session, f"m{i}") for i in range(4)]
+    strangers = [fake.depict(sha(f"orig:stranger-{i}")) for i in range(6)]
+    for m in mine:
+        fake.depict(m["origin"])
+    monkeypatch.setattr(rp, "LEASE_MAX_ITEMS", 2)
+    with serve(fake) as url:
+        code, lines = _run(db_session, url, clock=clock, batch_size=1, lease_seconds=60)
+    assert code == rp.EXIT_STOPPED
+    assert len(fake.sent("LeasePendingImages")) == 1
+    assert sum(fake.held_now(p) for p in strangers) == 2  # one answer's worth, no more
+    assert lines[-1]["batch"] == 0 and "deployment fault" in lines[-1]["why"]
+
+
+# ---------------------------------------------------------------------------
+# close-out 2: what each report carries, pinned at the replay
+# ---------------------------------------------------------------------------
+
+
+def test_the_mask_carries_its_masked_appearance_and_the_copy_its_plain_one(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    fake.depict(a["origin"])
+    mask_obj = db_session.get(PublicObject, a["masks"][0])
+    assert mask_obj is not None
+    mask_obj.created_at = AT + dt.timedelta(minutes=2)  # neither the row's created nor updated
+    db_session.commit()
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    derived = fake.sent("ReportDerivative")[0]
+    assert derived.thumbhash == base64.b64decode("AAECAwQFBgcICQ==")
+    assert derived.dominant_color == "#112233"
+    assert derived.generated_at == "2026-10-14T09:00:00.000000Z"
+    assert not derived.HasField("grounding")  # an opaque copy
+    mask = fake.sent("ReportMask")[0]
+    assert mask.thumbhash == base64.b64decode("CQgHBgUEAwIBAA==")
+    assert mask.dominant_color == "#445566"
+    assert mask.generated_at == "2026-10-14T09:02:00.000000Z"  # the mask object's instant
+    assert mask.mime == "image/png"
+
+
+def test_a_transparent_copy_is_reported_with_its_own_grounding(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    own = {**GROUND, "bottom_margin_frac": 0.05}
+    a = seed_copy(db_session, "a", mime="image/png", own_grounding=own)
+    fake.depict(a["origin"])
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    derived = fake.sent("ReportDerivative")[0]
+    assert derived.grounding.bottom_margin_frac == "0.05"
+    assert fake.sent("ReportMask")[0].grounding.bottom_margin_frac == "0.0125"
+
+
+def test_a_held_mask_is_never_sent(db_session: Session, spine: tuple[FakeSpine, str]) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=(("mask-v1", "held", "mh"),))
+    fake.depict(a["origin"])
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    assert fake.sent("ReportMask") == [] and fake.sent("WithdrawMask") == []
+    assert len(fake.sent("ReportDerivative")) == 1
+
+
+def test_the_copys_appearance_is_the_current_versions_else_the_latest_measured(
+    db_session: Session,
+) -> None:
+    def rows(tag: str, *spec: tuple[str, str | None, int]) -> str:
+        """(pipeline version, plain thumbhash or None = unmeasured, hours after AT)"""
+        seed = seed_copy(db_session, tag, masks=tuple((v, "ok", f"{tag}{v}") for v, _, _ in spec))
+        found = db_session.execute(
+            select(ImageMask).where(ImageMask.source_sha256 == seed["clean"]).order_by(ImageMask.id)
+        ).scalars()
+        for row, (_, thumb, hours) in zip(found, spec, strict=True):
+            row.plain_thumbhash = thumb
+            row.plain_dominant_color = None if thumb is None else "#000000"
+            row.updated_at = AT + dt.timedelta(hours=hours)
+        db_session.commit()
+        return str(seed["clean"])
+
+    current = rows("cur", ("mask-v1", "Y3VycmVudA==", 1), ("mask-v0", "b2xkZXJyb3c=", 2))
+    latest = rows("lat", ("mask-v0", "ZWFybGllcg==", 1), ("mask-v00", "bGF0ZXN0IQ==", 2))
+    unmeasured = rows("unm", ("mask-v0", "bWVhc3VyZWQ=", 1), ("mask-v00", None, 2))
+    copies = rp.load_plan(db_session).copies
+    assert copies[current].thumbhash == "Y3VycmVudA=="  # the current version wins
+    assert copies[latest].thumbhash == "bGF0ZXN0IQ=="  # else the latest measured
+    assert copies[unmeasured].thumbhash == "bWVhc3VyZWQ="  # an unmeasured row never
+    assert copies[unmeasured].dominant_color == "#000000"
+
+
+def test_a_dry_run_lists_only_what_follows_an_unfinished_runs_cursor(
+    db_session: Session,
+) -> None:
+    origins = sorted(seed_copy(db_session, f"c{i}")["origin"] for i in range(3))
+    db_session.add(
+        SpineReportRun(
+            status="running",
+            counts={},
+            batch_size=200,
+            started_at=AT,
+            cursor_sha256=origins[0],
+        )
+    )
+    db_session.commit()
+
+    def leased(**config: Any) -> list[str]:
+        _, lines = _run(db_session, None, dry_run=True, **config)
+        lease = next(w for w in lines if w.get("rpc") == "LeasePendingImages")
+        return sorted(lease["origin_sha256"])
+
+    assert leased() == origins[1:]
+    assert leased(restart=True) == origins
+
+
+def test_an_ok_mask_with_no_public_object_is_refused_by_name_not_given_a_mime(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    fake.depict(a["origin"])
+    db_session.delete(db_session.get(PublicObject, a["masks"][0]))
+    db_session.commit()
+    assert rp.load_plan(db_session).reports_for(a["clean"]) == []
+    code, lines = _run(db_session, None, dry_run=True)
+    assert code == rp.EXIT_DONE
+    assert _batches(lines)[0]["local"]["refused"] == {"mask_object": 1}
+    assert not [w for w in lines if w.get("rpc") == "ReportMask"]
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_REFUSED
+    assert fake.sent("ReportMask") == [] and fake.sent("WithdrawMask") == []
+    batch = _batches(lines)[0]
+    assert batch["local"]["refused"] == {"mask_object": 1}
+    assert any(a["masks"][0] in w and "no public object" in w for w in batch["warnings_sample"])
+
+
+def test_a_negative_zero_fraction_is_sent_as_zero(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    fake.depict(a["origin"])
+    row = db_session.execute(select(ImageMask)).scalar_one()
+    row.bottom_margin_frac = -0.0
+    db_session.commit()
+    code, _ = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    assert fake.sent("ReportMask")[0].grounding.bottom_margin_frac == "0.0"

@@ -94,9 +94,25 @@ def test_an_unmeasured_or_unsendable_appearance_is_sent_absent() -> None:
     ]
 
 
-def test_dimensions_outside_the_contract_are_sent_absent() -> None:
-    m = msg.derivative_report(PI, _copy(width=0, height=2**31), pipeline_version="v").message
-    assert not m.HasField("width") and not m.HasField("height")
+@pytest.mark.parametrize("width, height", [(0, 2**31), (-5, 2**40)])
+def test_dimensions_outside_the_contract_are_sent_as_zero_for_the_spine_to_absorb(
+    width: int, height: int
+) -> None:
+    built = msg.derivative_report(PI, _copy(width=width, height=height), pipeline_version="v")
+    m = built.message
+    # a DERIVED report without them is refused; 0 is stored as unknown, warned
+    assert m.HasField("width") and m.HasField("height")
+    assert (m.width, m.height) == (0, 0)
+    assert built.warnings == [
+        f"width {width} outside 1..2147483647: sent as 0 (unknown)",
+        f"height {height} outside 1..2147483647: sent as 0 (unknown)",
+    ]
+
+
+def test_the_edges_of_the_dimension_range_are_sent_as_they_are() -> None:
+    built = msg.derivative_report(PI, _copy(width=1, height=2**31 - 1), pipeline_version="v")
+    assert (built.message.width, built.message.height) == (1, 2**31 - 1)
+    assert built.warnings == []
 
 
 @pytest.mark.parametrize(

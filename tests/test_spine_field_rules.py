@@ -135,6 +135,7 @@ def test_a_fraction_is_decimal_text_on_the_contract_grammar() -> None:
     assert fr.decimal_text(1.0) == "1.0"
     assert fr.decimal_text(1e-05) == "0.00001"  # never an exponent
     assert fr.decimal_text(0.1 + 0.2) == "0.30000000000000004"
+    assert fr.decimal_text(-0.0) == "0.0"  # zero, whatever its sign bit
     for bad in (-0.25, math.nan, math.inf, -math.inf, None):
         assert fr.decimal_text(bad) is None
     tiny = fr.decimal_text(1e-40)
