@@ -909,3 +909,26 @@ def test_a_negative_zero_fraction_is_sent_as_zero(
     code, _ = _run(db_session, url)
     assert code == rp.EXIT_DONE
     assert fake.sent("ReportMask")[0].grounding.bottom_margin_frac == "0.0"
+
+
+def test_a_repeated_warning_is_counted_every_time_and_quoted_once(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", masks=())
+    seed_copy(db_session, "b", masks=(("mask-v1", "ok", "mb"),))
+    for row in db_session.execute(select(ImageMask)).scalars():
+        row.plain_dominant_color = "red"  # off the contract spelling: dropped, warned
+    db_session.commit()
+    b_origin = sha("orig:b")
+    for _ in range(3):
+        fake.depict(b_origin)
+    fake.depict(a["origin"])
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    batch = _batches(lines)[0]
+    assert batch["local"]["warnings"] == 3
+    assert (
+        batch["warnings_sample"].count("local: dominant_color off the contract spelling: dropped")
+        == 1
+    )
