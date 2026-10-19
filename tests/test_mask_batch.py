@@ -1638,6 +1638,11 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--residential-ttl", "-1"),
         ("--gpu-free-min-mib", "0"),  # would pass a full card
         ("--gpu-free-min-mib", "1023"),
+        ("--writers", "-1"),
+        ("--writers", "9"),  # more sessions than the pool lends
+        ("--writers", "two"),
+        ("--prefetch", "0"),
+        ("--prefetch", "17"),  # originals held in memory
     ],
 )
 def test_a_bad_run_option_is_refused_by_the_parser(
@@ -1665,6 +1670,10 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--max-wait-seconds", "0", "max_wait_seconds", 0.0),
         ("--residential-ttl", "0.5", "residential_ttl", 0.5),
         ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
+        ("--writers", "0", "writers", 0),
+        ("--writers", "8", "writers", 8),
+        ("--prefetch", "1", "prefetch", 1),
+        ("--prefetch", "16", "prefetch", 16),
     ],
 )
 def test_the_smallest_sane_run_options_are_accepted(
@@ -2376,7 +2385,7 @@ _CHUNK_KEYS = {
     "event", "chunk", "batch_id", "count", "counts", "ranks", "seconds_per_image",
     "median_seconds", "masked", "seconds_per_masked_image", "mask_seconds_per_image",
     "peak_vram_mib", "baseline_vram_mib", "provider", "failures", "yielded",
-    "elapsed_seconds", "held_vram_mib",
+    "elapsed_seconds", "held_vram_mib", "throughput_seconds_per_image",
 }  # fmt: skip
 _STAGE_KEYS = {"stage_seconds_per_image", "stage_median_seconds", "stage_images"}
 
@@ -3061,3 +3070,93 @@ def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) 
     finally:
         other.close()
         engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# MASK-PERF-2: the pipeline's options, the throughput, the recent writes
+# --------------------------------------------------------------------------
+
+
+def test_the_pipeline_is_on_by_default_on_the_command_line() -> None:
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    assert (args.writers, args.prefetch) == (mb.DEFAULT_WRITERS, mb.DEFAULT_PREFETCH)
+    assert args.writers > 0
+    assert mb.BatchConfig().writers == 0  # a library caller runs one image at a time
+
+
+def test_main_passes_the_pipeline_options_and_keeps_writes_for_every_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        seen.update(config=config, store=rt.media_store)
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["--sandbox", str(tmp_path / "sb"), "run", "--worklist", str(wl), "--raw-dir"]
+    argv += [str(tmp_path / "raw"), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "3", "--prefetch", "2"]) == 0
+    assert (seen["config"].writers, seen["config"].prefetch) == (3, 2)
+    assert seen["store"].keep == 4 + 3 * 3  # each worker's original, copy and mask
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    assert seen["store"].keep == 4
+
+
+def test_the_chunk_reports_its_throughput(db_session: Session, tmp_path: Path) -> None:
+    """Wall seconds of the chunk over its images: what a pipelined chunk
+    gains shows here, not in the per-image seconds."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+
+    class _Timed(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(3)
+            return super().predict_alpha(image)
+
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events)
+    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(chunk_size=2), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["elapsed_seconds"] == 6.0
+    assert chunk["throughput_seconds_per_image"] == 3.0
+
+
+def test_recent_writes_are_safe_from_many_workers() -> None:
+    """Workers evicting at once must not evict one copy twice (a KeyError
+    in a PUT that succeeded) nor grow past the bound."""
+    import threading
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.objects: dict[str, bytes] = {}
+
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            self.objects[key] = data
+
+        def get(self, key: str) -> bytes:
+            return self.objects[key]
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as the interpreter can
+    try:
+        store = mb.RecentWrites(_Memory(), keep=4)  # type: ignore[arg-type]
+        errors: list[BaseException] = []
+
+        def work(n: int) -> None:
+            try:
+                for i in range(3000):
+                    store.put(f"k{n}-{i}", b"x", "image/png")
+            except BaseException as exc:  # the failure itself
+                errors.append(exc)
+
+        workers = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
+    assert len(store._recent) == 4

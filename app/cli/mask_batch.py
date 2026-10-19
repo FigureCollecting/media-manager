@@ -7,6 +7,7 @@
         [--busy-windows SPEC] [--residential-ip IP|CIDR | --no-residential-check]
         [--ip-echo-url URL] [--residential-ttl S] [--poll-seconds S]
         [--max-wait-seconds S] [--max-consecutive-failures N] [--raw-dir DIR]
+        [--writers N] [--prefetch N]
     python -m app.cli.mask_batch sql ross-heads --user UUID
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
@@ -63,6 +64,24 @@ add up to the seconds per image only when every image ran every stage. ``--dry-r
 reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
+THE PIPELINE (MASK-PERF-2). The images of a chunk run ``--writers`` at a
+time (default 6), each on a worker with a database session of its own, and
+the next ``--prefetch`` originals (default 4) are read, decoded and
+hash-checked ahead; the model runs on the driver's thread alone, one image
+at a time, so one image's I/O (its read, its seed, its judgment, its
+uploads and rows) overlaps another's model run. Each image's own work runs
+in the same order as before, and what it writes is what one image at a
+time writes: images of one picture (their originals, captures, copies and
+gallery link meet: app.workers.mask_pipeline) wait for each other in
+work-list order, and the batch row is written in that order. A record is
+written, in work-list order, once its image's writes committed. A stop, a
+scraper window or the circuit lets no further image start or onto the GPU:
+the images past the GPU finish, the others are let go unrecorded and come
+back first. Each image's stages are its own wall time, the pipeline's waits
+among them (``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
+``throughput_seconds_per_image`` is its wall time over its images.
+``--writers 0`` runs one image at a time on the driver's own session.
+
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
 SIGTERM: the image in flight is finished first).
@@ -71,14 +90,17 @@ SIGTERM: the image in flight is finished first).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
+import functools
 import gzip
 import hashlib
 import ipaddress
 import json
 import math
 import os
+import queue
 import re
 import signal
 import statistics
@@ -86,15 +108,21 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import Any
 
 import httpx
-from sqlalchemy.orm import Session
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 
+from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
 from ..workers.mask_job import (
     finish_mask_batch,
@@ -102,8 +130,9 @@ from ..workers.mask_job import (
     original_settled,
     settle_clean_copy,
 )
+from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Turns, on_the_gpu
 from ..workers.mask_policy import ImageOrigin
-from ..workers.mask_seed import seed_clean_image
+from ..workers.mask_seed import PictureKeys, picture_keys, seed_clean_image, seed_footprint
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
 from ..workers.stage_timing import STAGES, DatabaseSeconds, StageTimings, timed
 
@@ -128,6 +157,13 @@ OWN_MAX_MIB = (
     (BiRefNetMattingBackend.GPU_MEM_LIMIT + IsNetMattingBackend.GPU_MEM_LIMIT) >> 20
 ) + 512
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
+#: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
+#: database session (0: one image at a time, the driver's own session)...
+DEFAULT_WRITERS = 6
+MAX_WRITERS = 8  # the media db's pool lends 30 connections, the sandbox's 15
+#: ...and the originals read, decoded and hash-checked ahead of them.
+DEFAULT_PREFETCH = 4
+MAX_PREFETCH = 16
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -636,15 +672,19 @@ class RecentWrites:
     A kept copy is served only when the bucket's ETag (a HEAD, no body) is
     the md5 of the kept bytes, so the lane's hash check still covers what the
     bucket holds: a PUT the bucket stored wrong, a store with no ETag, an ETag
-    that is no md5 (multipart) or a HEAD that fails all read the bucket."""
+    that is no md5 (multipart) or a HEAD that fails all read the bucket.
+    Pipelined (MASK-PERF-2) its workers share it: ``keep`` covers each
+    one's last original, copy and mask, and the kept copies are locked."""
 
     def __init__(self, store: ObjectStore, *, keep: int = 4) -> None:
         self._store = store
-        self._keep = keep
+        self.keep = keep
         self._recent: dict[str, bytes] = {}
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> bytes:
-        kept = self._recent.get(key)
+        with self._lock:
+            kept = self._recent.get(key)
         if kept is not None and self._stored_as(key, kept):
             return kept
         return self._store.get(key)
@@ -661,10 +701,11 @@ class RecentWrites:
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         self._store.put(key, data, content_type)
-        self._recent.pop(key, None)
-        self._recent[key] = data
-        while len(self._recent) > self._keep:
-            del self._recent[next(iter(self._recent))]
+        with self._lock:
+            self._recent.pop(key, None)
+            self._recent[key] = data
+            while len(self._recent) > self.keep:
+                del self._recent[next(iter(self._recent))]
 
 
 # --------------------------------------------------------------------------
@@ -674,6 +715,11 @@ class RecentWrites:
 
 @dataclass
 class BatchConfig:
+    """``writers`` above 0 runs each chunk's images that many at a time, each
+    on a worker with a database session of its own, ``prefetch`` originals
+    read ahead (MASK-PERF-2); 0 runs one image at a time on the driver's own
+    session, as before (the command line's default is the pipeline)."""
+
     chunk_size: int = 20
     limit: int | None = None
     retry_failed: bool = False
@@ -681,6 +727,8 @@ class BatchConfig:
     poll_seconds: float = 60.0
     max_wait_seconds: float | None = None
     max_consecutive_failures: int = 5
+    writers: int = 0
+    prefetch: int = 4
 
 
 @dataclass
@@ -762,6 +810,10 @@ class _Chunk:
             ],
             "yielded": self.yielded,
             "elapsed_seconds": round(elapsed, 3),
+            # the chunk's wall seconds over its images: what overlapping them gains
+            "throughput_seconds_per_image": (
+                round(elapsed / len(self.records), 3) if self.records else None
+            ),
         }
 
 
@@ -840,12 +892,16 @@ def _mint(
     batch: Any,
     retry_failed: bool,
     timings: StageTimings | None = None,
+    lane: _ImageLane | None = None,
 ) -> dict[str, Any]:
     """One original, start to finish; the result as its progress record.
     ``timings``, when given, gets the seconds of each stage (MASK-PERF-1);
-    its SQL's seconds are the batch's to time (DatabaseSeconds, run_batch)."""
+    its SQL's seconds are the batch's to time (DatabaseSeconds, run_batch).
+    ``lane``, pipelined (MASK-PERF-2): the image's claim before its first
+    query, its original read ahead, the hold checked before its seed and its
+    turn before its batch-row writes; its seconds read ahead count as its."""
     assert rt.raw_store is not None and rt.media_store is not None
-    start = rt.monotonic()
+    start = rt.monotonic() - (lane.ahead if lane is not None else 0.0)
     with timed(timings, "db"):  # read again from the database once a rollback expired it
         batch_id = getattr(batch, "id", None)
     record: dict[str, Any] = {
@@ -877,6 +933,8 @@ def _mint(
 
     media = _Witness(rt.media_store, timings)
     try:
+        if lane is not None:
+            lane.claim(db)  # its footprint read, and the related images it waits for
         with timed(timings, "db"):  # the image's first query: the pool's checkout too
             settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
@@ -887,12 +945,18 @@ def _mint(
     if item.codec not in ("identity", "gzip"):
         return failed(f"unsupported_codec:{item.codec}")
     try:
-        with timed(timings, "fetch"):
-            data = _decode(rt.raw_store.get(item.storage_key), item.codec)
+        if lane is None:
+            with timed(timings, "fetch"):
+                data = _decode(rt.raw_store.get(item.storage_key), item.codec)
+        else:
+            start -= lane.fetch_seconds  # read ahead, before the image had a worker
+            data = lane.fetched()
     except Exception as exc:
         return raised("fetch", exc)
     if hashlib.sha256(data).hexdigest() != item.blob_sha256:
         return failed("raw_hash_mismatch")
+    if lane is not None:
+        lane.before_seed()  # held: nothing of it written, a rerun takes it
     try:
         with timed(timings, "seed"):
             clean = seed_clean_image(
@@ -916,6 +980,7 @@ def _mint(
             batch=batch,
             retry_failed=retry_failed,
             timings=timings,
+            turn=lane.turn if lane is not None else None,
         )
     except Exception as exc:
         return rolled_back("settle", exc)
@@ -931,6 +996,425 @@ def _mint(
         record.update(status=report.status, reason=report.reason, mask_sha256=report.mask_sha256)
     record["seconds"] = round(rt.monotonic() - start, 3)
     return record
+
+
+# --------------------------------------------------------------------------
+# the pipeline (MASK-PERF-2)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _Fetched:
+    """An original read ahead: its bytes or the error reading them, its
+    picture's keys (None when it never reaches the seed), and the seconds
+    each took on the read-ahead thread."""
+
+    data: bytes | None = None
+    error: Exception | None = None
+    keys: PictureKeys | None = None
+    fetch_seconds: float = 0.0
+    keys_seconds: float = 0.0
+
+
+def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
+    """``item``'s original from the raw bucket, decoded and checked against
+    its sha, and its picture's keys, before the image has a worker. An
+    original in a codec the lane refuses is never read."""
+    assert rt.raw_store is not None
+    if item.codec not in ("identity", "gzip"):
+        return _Fetched()
+    start = rt.monotonic()
+    try:
+        data = _decode(rt.raw_store.get(item.storage_key), item.codec)
+    except Exception as exc:
+        return _Fetched(error=exc, fetch_seconds=rt.monotonic() - start)
+    fetched = rt.monotonic()
+    keys = None
+    if hashlib.sha256(data).hexdigest() == item.blob_sha256:
+        # a picture that will not decode fails the seed before it writes a row
+        with contextlib.suppress(Exception):
+            keys = picture_keys(data)
+    return _Fetched(
+        data=data,
+        keys=keys,
+        fetch_seconds=fetched - start,
+        keys_seconds=rt.monotonic() - fetched,
+    )
+
+
+class _BatchRow:
+    """The chunk's batch row as the last image to write it left it (its
+    counts and cursor), lent to the next image's own copy of the row at its
+    turn: each image's UPDATE is the one one image at a time makes. Unknown
+    after an image whose last write rolled back: the next one reads the row
+    again, as one image at a time does after a rollback."""
+
+    def __init__(self, batch: MaskBatch) -> None:
+        self._state: tuple[dict[str, int], str | None] | None = (
+            dict(batch.counts),
+            batch.cursor_sha256,
+        )
+
+    def lend(self, db: Session, batch: MaskBatch) -> None:
+        if self._state is None:
+            db.expire(batch, ["counts", "cursor_sha256"])
+            return
+        counts, cursor = self._state
+        set_committed_value(batch, "counts", dict(counts))
+        set_committed_value(batch, "cursor_sha256", cursor)
+
+    def keep(self, batch: MaskBatch) -> None:
+        state = inspect(batch)
+        loaded = state.dict
+        if state.modified or "counts" not in loaded or "cursor_sha256" not in loaded:
+            self._state = None
+        else:
+            self._state = (dict(loaded["counts"]), loaded["cursor_sha256"])
+
+
+@dataclass
+class _Done:
+    """An image off its worker: its record, or None when it was held."""
+
+    index: int
+    record: dict[str, Any] | None
+    stages: dict[str, float]
+    error: BaseException | None = None
+
+
+@dataclass(eq=False)
+class _ChunkRun:
+    """What one chunk's workers share: the claims, the turns, the batch row,
+    the hold, and the queue to the driver's thread (a GPU job or an image
+    done; at most one of either per worker, so never more than ``writers``)."""
+
+    batch: MaskBatch
+    events: queue.Queue[GpuJob | _Done]
+    claims: Claims = field(default_factory=Claims)
+    turns: Turns = field(default_factory=Turns)
+    hold: threading.Event = field(default_factory=threading.Event)
+    row: _BatchRow = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.row = _BatchRow(self.batch)
+
+    def submit(self, call: Callable[[], Any]) -> Any:
+        """Run ``call`` (a model call) on the driver's thread, and wait."""
+        job = GpuJob(call)
+        self.events.put(job)
+        return job.wait()
+
+
+class _ImageLane:
+    """One image's place in the pipeline, as ``_mint`` meets it."""
+
+    def __init__(
+        self,
+        run: _ChunkRun,
+        index: int,
+        item: WorkItem,
+        fetched: _Fetched,
+        db: Session,
+        batch: MaskBatch,
+        timings: StageTimings,
+    ) -> None:
+        self._run, self._index, self._item = run, index, item
+        self._fetched, self._db, self._batch, self._timings = fetched, db, batch, timings
+        self._claim: Claim | None = None
+        self._registered = False
+        self._turned = False
+        timings.add("claim", fetched.keys_seconds)  # its picture keys, read ahead
+        self.ahead = fetched.keys_seconds
+        self.fetch_seconds = fetched.fetch_seconds
+
+    def claim(self, db: Session) -> None:
+        """Before the image's first query: read its footprint, register it in
+        work-list order and wait for every earlier image it meets."""
+        self.before_seed()  # held before it began: not even a query
+        with self._timings.stage("claim"):
+            since = self._run.claims.snapshot()
+            shas, digests = {self._item.blob_sha256}, set()
+            keys = self._fetched.keys
+            if keys is not None:
+                shas.add(keys.clean_sha256)
+                digests = {keys.digest, keys.own_digest}
+            try:
+                footprint = seed_footprint(db, shas=shas, digests=digests)
+            except BaseException:
+                self._registered = True
+                self._run.claims.skip(self._index)
+                raise
+            # the seed reads its gallery link by the product and the URL
+            footprint.add(f"gallery {self._item.product_id} {self._item.url or ''}")
+            self._claim, waits = self._run.claims.register(self._index, footprint, since)
+            self._registered = True
+        with self._timings.stage("turn_wait"):
+            for earlier in waits:
+                earlier.done.wait()
+
+    def fetched(self) -> bytes:
+        self._timings.add("fetch", self._fetched.fetch_seconds)
+        if self._fetched.error is not None:
+            raise self._fetched.error
+        assert self._fetched.data is not None
+        return self._fetched.data
+
+    def before_seed(self) -> None:
+        if self._run.hold.is_set():
+            raise Held
+
+    def turn(self) -> None:
+        """Before the image's batch-row writes: once every image before it
+        has ended; the row as the last of them left it."""
+        if self._turned:
+            return
+        with self._timings.stage("turn_wait"):
+            self._run.turns.take(self._index)
+        self._turned = True
+        self._run.row.lend(self._db, self._batch)
+
+    def close(self) -> None:
+        """The image ended (recorded, held or broken): whoever waits goes on."""
+        if not self._registered:
+            self._run.claims.skip(self._index)
+        if self._turned:
+            self._run.row.keep(self._batch)
+        if self._claim is not None:
+            self._run.claims.finish(self._claim)
+        self._run.turns.end(self._index)
+
+
+class _Pipeline:
+    """A chunk's images, ``writers`` at a time (each on a worker thread with
+    a session of its own, ``_mint`` as ever), ``prefetch`` originals read
+    ahead, the model on the driver's thread alone. Records are taken in
+    work-list order, each once its image's writes committed. A stop, a scraper
+    window or the circuit HOLDS the chunk: no further image starts or gets
+    onto the GPU; the images already past the GPU finish, the others are let
+    go unrecorded (``Held``) and come back first for the next chunk. At most
+    ``writers`` images are under way past the last one recorded, so an outage
+    opens the circuit after at most ``writers`` - 1 images more than one at a
+    time would have tried."""
+
+    def __init__(
+        self,
+        rt: Runtime,
+        config: BatchConfig,
+        backend: MattingBackend,
+        sql: DatabaseSeconds,
+        sessions: sessionmaker[Session],
+        interrupted: set[str],
+    ) -> None:
+        self.rt, self.config, self.backend, self.sql = rt, config, backend, sql
+        self.sessions, self.interrupted = sessions, interrupted
+
+    def run_chunk(
+        self,
+        items: list[WorkItem],
+        batch: MaskBatch,
+        chunk: _Chunk,
+        take: Callable[[dict[str, Any], dict[str, float]], bool],
+    ) -> list[WorkItem]:
+        """Run ``items``; ``take`` each record (True: hold, the circuit is
+        open). Returns the items not done: the held ones, then the unstarted."""
+        writers, prefetch = self.config.writers, self.config.prefetch
+        run = _ChunkRun(batch=batch, events=queue.Queue(maxsize=2 * writers))
+        gpu = on_the_gpu(self.backend, run.submit)
+        pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
+        ahead: dict[int, Future[_Fetched]] = {}
+        workers: list[threading.Thread] = []
+        done: dict[int, _Done] = {}
+        held: list[int] = []
+        failure: BaseException | None = None
+        started = emitted = in_flight = 0
+
+        def holding() -> bool:
+            if not run.hold.is_set():
+                if self.rt.stop_requested():
+                    run.hold.set()
+                elif self.rt.gates.busy() is not None:
+                    chunk.yielded = True
+                    run.hold.set()
+            return run.hold.is_set()
+
+        def read_ahead() -> None:
+            for i in range(started, min(len(items), started + prefetch)):
+                if i not in ahead:
+                    ahead[i] = pool.submit(_read_ahead, items[i], self.rt)
+
+        try:
+            while True:
+                # at most ``writers`` images past the last one recorded: one that
+                # ends early (no row to write) never lets the chunk run further ahead
+                while started - emitted < writers and started < len(items) and not holding():
+                    read_ahead()
+                    worker = threading.Thread(
+                        target=self._work,
+                        args=(run, gpu, started, items[started], ahead.pop(started)),
+                        name=f"mask-image-{started}",
+                    )
+                    workers.append(worker)
+                    worker.start()
+                    started += 1
+                    in_flight += 1
+                if not run.hold.is_set():
+                    read_ahead()
+                if not in_flight:
+                    break
+                event = run.events.get()
+                if isinstance(event, GpuJob):
+                    if holding():
+                        event.refuse()
+                    else:
+                        event.run()
+                    continue
+                in_flight -= 1
+                done[event.index] = event
+                while emitted in done:
+                    ended = done.pop(emitted)
+                    emitted += 1
+                    if ended.error is not None:
+                        failure = failure or ended.error
+                        run.hold.set()
+                    elif ended.record is None:
+                        held.append(ended.index)
+                    elif take(ended.record, ended.stages):
+                        run.hold.set()
+        finally:
+            run.hold.set()
+            while in_flight:  # the driver broke off: let every worker go
+                event = run.events.get()
+                if isinstance(event, GpuJob):
+                    event.refuse()
+                else:
+                    in_flight -= 1
+            pool.shutdown(wait=True, cancel_futures=True)
+            for worker in workers:
+                worker.join()
+        if failure is not None:
+            raise failure
+        return [items[i] for i in held] + items[started:]
+
+    def _work(
+        self,
+        run: _ChunkRun,
+        gpu: MattingBackend,
+        index: int,
+        item: WorkItem,
+        ahead: Future[_Fetched],
+    ) -> None:
+        db = self.sessions()
+        timings = StageTimings(self.rt.monotonic)
+        lane: _ImageLane | None = None
+        record: dict[str, Any] | None = None
+        error: BaseException | None = None
+        try:
+            fetched = ahead.result()
+            batch = db.merge(run.batch, load=False)  # the row, without reading it
+            lane = _ImageLane(run, index, item, fetched, db, batch, timings)
+            redrive = self.config.retry_failed or item.blob_sha256 in self.interrupted
+            with self.sql.charging(timings):
+                record = _mint(db, item, self.rt, gpu, batch, redrive, timings, lane)
+        except Held:
+            with contextlib.suppress(Exception):
+                db.rollback()  # its judgment's reads: its seed, if any, is committed
+        except BaseException as exc:  # a fault of the batch's own: it stops
+            error = exc
+        finally:
+            if lane is not None:
+                lane.close()
+            else:
+                run.claims.skip(index)
+                run.turns.end(index)
+            with contextlib.suppress(Exception):
+                db.close()
+            run.events.put(_Done(index, record, timings.seconds, error))
+
+
+def _pipeline_refusal(db: Session, writers: int) -> str | None:
+    """Why the pipeline cannot run on ``db``'s pool, or None: every worker
+    holds a connection of its own while its image runs, and the batch its own."""
+    pool = db.get_bind().engine.pool
+    needed = writers + 1
+    if isinstance(pool, StaticPool | SingletonThreadPool):
+        lends: float = 1
+    elif isinstance(pool, QueuePool):
+        overflow = pool._max_overflow
+        lends = math.inf if overflow < 0 else pool.size() + overflow
+    else:
+        return None  # a connection per checkout
+    if lends >= needed:
+        return None
+    return (
+        f"--writers {writers} needs {needed} database connections at once (one per "
+        f"worker, one for the batch), the pool lends {lends:g}: fewer writers, "
+        "or --writers 0 for one image at a time"
+    )
+
+
+class _Tally:
+    """The batch's running count across chunks: the outage streak and
+    whether the model's own memory is measured since it was loaded."""
+
+    def __init__(self, max_consecutive_failures: int) -> None:
+        self.max = max_consecutive_failures
+        self.streak = (
+            0  # outage casualties in a row (an image's own fault neither counts nor resets)
+        )
+        self.measured = False
+
+    def take(
+        self,
+        rt: Runtime,
+        chunk: _Chunk,
+        gpu: GpuGate | None,
+        record: dict[str, Any],
+        stages: dict[str, float],
+    ) -> bool:
+        """One image's record, in work-list order: True once the circuit opens."""
+        record["chunk"] = chunk.number
+        if gpu is not None and not self.measured and record["status"] in _RAN_MODEL:
+            gpu.measure_own()
+            self.measured = True
+        rt.progress.append(record)
+        chunk.records.append(record)
+        chunk.stages.append(stages)
+        if record["status"] == "interrupted":
+            self.streak += 1
+        elif record["status"] != "failed":
+            self.streak = 0
+        return self.streak >= self.max
+
+
+def _one_at_a_time(
+    items: list[WorkItem],
+    rt: Runtime,
+    config: BatchConfig,
+    backend: MattingBackend,
+    db: Session,
+    batch: MaskBatch,
+    sql: DatabaseSeconds,
+    interrupted: set[str],
+    chunk: _Chunk,
+    take: Callable[[dict[str, Any], dict[str, float]], bool],
+) -> list[WorkItem]:
+    """``items`` one at a time on the driver's own session (``writers`` 0).
+    Returns the items not done: a stop or a scraper window stops before an
+    image, the circuit after one."""
+    for n, item in enumerate(items):
+        if rt.stop_requested():
+            return items[n:]
+        if rt.gates.busy() is not None:
+            chunk.yielded = True
+            return items[n:]
+        # an outage's casualties are re-driven without --retry-failed
+        redrive = config.retry_failed or item.blob_sha256 in interrupted
+        timings = StageTimings(rt.monotonic)
+        with sql.charging(timings):
+            record = _mint(db, item, rt, backend, batch, redrive, timings)
+        if take(record, timings.seconds):
+            return items[n + 1 :]
+    return []
 
 
 def _wait_for_gate(rt: Runtime, config: BatchConfig, backend: MattingBackend | None) -> bool:
@@ -1023,22 +1507,35 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         rt.emit({"event": "refused", "detail": f"backend {backend.name!r} is not a mask model"})
         return 2
     db = rt.open_db()
+    sessions: sessionmaker[Session] | None = None
+    if config.writers:
+        refusal = _pipeline_refusal(db, config.writers)
+        if refusal is not None:
+            rt.emit({"event": "refused", "detail": refusal})
+            return 2
+        # each worker's session as the batch's own is, on its engine
+        sessions = sessionmaker(
+            bind=db.get_bind(), autoflush=db.autoflush, expire_on_commit=db.expire_on_commit
+        )
     totals: dict[str, int] = {}
-    streak = 0  # outage casualties in a row (an image's own fault neither counts nor resets)
-    position = 0
+    tally = _Tally(config.max_consecutive_failures)
+    remaining = deque(pending)
     chunk_no = 0
     loaded = False
-    measured = False
-    sql = DatabaseSeconds(db)  # each image's statements, commits and rollbacks as its "db"
+    # each image's statements, commits and rollbacks as its "db"
+    sql = DatabaseSeconds(db, sessions)
+    pipeline = (
+        None if sessions is None else _Pipeline(rt, config, backend, sql, sessions, interrupted)
+    )
     try:
-        while position < len(pending):
+        while remaining:
             if _wait_for_gate(rt, config, backend if loaded else None):
                 loaded = False
             gpu = rt.gates.gpu
             if not loaded:
                 if gpu is not None:
                     gpu.mark_loading()
-                    measured = False
+                    tally.measured = False
                 try:
                     backend.load()
                 except Exception as exc:
@@ -1055,34 +1552,18 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
             )
             batch = open_mask_batch(db, backend_name=backend.name)
             chunk.batch_id = batch.id
+            todo = [remaining.popleft() for _ in range(min(config.chunk_size, len(remaining)))]
+            take = functools.partial(tally.take, rt, chunk, gpu)
             with rt.vram() as sampler:
-                for item in pending[position : position + config.chunk_size]:
-                    if rt.stop_requested():
-                        break
-                    if rt.gates.busy() is not None:
-                        chunk.yielded = True
-                        break
-                    # an outage's casualties are re-driven without --retry-failed
-                    redrive = config.retry_failed or item.blob_sha256 in interrupted
-                    timings = StageTimings(rt.monotonic)
-                    with sql.charging(timings):
-                        record = _mint(db, item, rt, backend, batch, redrive, timings)
-                    record["chunk"] = chunk_no
-                    if gpu is not None and not measured and record["status"] in _RAN_MODEL:
-                        gpu.measure_own()
-                        measured = True
-                    rt.progress.append(record)
-                    chunk.records.append(record)
-                    chunk.stages.append(timings.seconds)
-                    position += 1
-                    if record["status"] == "interrupted":
-                        streak += 1
-                    elif record["status"] != "failed":
-                        streak = 0
-                    if streak >= config.max_consecutive_failures:
-                        break
+                if pipeline is None:
+                    left = _one_at_a_time(
+                        todo, rt, config, backend, db, batch, sql, interrupted, chunk, take
+                    )
+                else:
+                    left = pipeline.run_chunk(todo, batch, chunk, take)
+            remaining.extendleft(reversed(left))
             finish_mask_batch(db, batch)
-            circuit_open = streak >= config.max_consecutive_failures
+            circuit_open = tally.streak >= config.max_consecutive_failures
             report = chunk.report(sampler.peak_mib, rt.monotonic() - chunk.started)
             report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
             rt.emit(report)
@@ -1091,20 +1572,24 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                 totals[status] = totals.get(status, 0) + n
             if circuit_open:
                 rt.emit(
-                    {"event": "circuit_open", "consecutive_failures": streak, "interrupted": streak}
+                    {
+                        "event": "circuit_open",
+                        "consecutive_failures": tally.streak,
+                        "interrupted": tally.streak,
+                    }
                 )
                 return 3
             if rt.stop_requested():
                 raise _Stopped
     except _Stopped:
-        rt.emit({"event": "stopped", "counts": totals, "pending": len(pending) - position})
+        rt.emit({"event": "stopped", "counts": totals, "pending": len(remaining)})
         return 130
     except _GaveUp as gave_up:
         rt.emit({"event": "gave_up", **gave_up.result.as_dict()})
         return 4
     finally:
         sql.close()
-    rt.emit({"event": "done", "counts": totals, "pending": len(pending) - position})
+    rt.emit({"event": "done", "counts": totals, "pending": len(remaining)})
     return 1 if totals.get("failed") or totals.get("interrupted") else 0
 
 
@@ -1322,6 +1807,8 @@ def _run(args: argparse.Namespace) -> int:
         poll_seconds=args.poll_seconds,
         max_wait_seconds=args.max_wait_seconds,
         max_consecutive_failures=args.max_consecutive_failures,
+        writers=args.writers,
+        prefetch=args.prefetch,
     )
     stop = threading.Event()
     previous: dict[int, Any] = {}
@@ -1341,7 +1828,8 @@ def _run(args: argparse.Namespace) -> int:
 
         raw_store = _raw_store(args)
         db, bucket = open_stores(args.sandbox)
-        media_store = RecentWrites(bucket)
+        # each worker's original, copy and mask kept until it reads its copy back
+        media_store = RecentWrites(bucket, keep=4 + 3 * args.writers)
         sessions.append(db)
     rt = Runtime(
         gates=gates,
@@ -1381,7 +1869,7 @@ def _sql(args: argparse.Namespace) -> int:
     return 0
 
 
-def _whole(minimum: int) -> Callable[[str], int]:
+def _whole(minimum: int, maximum: int | None = None) -> Callable[[str], int]:
     def parse(text: str) -> int:
         try:
             value = int(text)
@@ -1389,6 +1877,8 @@ def _whole(minimum: int) -> Callable[[str], int]:
             raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
         if value < minimum:
             raise argparse.ArgumentTypeError(f"must be {minimum} or more, got {value}")
+        if maximum is not None and value > maximum:
+            raise argparse.ArgumentTypeError(f"must be {maximum} or less, got {value}")
         return value
 
     return parse
@@ -1453,6 +1943,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--poll-seconds", type=_seconds(1.0, 3600.0), default=60.0)
     run.add_argument("--max-wait-seconds", type=_seconds(0.0))
     run.add_argument("--max-consecutive-failures", type=_whole(1), default=5)
+    run.add_argument("--writers", type=_whole(0, MAX_WRITERS), default=DEFAULT_WRITERS)
+    run.add_argument("--prefetch", type=_whole(1, MAX_PREFETCH), default=DEFAULT_PREFETCH)
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 
     sql = sub.add_parser("sql", help="print a read-only work-list query")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import io
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -250,6 +251,68 @@ def link_capture(db: Session, image: ImageModel, digest: str) -> list[PublicObje
     copies = _copies_showing(db, digest, image.sha256)
     _join_picture(db, {c.sha256 for c in copies}, {image.id})
     return copies
+
+
+class PictureKeys(NamedTuple):
+    """What ``seed_clean_image`` finds an original's picture by, from its
+    bytes alone: its pixel digest, the sha of the clean copy it would mint,
+    and that copy's own pixel digest."""
+
+    digest: str
+    clean_sha256: str
+    own_digest: str
+
+
+def picture_keys(original: bytes) -> PictureKeys:
+    """``original``'s ``PictureKeys``, computed exactly as the seed computes
+    them (MASK-PERF-2: the pipelined batch claims them before the seed)."""
+    picture = _picture(original)
+    clean, _mime = _encode(picture, original)
+    return PictureKeys(_digest(picture), hashlib.sha256(clean).hexdigest(), pixel_digest(clean))
+
+
+def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str]:
+    """The keys of every row seeding and settling an image may read or write
+    (MASK-PERF-2): its own byte shas (``shas``: the original's, the clean
+    copy's) and pixel digests (``digests``), and the sha of every image and
+    public object they lead to -- an image with one of those shas or pixel
+    digests, an object with one of those shas or either digest -- grown
+    through every capture-to-copy link to its fixed point, as
+    ``link_capture`` and ``_join_picture`` grow a picture. Two images whose
+    footprints do not meet cannot see each other's rows; read now, it may
+    miss what an image still in flight is about to link (the pipeline joins
+    those by their own footprints)."""
+    images = set(
+        db.execute(
+            select(ImageModel.sha256).where(
+                or_(ImageModel.sha256.in_(shas), ImageModel.pixel_sha256.in_(digests))
+            )
+        ).scalars()
+    )
+    objects = set(
+        db.execute(
+            select(PublicObject.sha256).where(
+                or_(
+                    PublicObject.sha256.in_(shas),
+                    PublicObject.pixel_sha256.in_(digests),
+                    PublicObject.own_pixel_sha256.in_(digests),
+                )
+            )
+        ).scalars()
+    )
+    while images or objects:
+        links = db.execute(
+            select(PublicObjectImage.sha256, ImageModel.sha256)
+            .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
+            .where(or_(PublicObjectImage.sha256.in_(objects), ImageModel.sha256.in_(images)))
+        ).all()
+        more_objects = {obj for obj, _image in links} - objects
+        more_images = {image for _obj, image in links} - images
+        if not more_objects and not more_images:
+            break
+        objects |= more_objects
+        images |= more_images
+    return shas | digests | images | objects
 
 
 def _original_key(sha256: str, mime: str) -> str:

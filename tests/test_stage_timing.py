@@ -441,3 +441,77 @@ def test_only_the_image_being_timed_is_charged_and_close_leaves_no_listener(
     sql.close()
     assert listeners() == before
     assert timings.seconds == {"db": 0.0625}
+
+
+# --------------------------------------------------------------------------
+# MASK-PERF-2: seconds measured elsewhere, and one image per worker thread
+# --------------------------------------------------------------------------
+
+
+def test_seconds_measured_ahead_are_added_to_no_open_stage() -> None:
+    clock = _Clock()
+    timings = StageTimings(clock)
+    with timings.stage("seed"):
+        clock.now += 1.0
+        timings.add("fetch", 0.5)  # read ahead on another thread
+    timings.add("fetch", 0.25)
+    assert timings.seconds == {"seed": 1.0, "fetch": 0.75}
+
+
+def test_each_worker_thread_charges_its_own_image(tmp_path: Any) -> None:
+    """Two workers, each with its session on one engine, each timing its
+    image: every statement is charged to the image of the thread it ran on,
+    a commit on the session that ran it, and nothing to the other."""
+    import threading
+
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'db.sqlite'}", connect_args={"check_same_thread": False}
+    )
+    _Base.metadata.create_all(engine)
+    lock = threading.Lock()
+    clocks: dict[int, float] = {}
+
+    def clock() -> float:  # each thread's own fake time
+        return clocks.setdefault(threading.get_ident(), 0.0)
+
+    def cost(seconds: float) -> Any:
+        def listener(*a: Any) -> None:
+            with lock:
+                clocks[threading.get_ident()] = clock() + seconds
+
+        return listener
+
+    event.listen(engine, "before_cursor_execute", cost(0.0625))
+    event.listen(engine, "commit", cost(0.5))
+    main = Session(engine)
+    sessions = sessionmaker(bind=engine)
+    sql = DatabaseSeconds(main, sessions)
+    barrier = threading.Barrier(2)
+    seen: dict[str, dict[str, float]] = {}
+
+    def image(name: str, statements: int) -> None:
+        db = sessions()
+        timings = StageTimings(clock)
+        with sql.charging(timings):
+            barrier.wait()
+            for n in range(statements):
+                db.add(_Row(name=f"{name}{n}"))
+                db.flush()
+                barrier_free = db.execute(select(_Row)).all()
+                assert barrier_free
+            db.commit()
+        db.close()
+        seen[name] = timings.seconds
+
+    workers = [threading.Thread(target=image, args=(n, k)) for n, k in (("a", 1), ("b", 3))]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    sql.close()
+    main.close()
+    engine.dispose()
+    assert seen["a"] == {"db": pytest.approx(2 * 0.0625 + 0.5)}
+    assert seen["b"] == {"db": pytest.approx(6 * 0.0625 + 0.5)}
