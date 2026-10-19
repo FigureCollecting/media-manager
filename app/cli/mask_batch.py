@@ -65,7 +65,7 @@ reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
 THE PIPELINE (MASK-PERF-2). The images of a chunk run ``--writers`` at a
-time (default 6), each on a worker with a database session of its own, and
+time (default 12), each on a worker with a database session of its own, and
 the next ``--prefetch`` originals (default 4) are read, decoded and
 hash-checked ahead; the model runs on the driver's thread alone, one image
 at a time, so one image's I/O (its read, its seed, its judgment, its
@@ -158,9 +158,12 @@ OWN_MAX_MIB = (
 ) + 512
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
-#: database session (0: one image at a time, the driver's own session)...
-DEFAULT_WRITERS = 6
-MAX_WRITERS = 8  # the media db's pool lends 30 connections, the sandbox's 15
+#: database session (0: one image at a time, the driver's own session). 12 by
+#: the simulation of the live costs: 5.5 s an image one at a time, 1.6 s with
+#: 6, 1.23 s with 12, 1.22 s with 16. The media db's pool lends 30
+#: connections, the sandbox's 15 (a run needs writers + 1)...
+DEFAULT_WRITERS = 12
+MAX_WRITERS = 16
 #: ...and the originals read, decoded and hash-checked ahead of them.
 DEFAULT_PREFETCH = 4
 MAX_PREFETCH = 16

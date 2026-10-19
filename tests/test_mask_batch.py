@@ -1639,7 +1639,7 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--gpu-free-min-mib", "0"),  # would pass a full card
         ("--gpu-free-min-mib", "1023"),
         ("--writers", "-1"),
-        ("--writers", "9"),  # more sessions than the pool lends
+        ("--writers", "17"),  # more sessions than the media db's pool lends
         ("--writers", "two"),
         ("--prefetch", "0"),
         ("--prefetch", "17"),  # originals held in memory
@@ -1671,7 +1671,7 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--residential-ttl", "0.5", "residential_ttl", 0.5),
         ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
         ("--writers", "0", "writers", 0),
-        ("--writers", "8", "writers", 8),
+        ("--writers", "16", "writers", 16),
         ("--prefetch", "1", "prefetch", 1),
         ("--prefetch", "16", "prefetch", 16),
     ],
@@ -3080,7 +3080,7 @@ def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) 
 def test_the_pipeline_is_on_by_default_on_the_command_line() -> None:
     args = mb._parser().parse_args(["run", "--worklist", "w"])
     assert (args.writers, args.prefetch) == (mb.DEFAULT_WRITERS, mb.DEFAULT_PREFETCH)
-    assert args.writers > 0
+    assert args.writers == 12  # MASK-PERF-2's simulation: 16 gains under 1 %
     assert mb.BatchConfig().writers == 0  # a library caller runs one image at a time
 
 
