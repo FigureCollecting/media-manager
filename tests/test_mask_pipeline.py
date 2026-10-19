@@ -34,10 +34,10 @@ from typing import Any
 import numpy as np
 import pytest
 from app.cli import mask_batch as mb
-from app.models import Base, ImageMask, ImageVersion, MaskBatch, PublicObject
+from app.models import Base, FigureGallery, ImageMask, ImageVersion, MaskBatch, PublicObject
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
-from app.workers import mask_job
+from app.workers import mask_job, mask_seed
 from app.workers import mask_pipeline as mp
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import picture_keys, seed_clean_image, seed_footprint
@@ -660,6 +660,187 @@ def test_two_captures_of_one_picture_never_overlap(tmp_path: Path) -> None:
     assert not any(k.startswith(second_original) for k in media.puts[:3])
     main.close()
     engine.dispose()
+
+
+def _stored(raw: _Raw, data: bytes, n: int, url: str = ITEM) -> mb.WorkItem:
+    """``data`` in the raw bucket, as a work item of product ``n`` at ``url``."""
+    sha = hashlib.sha256(data).hexdigest()
+    key = f"raw-img/sha256/{sha[:2]}/{sha}.png"
+    LocalObjectStore.put(raw.store, key, data, "image/png")
+    return mb.WorkItem(
+        blob_sha256=sha,
+        storage_key=key,
+        url=url.format(n=n),
+        product_id=f"00000000-0000-0000-0000-{n:012d}",
+        head_id=None,
+        rank=0,
+    )
+
+
+def _slow_first(tmp_path: Path, raw: _Raw, items: list[mb.WorkItem]) -> tuple[_Counted, Path]:
+    """``items`` pipelined two at a time, the first image's original PUT
+    slow (0.4 s): its media bucket and its run's directory."""
+    root = tmp_path / "run"
+    media = _Counted(root / "media")
+    media.slow[items[0].blob_sha256] = 0.4
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [], media=media)
+    mb.run_batch(items, mb.BatchConfig(chunk_size=len(items), writers=2), rt)
+    main.close()
+    engine.dispose()
+    return media, root
+
+
+def _original_key(item: mb.WorkItem) -> str:
+    return f"{item.blob_sha256[:2]}/{item.blob_sha256[2:4]}/{item.blob_sha256}"
+
+
+def test_a_capture_of_a_copys_own_pixels_waits_for_the_image_minting_that_copy(
+    tmp_path: Path,
+) -> None:
+    """Our JPEG copy captured again (the pixels it decodes to, other bytes)
+    is a capture of that copy's picture: its claim meets the claim of the
+    image still minting the copy by the copy's own pixel digest, so it waits
+    for it, however slow, and finds the copy settled ('already')."""
+    raw = _Raw(tmp_path / "raw")
+    first = raw.add(100, 1)
+    original = LocalObjectStore.get(raw.store, first.storage_key)
+    clean = mask_seed._encode(mask_seed._picture(original), original)[0]
+    with Image.open(io.BytesIO(clean)) as copy:
+        buf = io.BytesIO()
+        copy.convert("RGB").save(buf, format="PNG")  # its own pixels, other bytes
+    second = _stored(raw, buf.getvalue(), 2)
+    assert picture_keys(buf.getvalue()).digest == picture_keys(original).own_digest
+    media, root = _slow_first(tmp_path, raw, [first, second])
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    assert [r["status"] for r in records] == ["ok", "already"]
+    # the first's original, copy and mask, and only then the second's original
+    assert len(media.puts) == 4
+    assert media.puts[-1].startswith(_original_key(second))
+
+
+def test_images_of_one_gallery_link_wait_for_each_other(tmp_path: Path) -> None:
+    """Two pictures of one product under one URL: the seed links the product
+    to the first image only, as one image at a time does, because the second
+    waits for the first, however slow, before its first query."""
+    raw = _Raw(tmp_path / "raw")
+    first = raw.add(100, 1, url=PICTURE)
+    second = _stored(raw, _photo(108, 2), 1, url=PICTURE)  # another picture
+    assert (first.product_id, first.url) == (second.product_id, second.url)
+    media, root = _slow_first(tmp_path, raw, [first, second])
+    statuses = [r["status"] for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    assert statuses == ["ineligible", "ineligible"]  # a PICTURE url: no mask, no upload
+    assert len(media.puts) == 4  # each its original and copy
+    assert not any(k.startswith(_original_key(second)) for k in media.puts[:2])
+    engine = _engine(tmp_path / "media.db")
+    with Session(engine) as db:
+        (linked,) = db.execute(select(FigureGallery.image_id)).scalars()
+        assert db.get(ImageModel, linked).sha256 == first.blob_sha256
+    engine.dispose()
+
+
+def test_the_batch_row_is_read_again_after_an_images_write_rolls_back(tmp_path: Path) -> None:
+    """One image writes the batch row, the next one's write rolls back, the
+    one after reads the row again before its own: the counts and cursor are
+    one image at a time's (the rolled-back image's copy of the row is
+    stale)."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1), raw.add(112, 2), raw.add(113, 3)]
+
+    def dropping(name: str) -> Engine:
+        engine = _engine(tmp_path / f"{name}.db")
+        dropped: list[bool] = []
+
+        @sa_event.listens_for(engine, "before_cursor_execute")
+        def _insert(conn: Any, cursor: Any, statement: str, params: Any, *rest: Any) -> None:
+            if statement.startswith("INSERT INTO image_masks") and 112 in params and not dropped:
+                dropped.append(True)
+                raise OperationalError(statement, params, Exception("server closed the connection"))
+
+        return engine
+
+    alone = _run(tmp_path, "alone", items, raw, mb.BatchConfig(), engine=dropping("alone"))
+    config = mb.BatchConfig(writers=2)
+    piped = _run(tmp_path, "piped", items, raw, config, engine=dropping("piped"))
+    statuses = [r["status"] for r in alone["progress"] if r["event"] == "item"]
+    assert statuses == ["ok", "interrupted", "ok"]
+    (row,) = (json.loads(r) for r in alone["tables"]["mask_batches"])
+    assert row["counts"]["ok"] == 2
+    assert piped == alone
+
+
+def test_no_more_than_writers_images_start_past_the_last_one_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Images that end early (here an unsupported codec: no row to write)
+    are not recorded before the image ahead of them: while it is held up no
+    further image starts, so an outage opens the circuit after at most
+    writers - 1 images more than one at a time would have tried."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1), *(raw.add(110 + n, n, codec="zstd") for n in range(2, 9))]
+    started: list[str] = []
+    real_mint = mb._mint
+
+    def counted_mint(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        started.append(args[1].blob_sha256)
+        return real_mint(*args, **kwargs)
+
+    monkeypatch.setattr(mb, "_mint", counted_mint)
+    while_held: list[int] = []
+
+    def first_holds_the_gpu(width: int) -> None:
+        time.sleep(0.5)  # the image after it ends meanwhile
+        while_held.append(len(started))
+
+    config = mb.BatchConfig(chunk_size=8, writers=2)
+    backend = _Shapes(gate=first_holds_the_gpu)
+    outcome = _run(tmp_path, "run", items, raw, config, backend=backend)
+    assert outcome["exit"] == 1
+    statuses = [r["status"] for r in outcome["progress"] if r["event"] == "item"]
+    assert statuses == ["ok"] + ["failed"] * 7
+    assert while_held == [2]
+    assert len(started) == 8
+
+
+def test_each_workers_sql_is_charged_to_its_own_images_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every statement a worker runs -- its claim's, its seed's, its
+    judgment's, not only those inside an explicit "db" stage -- is its
+    image's "db" seconds."""
+    by_thread: dict[str, StageTimings] = {}
+
+    class Capturing(StageTimings):
+        def __init__(self, clock: Callable[[], float]) -> None:
+            super().__init__(clock)
+            by_thread[threading.current_thread().name] = self
+
+    monkeypatch.setattr(mb, "StageTimings", Capturing)
+    engine = _engine(tmp_path / "media.db")
+    lock = threading.Lock()
+    statements: dict[str, int] = {}
+    cost = 0.01
+
+    @sa_event.listens_for(engine, "after_cursor_execute")
+    def _slow(*_: Any) -> None:
+        name = threading.current_thread().name
+        if name.startswith("mask-image-"):
+            with lock:
+                statements[name] = statements.get(name, 0) + 1
+            time.sleep(cost)
+
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n * 8, n) for n in range(1, 5)]
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, tmp_path / "run", raw, _Shapes(), [])
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=4, writers=2), rt) == 0
+    main.close()
+    engine.dispose()
+    assert sorted(statements) == sorted(by_thread) == [f"mask-image-{i}" for i in range(4)]
+    for name, timings in by_thread.items():
+        assert statements[name] >= 15  # the claim's, the seed's, the judgment's, the rows'
+        assert timings.seconds["db"] >= statements[name] * cost
 
 
 def test_the_batch_rows_counts_and_cursor_are_one_image_at_a_times(tmp_path: Path) -> None:
