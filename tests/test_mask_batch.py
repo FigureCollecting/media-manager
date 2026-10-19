@@ -3168,6 +3168,66 @@ def test_the_chunk_reports_its_throughput(db_session: Session, tmp_path: Path) -
     assert chunk["throughput_seconds_per_image"] == 3.0
 
 
+def test_the_chunks_throughput_leaves_out_its_already_images(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """An 'already' image is one lookup: the throughput is the chunk's wall
+    seconds over the images it minted, as ``seconds_per_image`` is their
+    mean; a chunk that minted none has none."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+
+    class _Timed(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(3)
+            return super().predict_alpha(image)
+
+    first = raw.add(1)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events)
+    assert mb.run_batch([first, raw.add(2), first], mb.BatchConfig(chunk_size=3), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ok": 2, "already": 1}
+    assert (chunk["elapsed_seconds"], chunk["throughput_seconds_per_image"]) == (6.0, 3.0)
+    events.clear()
+    again = tmp_path / "again.jsonl"  # a fresh record: every image is found settled
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, progress=again, events=events)
+    assert mb.run_batch([first], mb.BatchConfig(chunk_size=1), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"already": 1}
+    assert chunk["throughput_seconds_per_image"] is None
+
+
+def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """botocore keeps 10 connections and closes any it lent past them when it
+    comes back: the batch's clients keep one for every worker and every
+    original read ahead."""
+    for name, value in (
+        ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
+        ("RAW_S3_BUCKET", "raw"),
+        ("RAW_S3_ACCESS_KEY", "k"),
+        ("RAW_S3_SECRET_KEY", "s"),
+    ):
+        monkeypatch.setenv(name, value)
+    seen: list[tuple[int, int]] = []
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        raw, media = rt.raw_store, rt.media_store
+        assert isinstance(raw, mb.ReadOnlyStore) and isinstance(media, mb.RecentWrites)
+        pools = (raw._store, media._store)
+        seen.append(tuple(s._client.meta.config.max_pool_connections for s in pools))  # type: ignore[arg-type]
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "12", "--prefetch", "6"]) == 0
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    assert seen == [(18, 18), (10, 10)]  # never fewer than botocore's own 10
+
+
 def test_recent_writes_are_safe_from_many_workers() -> None:
     """Workers evicting at once must not evict one copy twice (a KeyError
     in a PUT that succeeded) nor grow past the bound."""

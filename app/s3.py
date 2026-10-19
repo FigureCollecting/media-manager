@@ -10,9 +10,9 @@ from .config import get_settings
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
-def get_s3() -> Any:
-    """Return a cached boto3 S3 client singleton."""
+def s3_client(*, max_pool_connections: int = 10) -> Any:
+    """A boto3 S3 client for the configured bucket, keeping up to
+    ``max_pool_connections`` connections (botocore's default: 10)."""
     s = get_settings()
     session = boto3.session.Session()
     return session.client(
@@ -21,10 +21,20 @@ def get_s3() -> Any:
         region_name=s.s3_region,
         aws_access_key_id=s.s3_access_key,
         aws_secret_access_key=s.s3_secret_key,
-        config=Config(s3={"addressing_style": "virtual"}, signature_version="s3v4"),
+        config=Config(
+            s3={"addressing_style": "virtual"},
+            signature_version="s3v4",
+            max_pool_connections=max_pool_connections,
+        ),
         use_ssl=s.s3_secure,
         verify=s.s3_secure,
     )
+
+
+@lru_cache(maxsize=1)
+def get_s3() -> Any:
+    """Return a cached boto3 S3 client singleton."""
+    return s3_client()
 
 
 def presign_post_for_upload(key: str, *, content_type: str, size: int) -> dict[str, Any]:

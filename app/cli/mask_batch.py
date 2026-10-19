@@ -818,10 +818,9 @@ class _Chunk:
             ],
             "yielded": self.yielded,
             "elapsed_seconds": round(elapsed, 3),
-            # the chunk's wall seconds over its images: what overlapping them gains
-            "throughput_seconds_per_image": (
-                round(elapsed / len(self.records), 3) if self.records else None
-            ),
+            # the chunk's wall seconds over the images it minted (an 'already'
+            # one is a lookup, as in seconds_per_image): what overlapping them gains
+            "throughput_seconds_per_image": round(elapsed / len(minted), 3) if minted else None,
         }
 
 
@@ -1782,7 +1781,8 @@ def build_backend(args: argparse.Namespace) -> MattingBackend:
     return backend
 
 
-def _raw_store(args: argparse.Namespace) -> ObjectStore:
+def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
+    """The raw bucket, read only; its client keeps ``connections`` (``_run``)."""
     if args.raw_dir:
         from ..object_store import LocalObjectStore
 
@@ -1792,6 +1792,7 @@ def _raw_store(args: argparse.Namespace) -> ObjectStore:
     if missing:
         raise Refused(f"the raw bucket needs {', '.join(missing)} (or --raw-dir)")
     import boto3
+    from botocore.config import Config
 
     client = boto3.client(
         "s3",
@@ -1799,6 +1800,7 @@ def _raw_store(args: argparse.Namespace) -> ObjectStore:
         region_name=os.environ.get("RAW_S3_REGION", "us-east-1"),
         aws_access_key_id=os.environ["RAW_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["RAW_S3_SECRET_KEY"],
+        config=Config(max_pool_connections=connections),
     )
     return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
 
@@ -1873,8 +1875,18 @@ def _run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         from .masks import open_stores
 
-        raw_store = _raw_store(args)
+        # a bucket connection for every worker and read-ahead: botocore keeps 10
+        # and closes any it lent past them when it comes back
+        connections = max(10, args.writers + args.prefetch)
+        raw_store = _raw_store(args, connections)
         opened, bucket = open_stores(args.sandbox)
+        if args.sandbox is None:
+            from ..s3 import s3_client
+
+            bucket = S3ObjectStore(
+                client=s3_client(max_pool_connections=connections),
+                bucket=get_settings().s3_bucket,
+            )
         db = _sized(opened, args.writers)
         if db is not opened:
             engines.append(db.get_bind().engine)
