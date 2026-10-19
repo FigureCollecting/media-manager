@@ -2737,6 +2737,35 @@ def test_the_rollback_after_a_failure_is_a_database_second(
     assert sum(timings.seconds.values()) == record["seconds"]
 
 
+def test_the_batch_row_read_again_after_a_rollback_is_a_database_second(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rollback expires the batch's row: the next image's record reads its
+    id back from the database, a round trip like any query."""
+    from sqlalchemy.exc import OperationalError
+
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625)
+    real_write = mask_job._write_row
+    calls: list[str] = []
+
+    def write_once_down(*a: Any, **k: Any) -> None:
+        # the mask row's INSERT, with the lane's queries open in the transaction
+        calls.append("write")
+        if len(calls) == 1:
+            raise OperationalError("INSERT", {}, Exception("server closed the connection"))
+        real_write(*a, **k)
+
+    monkeypatch.setattr(mask_job, "_write_row", write_once_down)
+    made = _captured(monkeypatch)
+    assert mb.run_batch([raw.add(1, rank=0), raw.add(2, rank=1)], mb.BatchConfig(), rt) == 1
+    records = _item_records(tmp_path / "progress.jsonl")
+    assert [r["status"] for r in records] == ["interrupted", "ok"]
+    assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
+
+
 def _recaptured(raw: _Raw, n: int) -> mb.WorkItem:
     """Picture ``n`` again in other bytes (a re-save with a text chunk)."""
     from PIL import PngImagePlugin

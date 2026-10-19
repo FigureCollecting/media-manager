@@ -845,13 +845,15 @@ def _mint(
     ``timings``, when given, gets the seconds of each stage (MASK-PERF-1)."""
     assert rt.raw_store is not None and rt.media_store is not None
     start = rt.monotonic()
+    with timed(timings, "db"):  # read again from the database once a rollback expired it
+        batch_id = getattr(batch, "id", None)
     record: dict[str, Any] = {
         "event": "item",
         "blob_sha256": item.blob_sha256,
         "product_id": item.product_id,
         "head_id": item.head_id,
         "rank": item.rank,
-        "batch_id": getattr(batch, "id", None),
+        "batch_id": batch_id,
         "clean_sha256": None,
         "mask_sha256": None,
         "reason": None,
