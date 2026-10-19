@@ -49,7 +49,7 @@ from PIL import Image
 from sqlalchemy import create_engine, func, select
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/{n}.jpeg"
@@ -3080,7 +3080,7 @@ def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) 
 def test_the_pipeline_is_on_by_default_on_the_command_line() -> None:
     args = mb._parser().parse_args(["run", "--worklist", "w"])
     assert (args.writers, args.prefetch) == (mb.DEFAULT_WRITERS, mb.DEFAULT_PREFETCH)
-    assert args.writers == 12  # MASK-PERF-2's simulation: 16 gains under 1 %
+    assert args.writers == 4  # the live chunk tunes it with --writers
     assert mb.BatchConfig().writers == 0  # a library caller runs one image at a time
 
 
@@ -3102,6 +3102,51 @@ def test_main_passes_the_pipeline_options_and_keeps_writes_for_every_worker(
     assert seen["store"].keep == 4 + 3 * 3  # each worker's original, copy and mask
     assert mb.main([*argv, "--writers", "0"]) == 0
     assert seen["store"].keep == 4
+
+
+def test_main_runs_the_pipeline_on_a_pool_that_never_lends_past_what_it_keeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection a QueuePool lends past its size is closed when it comes
+    back, and any close kills the live run's kubectl port-forward: the
+    command line runs the pipeline on the same database through a pool that
+    keeps a connection for every worker and the batch, and lends no more."""
+    seen: list[Session] = []
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        seen.append(rt.open_db())
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    sandbox = tmp_path / "sb"
+    argv = ["--sandbox", str(sandbox), "run", "--worklist", str(wl), "--raw-dir"]
+    argv += [str(tmp_path / "raw"), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "9"]) == 0
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    piped, alone = (db.get_bind().engine for db in seen)
+    assert isinstance(piped.pool, QueuePool)
+    assert (piped.pool.size(), piped.pool._max_overflow) == (10, 0)
+    assert piped.url.database == alone.url.database == str(sandbox / "masks.db")
+    assert seen[0].autoflush and not seen[0].expire_on_commit  # the sandbox's session, as was
+    assert alone.pool._max_overflow == 10  # one image at a time: the session as opened
+
+
+def test_a_sized_session_keeps_its_database_and_session_settings(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}", pool_size=10, max_overflow=20)
+    db = Session(engine, autoflush=False, expire_on_commit=False)
+    sized = mb._sized(db, 4)
+    pool = sized.get_bind().engine.pool
+    assert isinstance(pool, QueuePool)
+    assert (pool.size(), pool._max_overflow) == (10, 0)  # never below what the pool kept
+    assert (sized.autoflush, sized.expire_on_commit) == (False, False)
+    assert sized.get_bind().engine.url == engine.url
+    sized.close()
+    sized.get_bind().engine.dispose()
+    one = Session(create_engine("sqlite://", poolclass=StaticPool))
+    assert mb._sized(one, 4) is one  # not a QueuePool: _pipeline_refusal judges it
+    assert mb._sized(db, 0) is db
+    engine.dispose()
 
 
 def test_the_chunk_reports_its_throughput(db_session: Session, tmp_path: Path) -> None:

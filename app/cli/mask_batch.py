@@ -65,7 +65,7 @@ reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
 THE PIPELINE (MASK-PERF-2). The images of a chunk run ``--writers`` at a
-time (default 12), each on a worker with a database session of its own, and
+time (default 4), each on a worker with a database session of its own, and
 the next ``--prefetch`` originals (default 4) are read, decoded and
 hash-checked ahead; the model runs on the driver's thread alone, one image
 at a time, so one image's I/O (its read, its seed, its judgment, its
@@ -117,11 +117,12 @@ from types import FrameType
 from typing import Any
 
 import httpx
-from sqlalchemy import inspect
+from sqlalchemy import Engine, create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 
+from ..config import get_settings
 from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
 from ..workers.mask_job import (
@@ -158,11 +159,10 @@ OWN_MAX_MIB = (
 ) + 512
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
-#: database session (0: one image at a time, the driver's own session). 12 by
-#: the simulation of the live costs: 5.5 s an image one at a time, 1.6 s with
-#: 6, 1.23 s with 12, 1.22 s with 16. The media db's pool lends 30
-#: connections, the sandbox's 15 (a run needs writers + 1)...
-DEFAULT_WRITERS = 12
+#: database session (0: one image at a time, the driver's own session); the
+#: live chunk tunes it with ``--writers``. The command line's pool keeps
+#: writers + 1 connections and lends none past them (``_sized``)...
+DEFAULT_WRITERS = 4
 MAX_WRITERS = 16
 #: ...and the originals read, decoded and hash-checked ahead of them.
 DEFAULT_PREFETCH = 4
@@ -1338,23 +1338,46 @@ class _Pipeline:
 
 def _pipeline_refusal(db: Session, writers: int) -> str | None:
     """Why the pipeline cannot run on ``db``'s pool, or None: every worker
-    holds a connection of its own while its image runs, and the batch its own."""
+    holds a connection of its own while its image runs, and the batch its own.
+    A QueuePool's overflow does not count: a connection it lends past its size
+    is closed when it comes back, and any close kills the kubectl
+    port-forward the live run reaches its database through."""
     pool = db.get_bind().engine.pool
     needed = writers + 1
     if isinstance(pool, StaticPool | SingletonThreadPool):
-        lends: float = 1
+        kept = 1
     elif isinstance(pool, QueuePool):
-        overflow = pool._max_overflow
-        lends = math.inf if overflow < 0 else pool.size() + overflow
+        kept = pool.size()
     else:
         return None  # a connection per checkout
-    if lends >= needed:
+    if kept >= needed:
         return None
     return (
         f"--writers {writers} needs {needed} database connections at once (one per "
-        f"worker, one for the batch), the pool lends {lends:g}: fewer writers, "
+        f"worker, one for the batch), the pool keeps {kept}: fewer writers, "
         "or --writers 0 for one image at a time"
     )
+
+
+def _sized(db: Session, writers: int) -> Session:
+    """``db`` for a run of ``writers`` (the command line's): a session like it
+    on the same database, through a pool that keeps a connection for every
+    worker and one for the batch and lends none past them (no overflow, so
+    no connection is closed while the run lasts: ``_pipeline_refusal``). One
+    image at a time, or a pool other than a QueuePool: ``db`` itself."""
+    engine = db.get_bind().engine
+    pool = engine.pool
+    if not writers or not isinstance(pool, QueuePool):
+        return db
+    sized = create_engine(
+        engine.url,
+        pool_size=max(pool.size(), writers + 1),
+        max_overflow=0,
+        pool_pre_ping=True,  # as app.db's engine
+        pool_recycle=get_settings().db_pool_recycle,
+    )
+    db.close()
+    return Session(sized, autoflush=db.autoflush, expire_on_commit=db.expire_on_commit)
 
 
 class _Tally:
@@ -1828,11 +1851,15 @@ def _run(args: argparse.Namespace) -> int:
     media_store: ObjectStore | None = None
     raw_store: ObjectStore | None = None
     sessions: list[Session] = []
+    engines: list[Engine] = []  # the ones made for this run
     if not args.dry_run:
         from .masks import open_stores
 
         raw_store = _raw_store(args)
-        db, bucket = open_stores(args.sandbox)
+        opened, bucket = open_stores(args.sandbox)
+        db = _sized(opened, args.writers)
+        if db is not opened:
+            engines.append(db.get_bind().engine)
         # each worker's original, copy and mask kept until it reads its copy back
         media_store = RecentWrites(bucket, keep=4 + 3 * args.writers)
         sessions.append(db)
@@ -1856,6 +1883,8 @@ def _run(args: argparse.Namespace) -> int:
     finally:
         for db in sessions:
             db.close()
+        for engine in engines:
+            engine.dispose()
         for number, handler in previous.items():
             signal.signal(number, handler)
 
@@ -1948,8 +1977,21 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--poll-seconds", type=_seconds(1.0, 3600.0), default=60.0)
     run.add_argument("--max-wait-seconds", type=_seconds(0.0))
     run.add_argument("--max-consecutive-failures", type=_whole(1), default=5)
-    run.add_argument("--writers", type=_whole(0, MAX_WRITERS), default=DEFAULT_WRITERS)
-    run.add_argument("--prefetch", type=_whole(1, MAX_PREFETCH), default=DEFAULT_PREFETCH)
+    run.add_argument(
+        "--writers",
+        type=_whole(0, MAX_WRITERS),
+        default=DEFAULT_WRITERS,
+        help=(
+            "images a chunk runs at once, each on a worker with a database connection "
+            f"of its own (0: one at a time; default {DEFAULT_WRITERS}, up to {MAX_WRITERS})"
+        ),
+    )
+    run.add_argument(
+        "--prefetch",
+        type=_whole(1, MAX_PREFETCH),
+        default=DEFAULT_PREFETCH,
+        help=f"originals read ahead of the workers (default {DEFAULT_PREFETCH})",
+    )
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 
     sql = sub.add_parser("sql", help="print a read-only work-list query")

@@ -598,7 +598,9 @@ def test_the_batch_rows_counts_and_cursor_are_one_image_at_a_times(tmp_path: Pat
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 4, n) for n in range(1, 11)]  # ok, held, empty, crash, ...
     alone = _run(tmp_path, "alone", items, raw, mb.BatchConfig(chunk_size=10))
-    piped = _run(tmp_path, "piped", items, raw, mb.BatchConfig(chunk_size=10, writers=6))
+    engine = _engine(tmp_path / "piped.db", pool_size=7)  # a connection per worker and the batch
+    config = mb.BatchConfig(chunk_size=10, writers=6)
+    piped = _run(tmp_path, "piped", items, raw, config, engine=engine)
     assert piped["tables"]["mask_batches"] == alone["tables"]["mask_batches"]
     (row,) = (json.loads(r) for r in piped["tables"]["mask_batches"])
     assert sum(row["counts"].values()) == 10
@@ -856,6 +858,8 @@ def test_a_read_ahead_that_breaks_stops_the_batch(
     [
         {"poolclass": StaticPool},  # one connection for every session
         {"poolclass": QueuePool, "pool_size": 2, "max_overflow": 0},  # fewer than writers + 1
+        # enough only with its overflow, whose connections are closed when they come back
+        {"poolclass": QueuePool, "pool_size": 4, "max_overflow": 20},
     ],
 )
 def test_the_pipeline_is_refused_without_a_connection_per_worker(
@@ -880,6 +884,34 @@ def test_a_pool_that_opens_a_connection_per_checkout_runs_the_pipeline(tmp_path:
     engine = _engine(tmp_path / "media.db", poolclass=NullPool)
     outcome = _run(tmp_path, "run", items, raw, mb.BatchConfig(writers=4), engine=engine)
     assert outcome["exit"] == 0
+
+
+def test_a_chunk_at_the_command_lines_defaults_closes_no_pooled_connection(
+    tmp_path: Path,
+) -> None:
+    """The live run reaches its database through a kubectl port-forward,
+    which any closed connection kills: a chunk at the command line's
+    defaults, on a pool like the media db's (10 kept, 20 more lent past
+    them and closed when they come back), closes none of its connections."""
+    raw = _Raw(tmp_path / "raw", cost=0.01)
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 25)]
+    engine = _engine(tmp_path / "media.db", poolclass=QueuePool, pool_size=10, max_overflow=20)
+    closed: list[str] = []
+    for name in ("close", "close_detached"):
+        sa_event.listen(engine, name, lambda *_, name=name: closed.append(name))
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    config = mb.BatchConfig(
+        chunk_size=args.chunk_size, writers=args.writers, prefetch=args.prefetch
+    )
+    root = tmp_path / "run"
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(cost=0.03), [])
+    assert mb.run_batch(items, config, rt) == 0
+    main.close()
+    assert closed == []
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    assert len(records) == 24
+    engine.dispose()
 
 
 # --------------------------------------------------------------------------
