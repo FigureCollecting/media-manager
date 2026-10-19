@@ -53,6 +53,7 @@ from .grounding import (
     measure_alpha_grounding,
 )
 from .matting import MattingBackend, get_matting_backend
+from .stage_timing import StageTimings, timed
 
 #: Bump when the mask algorithm or its encoding changes: a new version mints
 #: new masks beside the old ones (an address cached on a phone never changes
@@ -192,9 +193,12 @@ def _appearance(rgba: Image.Image) -> Appearance:
     )
 
 
-def build_mask_artifact(clean: bytes, *, backend: MattingBackend | None = None) -> MaskOutcome:
+def build_mask_artifact(
+    clean: bytes, *, backend: MattingBackend | None = None, timings: StageTimings | None = None
+) -> MaskOutcome:
     """Compute the mask, its grounding and both appearances for one clean
-    image. Never alters ``clean``; never produces a cut-out.
+    image. Never alters ``clean``; never produces a cut-out. ``timings``, when
+    given, gets the model's seconds and the mask encode's (MASK-PERF-1).
 
     The image is read with its EXIF orientation applied, because that is how
     a browser draws the clean copy (``image-orientation: from-image``), and
@@ -210,7 +214,10 @@ def build_mask_artifact(clean: bytes, *, backend: MattingBackend | None = None) 
     own_alpha_grounding = measure_alpha_grounding(own) if bool((own < 255).any()) else None
     unmasked = _appearance(rgba)
 
-    alpha = np.asarray(active.predict_alpha(rgba), dtype=np.uint8)
+    answer = (
+        active.predict_alpha(rgba) if timings is None else active.predict_alpha_timed(rgba, timings)
+    )
+    alpha = np.asarray(answer, dtype=np.uint8)
     if alpha.shape != (height, width):
         raise ValueError(
             f"backend {active.name!r} answered {alpha.shape} for a {height}x{width} image"
@@ -234,7 +241,8 @@ def build_mask_artifact(clean: bytes, *, backend: MattingBackend | None = None) 
             own_alpha_grounding=own_alpha_grounding,
         )
 
-    mask_png = encode_mask_png(alpha)
+    with timed(timings, "encode"):
+        mask_png = encode_mask_png(alpha)
     return MaskOutcome(
         status=status,
         reason=reason,
