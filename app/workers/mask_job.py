@@ -262,17 +262,16 @@ def _settle(
     seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
     sha = obj.sha256
     try:
-        with timed(timings, "db"):
-            # Judged over every image behind the clean copy (app.publication).
-            origins = judged_origins(db, sha)
-            if origins is None:
-                # Soft-deleted since it was selected: skipped and NOT recorded,
-                # as when it is deleted before selection, so a restore makes it
-                # a candidate again for a plain batch.
-                return ItemReport(sha, "skipped", "deleted", None)
-            eligibility = mask_eligibility(
-                origins, revoked=store_revocations(db) if revoked is None else revoked
-            )
+        # Judged over every image behind the clean copy (app.publication).
+        origins = judged_origins(db, sha)
+        if origins is None:
+            # Soft-deleted since it was selected: skipped and NOT recorded,
+            # as when it is deleted before selection, so a restore makes it
+            # a candidate again for a plain batch.
+            return ItemReport(sha, "skipped", "deleted", None)
+        eligibility = mask_eligibility(
+            origins, revoked=store_revocations(db) if revoked is None else revoked
+        )
     except Exception as exc:
         # A judgment that raises is this image's failure, never the batch's.
         with timed(timings, "db"):
@@ -316,17 +315,16 @@ def _settle(
                 key = derived_key(outcome.mask_sha256, MASK_MIME)
                 with timed(timings, "upload"):
                     store.put(key, outcome.mask_png, MASK_MIME)
-                with timed(timings, "db"):
-                    register_public_object(
-                        db,
-                        sha256=outcome.mask_sha256,
-                        kind="mask",
-                        mime=MASK_MIME,
-                        size=len(outcome.mask_png),
-                        width=outcome.width,
-                        height=outcome.height,
-                        storage_key=key,
-                    )
+                register_public_object(
+                    db,
+                    sha256=outcome.mask_sha256,
+                    kind="mask",
+                    mime=MASK_MIME,
+                    size=len(outcome.mask_png),
+                    width=outcome.width,
+                    height=outcome.height,
+                    storage_key=key,
+                )
             else:
                 key = f"held-masks/{outcome.mask_sha256}.png"
                 with timed(timings, "upload"):
@@ -442,7 +440,7 @@ def settle_clean_copy(
     seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
     if not backend.publishes_masks:
         raise ValueError(f"backend {backend.name!r} is not a mask model: dry run only")
-    with timed(timings, "db"):
+    with timed(timings, "db"):  # the lane's first query: the pool's checkout too
         page = _candidates(
             db,
             after=None,

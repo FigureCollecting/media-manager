@@ -877,7 +877,7 @@ def _mint(
 
     media = _Witness(rt.media_store, timings)
     try:
-        with timed(timings, "db"):
+        with timed(timings, "db"):  # the image's first query: the pool's checkout too
             settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
         return rolled_back("db", exc)
@@ -922,9 +922,7 @@ def _mint(
     record["mask_seconds"] = round(rt.monotonic() - mask_start, 3)
     if report is None:
         # another original's copy of the same picture was settled first
-        with timed(timings, "db"):
-            mask_status = original_settled(db, item.blob_sha256)
-        record.update(status="already", mask_status=mask_status)
+        record.update(status="already", mask_status=original_settled(db, item.blob_sha256))
     elif report.status == "failed":
         # the lane caught it and kept the class name; the bucket's error, if any, says more
         witnessed = media.error is not None and is_outage(media.error)
