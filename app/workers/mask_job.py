@@ -258,7 +258,8 @@ def _settle(
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
     written then, the report is the whole result. ``revoked`` defaults to
     the revocations as they stand when this image is judged. ``timings``,
-    when given, gets the seconds of each stage (MASK-PERF-1)."""
+    when given, gets the seconds of each stage (MASK-PERF-1); its SQL's
+    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
     sha = obj.sha256
     try:
         with timed(timings, "db"):
@@ -437,7 +438,8 @@ def settle_clean_copy(
     own order). None when the copy is not a candidate: already settled at this
     pipeline version (unless re-driven), soft-deleted, or not a clean copy.
     Applied only: a backend that is not a mask model is refused. ``timings``,
-    when given, gets the seconds of each stage (MASK-PERF-1)."""
+    when given, gets the seconds of each stage (MASK-PERF-1); its SQL's
+    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
     if not backend.publishes_masks:
         raise ValueError(f"backend {backend.name!r} is not a mask model: dry run only")
     with timed(timings, "db"):

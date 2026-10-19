@@ -105,7 +105,7 @@ from ..workers.mask_job import (
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
-from ..workers.stage_timing import STAGES, StageTimings, timed
+from ..workers.stage_timing import STAGES, DatabaseSeconds, StageTimings, timed
 
 #: The scraper's roll windows (minutes of the hour): no chunk runs in them.
 DEFAULT_BUSY_WINDOWS = "03-26,41-43,50-56"
@@ -842,7 +842,8 @@ def _mint(
     timings: StageTimings | None = None,
 ) -> dict[str, Any]:
     """One original, start to finish; the result as its progress record.
-    ``timings``, when given, gets the seconds of each stage (MASK-PERF-1)."""
+    ``timings``, when given, gets the seconds of each stage (MASK-PERF-1);
+    its SQL's seconds are the batch's to time (DatabaseSeconds, run_batch)."""
     assert rt.raw_store is not None and rt.media_store is not None
     start = rt.monotonic()
     with timed(timings, "db"):  # read again from the database once a rollback expired it
@@ -1030,6 +1031,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
     chunk_no = 0
     loaded = False
     measured = False
+    sql = DatabaseSeconds(db)  # each image's statements, commits and rollbacks as its "db"
     try:
         while position < len(pending):
             if _wait_for_gate(rt, config, backend if loaded else None):
@@ -1065,7 +1067,8 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     # an outage's casualties are re-driven without --retry-failed
                     redrive = config.retry_failed or item.blob_sha256 in interrupted
                     timings = StageTimings(rt.monotonic)
-                    record = _mint(db, item, rt, backend, batch, redrive, timings)
+                    with sql.charging(timings):
+                        record = _mint(db, item, rt, backend, batch, redrive, timings)
                     record["chunk"] = chunk_no
                     if gpu is not None and not measured and record["status"] in _RAN_MODEL:
                         gpu.measure_own()
@@ -1101,6 +1104,8 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
     except _GaveUp as gave_up:
         rt.emit({"event": "gave_up", **gave_up.result.as_dict()})
         return 4
+    finally:
+        sql.close()
     rt.emit({"event": "done", "counts": totals, "pending": len(pending) - position})
     return 1 if totals.get("failed") or totals.get("interrupted") else 0
 

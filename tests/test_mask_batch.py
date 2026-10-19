@@ -29,6 +29,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -38,12 +39,12 @@ from app.cli import mask_batch as mb
 from app.models import Base, ImageMask, MaskBatch, PublicObject
 from app.object_store import LocalObjectStore
 from app.workers import mask as mask_artifact
-from app.workers import mask_job
+from app.workers import mask_job, mask_seed
 from app.workers.basekept import BaseKeptMattingBackend
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import seed_clean_image
 from app.workers.matting import MattingBackend, StubMattingBackend
-from app.workers.stage_timing import StageTimings
+from app.workers.stage_timing import DatabaseSeconds, StageTimings
 from PIL import Image
 from sqlalchemy import create_engine, func, select
 from sqlalchemy import event as sa_event
@@ -2421,10 +2422,13 @@ def _costly_lane(
     *,
     statement: float = 0.0,
     rollback: float = 0.0,
+    checkout: float = 0.0,
 ) -> None:
     """The lane's database and artifact costing fake seconds on ``clock``: a
     commit 0.5 s, each SQL statement ``statement`` s, a rollback ``rollback``
-    s; each appearance (analysis) 0.375 s; the mask encode 0.625 s."""
+    s, each pool checkout ``checkout`` s (a transaction's first query: the
+    pre-ping's round trip, which no SQL event spans); each appearance
+    (analysis) 0.375 s; the mask encode 0.625 s."""
     real_encode, real_appearance = mask_artifact.encode_mask_png, mask_artifact._appearance
 
     def encode(alpha: np.ndarray) -> bytes:
@@ -2441,6 +2445,8 @@ def _costly_lane(
     sa_event.listen(engine, "commit", lambda conn: clock.advance(0.5))
     if statement:
         sa_event.listen(engine, "before_cursor_execute", lambda *a: clock.advance(statement))
+    if checkout:
+        sa_event.listen(engine, "checkout", lambda *a: clock.advance(checkout))
     if rollback:
         real_rollback = db.rollback
 
@@ -2462,12 +2468,22 @@ def _costly_runtime(
     primary: MattingBackend | None = None,
     statement: float = 0.0,
     rollback: float = 0.0,
+    checkout: float = 0.0,
+    clean_encode: float = 0.0,
 ) -> mb.Runtime:
     """The batch with every stage costing fake seconds on its clock: the raw
     GET 1 s; a media PUT 0.25 s, a media GET 0.125 s; BiRefNet (``primary``)
-    2 s; the base-keep donors 0.75 + 0.5 s; the database and the artifact as
-    in ``_costly_lane``. Nothing else moves the clock."""
-    _costly_lane(db, clock, monkeypatch, statement=statement, rollback=rollback)
+    2 s; the base-keep donors 0.75 + 0.5 s; the seed's clean-copy encode
+    ``clean_encode`` s; the database and the artifact as in ``_costly_lane``.
+    Nothing else moves the clock."""
+    _costly_lane(db, clock, monkeypatch, statement=statement, rollback=rollback, checkout=checkout)
+    real_encode = mask_seed._encode
+
+    def encode(picture: Image.Image, original: bytes) -> tuple[bytes, str]:
+        clock.advance(clean_encode)
+        return real_encode(picture, original)
+
+    monkeypatch.setattr(mask_seed, "_encode", encode)
     backend = BaseKeptMattingBackend(
         primary=primary or _Pass(clock, 2.0),
         donors=[_Pass(clock, 0.75), _Pass(clock, 0.5)],
@@ -2517,14 +2533,14 @@ def test_the_chunk_reports_where_each_images_seconds_go(
     assert set(chunk) == _CHUNK_KEYS | _STAGE_KEYS
     means = {
         "fetch": 1.0,  # the raw GET (and its decode)
-        "seed": 0.5,  # its commit (its two PUTs are uploads)
+        "seed": 0.0,  # its own work costs nothing here (PUTs, SQL and commit are not its)
         "readback": 0.125,  # the lane re-reads the copy it hashes
         "inference": 4.0,  # BiRefNet: (2 + 3 + 7) / 3
         "base_keep": 1.25,  # the two IS-Net donors
         "analysis": 0.75,  # the appearances, unmasked and masked
         "encode": 0.625,  # the mask PNG
         "upload": 0.75,  # three PUTs: the original, its clean copy, the mask
-        "db": 0.5,  # the mask row's commit
+        "db": 1.0,  # the seed's commit and the mask row's
     }
     assert chunk["stage_seconds_per_image"] == means
     assert list(chunk["stage_seconds_per_image"]) == list(means)
@@ -2581,6 +2597,8 @@ def test_no_database_second_escapes_the_stages(
         primary=_FullOn(clock, 2.0, frame=1),
         statement=0.0625,
         rollback=0.375,
+        checkout=0.03125,
+        clean_encode=0.125,
     )
     real_judgment = mask_job.judged_origins
     judged: list[str] = []
@@ -2607,13 +2625,16 @@ def test_no_database_second_escapes_the_stages(
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
     # every PUT is an upload (the seed's two, the mask's held or not), nothing else is
     assert [t.seconds["upload"] for t in made] == [0.75, 0.75, 0.5, 0.5]
+    # the seed keeps its own work alone (its clean copy's encode): none of its SQL
+    assert [t.seconds["seed"] for t in made] == [0.125] * 4
     # the failed judgment's rollback and row (statements, commit) are the database's
     assert made[2].seconds["db"] > 0.875
     assert set(made[2].seconds) == {"fetch", "seed", "upload", "db"}
     (chunk,) = _events(events, "chunk")
     stages = chunk["stage_seconds_per_image"]
     assert stages["upload"] == 0.625
-    assert stages["db"] > 0.5 and stages["seed"] > 0.5  # the statements, beyond the commits
+    assert stages["seed"] == 0.125
+    assert stages["db"] > 1.0  # the statements and checkouts, beyond the two commits
     # each mean is over the images that ran its stage, and says how many did
     assert chunk["stage_images"] == {
         "fetch": 4, "seed": 4, "readback": 2, "inference": 2, "base_keep": 2,
@@ -2623,6 +2644,86 @@ def test_no_database_second_escapes_the_stages(
     total = sum(mean * chunk["stage_images"][name] for name, mean in stages.items())
     assert total == pytest.approx(chunk["seconds_per_image"] * len(records), abs=0.01)
     assert sum(stages.values()) > chunk["seconds_per_image"] + 1
+
+
+def test_the_seed_keeps_its_own_work_and_its_sql_is_the_databases(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whichever stage runs a statement, a commit or a rollback, its seconds
+    are the database's: the seed keeps its clean copy's encode alone."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(
+        db_session,
+        tmp_path,
+        raw,
+        clock,
+        monkeypatch,
+        events,
+        statement=0.0625,
+        checkout=0.03125,
+        clean_encode=0.125,
+    )
+    made = _captured(monkeypatch)
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 0
+    (record,) = _item_records(tmp_path / "progress.jsonl")
+    assert record["status"] == "ok"
+    (timings,) = made
+    assert timings.seconds == {
+        # 34 statements (the lookup, the seed's 21, the lane's 12), two commits
+        # (the seed's, the mask row's) and two checkouts (the lookup's, the lane's)
+        "db": 34 * 0.0625 + 2 * 0.5 + 2 * 0.03125,
+        "fetch": 1.0,
+        "upload": 0.75,
+        "seed": 0.125,
+        "readback": 0.125,
+        "base_keep": 1.25,
+        "inference": 2.0,
+        "encode": 0.625,
+        "analysis": 0.75,
+    }
+    assert round(sum(timings.seconds.values()), 3) == record["seconds"]  # every second, once
+
+
+def test_the_batch_listens_to_its_database_only_while_it_runs(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """Done or refused, the batch leaves its session and engine with the
+    listeners it found."""
+    engine = db_session.get_bind()
+
+    def listeners() -> dict[str, int]:
+        on_engine = ("before_execute", "after_execute", "before_cursor_execute")
+        on_session = ("before_commit", "after_rollback", "after_transaction_end")
+        return {
+            **{n: len(getattr(engine.dispatch, n)) for n in on_engine},
+            "after_cursor_execute": len(engine.dispatch.after_cursor_execute),
+            "rollback": len(engine.dispatch.rollback),
+            "handle_error": len(engine.dialect.dispatch.handle_error),
+            **{n: len(getattr(db_session.dispatch, n)) for n in on_session},
+        }
+
+    class _NoCuda(_Model):
+        def load(self) -> None:
+            raise RuntimeError("onnxruntime session loaded without CUDAExecutionProvider")
+
+    during: list[dict[str, int]] = []
+
+    class _Watching(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            during.append(listeners())
+            return super().predict_alpha(image)
+
+    before = listeners()
+    raw = _Raw(tmp_path / "raw")
+    rt = _runtime(db_session, tmp_path, raw, backend=_Watching())
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 0
+    assert during and all(n == before[name] + 1 for name, n in during[0].items())
+    assert listeners() == before
+    refused = _runtime(db_session, tmp_path, raw, backend=_NoCuda(), progress=tmp_path / "2.jsonl")
+    assert mb.run_batch([raw.add(2)], mb.BatchConfig(), refused) == 2
+    assert listeners() == before
 
 
 def test_a_stage_that_never_ran_is_omitted_not_zero(
@@ -2636,7 +2737,8 @@ def test_a_stage_that_never_ran_is_omitted_not_zero(
     assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt) == 0
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"ineligible": 1}
-    staged = {"fetch": 1.0, "seed": 0.5, "upload": 0.5, "db": 0.5}
+    # the seed ran (its own work free here); db: its commit and the row's
+    staged = {"fetch": 1.0, "seed": 0.0, "upload": 0.5, "db": 1.0}
     assert chunk["stage_seconds_per_image"] == staged
     assert chunk["stage_median_seconds"] == staged
     assert chunk["stage_images"] == dict.fromkeys(staged, 1)
@@ -2693,13 +2795,13 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
     assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 6.5]
     assert chunk["stage_seconds_per_image"] == {
         "fetch": 2.5,  # (4 + 1) / 2
-        "seed": 0.5,
+        "seed": 0.0,
         "readback": 0.125,
         "inference": 2.0,  # up to the crash
         "base_keep": 1.25,  # the donors ran first
         "analysis": 0.375,  # the unmasked appearance only
         "upload": 0.5,  # the seed's two PUTs
-        "db": 0.375,  # (0 + the rollback and the failed row's commit) / 2
+        "db": 0.625,  # (0 + the seed's commit, the rollback and the failed row's commit) / 2
     }
     assert chunk["stage_images"] == {
         "fetch": 2, "seed": 1, "readback": 1, "inference": 1, "base_keep": 1, "analysis": 1,
@@ -2733,7 +2835,8 @@ def test_the_rollback_after_a_failure_is_a_database_second(
     (record,) = _item_records(tmp_path / "progress.jsonl")
     assert record["reason"] == f"{where}:ConnectionError"
     (timings,) = made
-    assert timings.seconds["db"] == 0.375  # the rollback, the lookup costing nothing here
+    # the rollback (the lookup costing nothing here), after a lane's the seed's commit too
+    assert timings.seconds["db"] == 0.375 + (0.5 if where == "settle" else 0.0)
     assert sum(timings.seconds.values()) == record["seconds"]
 
 
@@ -2747,7 +2850,9 @@ def test_the_batch_row_read_again_after_a_rollback_is_a_database_second(
     raw = _Raw(tmp_path / "raw")
     clock = _Clock()
     events: list[dict[str, Any]] = []
-    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625)
+    rt = _costly_runtime(
+        db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625, checkout=0.03125
+    )
     real_write = mask_job._write_row
     calls: list[str] = []
 
@@ -2764,12 +2869,14 @@ def test_the_batch_row_read_again_after_a_rollback_is_a_database_second(
     records = _item_records(tmp_path / "progress.jsonl")
     assert [r["status"] for r in records] == ["interrupted", "ok"]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
-    # the read again is the database's: its 14 statements (the batch row, the
-    # lookup, the lane's 12) and the mask row's commit; the raw GET alone is
-    # the fetch, the seed's 21 statements and its commit are its own
-    assert made[1].seconds["db"] == 14 * 0.0625 + 0.5
+    # the read again is the database's, with the checkout of the transaction
+    # it opens: 35 statements (the batch row, the lookup, the seed's 21, the
+    # lane's 12), two commits (the seed's, the mask row's) and two checkouts
+    # (this read's, the lane's); the raw GET alone is the fetch, and the seed
+    # keeps none of it
+    assert made[1].seconds["db"] == 35 * 0.0625 + 2 * 0.5 + 2 * 0.03125
     assert made[1].seconds["fetch"] == 1.0
-    assert made[1].seconds["seed"] == 21 * 0.0625 + 0.5
+    assert made[1].seconds["seed"] == 0.0
 
 
 def _recaptured(raw: _Raw, n: int) -> mb.WorkItem:
@@ -2805,14 +2912,14 @@ def test_the_lookup_after_a_copy_settled_by_another_original_is_a_database_secon
         ("already", "ok"),
     ]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
-    # the database holds the lookup, the lane's candidate query and the late
-    # lookup (3 statements); the seed its own 15 and its commit; the
-    # original's PUT is the upload (its picture needs no clean copy)
+    # the database holds 18 statements (the lookup, the seed's 15, the lane's
+    # candidate query, the late lookup) and the seed's commit; the seed keeps
+    # none; the original's PUT is the upload (its picture needs no clean copy)
     assert made[1].seconds == {
-        "db": 3 * 0.0625,
+        "db": 18 * 0.0625 + 0.5,
         "fetch": 1.0,
         "upload": 0.25,
-        "seed": 15 * 0.0625 + 0.5,
+        "seed": 0.0,
     }
 
 
@@ -2874,7 +2981,7 @@ def test_settle_clean_copy_stages_its_own_seconds(
     store = _CostlyStore(tmp_path / "media", clock, get=0.125, put=0.25)
     obj = _seed(db_session, store, 7)
     batch = mask_job.open_mask_batch(db_session, backend_name="stub-model")
-    _costly_lane(db_session, clock, monkeypatch, rollback=0.375)
+    _costly_lane(db_session, clock, monkeypatch, rollback=0.375, checkout=0.03125)
 
     class _Primary(_Pass):
         def predict_alpha(self, image: Image.Image) -> np.ndarray:
@@ -2895,33 +3002,45 @@ def test_settle_clean_copy_stages_its_own_seconds(
     )
     assert report is not None and report.status == status
     stored = status in ("ok", "held")
-    # the row's commit, and a failure's rollback before it
-    db = 0.5 if stored else 0.375 + 0.5
+    # the row's commit and the checkout of the lane's transaction; after a
+    # failure its rollback, and the checkout of the transaction the row opens
+    db = 0.5 + 0.03125 if stored else 0.375 + 0.5 + 2 * 0.03125
     assert timings.seconds == {**staged, **({"upload": 0.25} if stored else {}), "db": db}
     assert sum(timings.seconds.values()) == clock.monotonic() - start
 
 
 def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) -> None:
-    """The same clean copy settled with and without the stage timings: the
-    same report, the same row, the same mask bytes."""
+    """The same clean copy seeded and settled with and without the stage
+    timings and the database's listeners: the same report, the same row,
+    the same mask bytes."""
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     Base.metadata.create_all(engine)
     other = sessionmaker(bind=engine, expire_on_commit=False)()
     clock = _Clock()
+    sa_event.listen(engine, "before_cursor_execute", lambda *a: clock.advance(0.0625))
+    start = clock.monotonic()
+    timed_run = StageTimings(clock.monotonic)
     outcomes = []
     try:
         for db, root, timings in (
             (db_session, tmp_path / "plain", None),
-            (other, tmp_path / "timed", StageTimings(clock.monotonic)),
+            (other, tmp_path / "timed", timed_run),
         ):
-            store = LocalObjectStore(root)
-            obj = _seed(db, store, 7)
-            batch = mask_job.open_mask_batch(db, backend_name="stub-model")
-            report = mask_job.settle_clean_copy(
-                db, store, obj.sha256, backend=_Model(), batch=batch, timings=timings
-            )
+            sql = None if timings is None else DatabaseSeconds(db)
+            try:
+                with nullcontext() if sql is None else sql.charging(timed_run):
+                    store = LocalObjectStore(root)
+                    obj = _seed(db, store, 7)
+                    batch = mask_job.open_mask_batch(db, backend_name="stub-model")
+                    report = mask_job.settle_clean_copy(
+                        db, store, obj.sha256, backend=_Model(), batch=batch, timings=timings
+                    )
+            finally:
+                if sql is not None:
+                    sql.close()
+            elapsed = clock.monotonic() - start  # only the timed run's statements cost
             row = db.execute(select(ImageMask)).scalar_one()
             columns = {
                 c.key: getattr(row, c.key)
@@ -2937,6 +3056,8 @@ def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) 
         assert outcomes[0] == outcomes[1]
         assert outcomes[0][0] is not None and outcomes[0][0].status == "ok"
         assert any(k.endswith(".png") for k in outcomes[0][2])  # the mask, among the files
+        # the listeners did time it: every statement, the seed's (no stage) too
+        assert sum(timed_run.seconds.values()) == elapsed > 0
     finally:
         other.close()
         engine.dispose()
