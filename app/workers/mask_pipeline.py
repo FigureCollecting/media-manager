@@ -3,7 +3,8 @@
 The batch runs a chunk's images on several workers, each with a database
 session of its own, so one image's I/O (its original read, its seed, its
 judgment, its uploads and rows) overlaps another's model run. Three rules
-keep what it writes what one image at a time writes:
+keep what it writes what one image at a time writes; a fourth bounds its
+memory:
 
 - RELATED IMAGES WAIT (``Claims``). Seeding and settling an image reads and
   writes the rows of its picture: its original, every capture of the
@@ -19,10 +20,14 @@ keep what it writes what one image at a time writes:
   model: it hands the call to the driver's thread, which runs one at a
   time and refuses any while the batch is held (a pause or a stop); the
   worker then lets its image go (``Held``), unrecorded, for a rerun.
+- A FEW DECODED AT ONCE (``Slots``). An image's copy is decoded for the
+  model only when a slot is free, and holds it until its mask is made: the
+  memory of the images waiting for the GPU is bounded whatever the writers.
 """
 
 from __future__ import annotations
 
+import heapq
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -134,6 +139,36 @@ class Turns:
             while self._next in self._ended:
                 self._ended.discard(self._next)
                 self._next += 1
+            self._cond.notify_all()
+
+
+class Slots:
+    """The images whose copies are decoded for the model at once (the
+    memory bound): an image holds a slot from its copy's decode, through its
+    wait for the GPU, to its mask. A slot goes to the earliest image waiting,
+    so no later image keeps the one the chunk records next waiting. A holder
+    waits for nothing but the GPU, so every slot comes back."""
+
+    def __init__(self, size: int) -> None:
+        self._cond = threading.Condition()
+        self._free = size
+        self._waiting: list[int] = []  # a heap of work-list indexes
+
+    def waiting(self) -> int:
+        with self._cond:
+            return len(self._waiting)
+
+    def acquire(self, index: int) -> None:
+        with self._cond:
+            heapq.heappush(self._waiting, index)
+            self._cond.wait_for(lambda: self._free > 0 and self._waiting[0] == index)
+            heapq.heappop(self._waiting)
+            self._free -= 1
+            self._cond.notify_all()  # another slot may be free for the next one
+
+    def release(self) -> None:
+        with self._cond:
+            self._free += 1
             self._cond.notify_all()
 
 

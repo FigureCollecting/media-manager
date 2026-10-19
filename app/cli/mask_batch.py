@@ -109,7 +109,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,7 +131,7 @@ from ..workers.mask_job import (
     original_settled,
     settle_clean_copy,
 )
-from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Turns, on_the_gpu
+from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Slots, Turns, on_the_gpu
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import PictureKeys, picture_keys, seed_clean_image, seed_footprint
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
@@ -167,6 +167,11 @@ MAX_WRITERS = 16
 #: ...and the originals read, decoded and hash-checked ahead of them.
 DEFAULT_PREFETCH = 4
 MAX_PREFETCH = 16
+#: The images whose copies are decoded for the model at once, whatever the
+#: writers: the one on the GPU and two waiting (app.workers.mask_pipeline.Slots).
+#: Each holds ~0.55 GB at its peak at 4000x3000, so a chunk's memory stays near
+#: one image at a time's.
+DECODED_AT_ONCE = 3
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -984,6 +989,7 @@ def _mint(
             retry_failed=retry_failed,
             timings=timings,
             turn=lane.turn if lane is not None else None,
+            slot=lane.decoded if lane is not None else None,
         )
     except Exception as exc:
         return rolled_back("settle", exc)
@@ -1090,7 +1096,7 @@ class _Done:
 @dataclass(eq=False)
 class _ChunkRun:
     """What one chunk's workers share: the claims, the turns, the batch row,
-    the hold, and the queue to the driver's thread (a GPU job or an image
+    the hold, the decode slots, and the queue to the driver's thread (a GPU job or an image
     done; at most one of either per worker, so never more than ``writers``)."""
 
     batch: MaskBatch
@@ -1098,6 +1104,7 @@ class _ChunkRun:
     claims: Claims = field(default_factory=Claims)
     turns: Turns = field(default_factory=Turns)
     hold: threading.Event = field(default_factory=threading.Event)
+    slots: Slots = field(default_factory=lambda: Slots(DECODED_AT_ONCE))
     row: _BatchRow = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1167,6 +1174,17 @@ class _ImageLane:
     def before_seed(self) -> None:
         if self._run.hold.is_set():
             raise Held
+
+    @contextlib.contextmanager
+    def decoded(self) -> Iterator[None]:
+        """Its copy decoded for the model, a slot held meanwhile: the wait
+        for one is a wait for the GPU."""
+        with self._timings.stage("gpu_wait"):
+            self._run.slots.acquire(self._index)
+        try:
+            yield
+        finally:
+            self._run.slots.release()
 
     def turn(self) -> None:
         """Before the image's batch-row writes: once every image before it

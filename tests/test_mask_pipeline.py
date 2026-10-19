@@ -37,6 +37,7 @@ from app.cli import mask_batch as mb
 from app.models import Base, ImageMask, ImageVersion, MaskBatch, PublicObject
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
+from app.workers import mask_job
 from app.workers import mask_pipeline as mp
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import picture_keys, seed_clean_image, seed_footprint
@@ -525,6 +526,73 @@ def test_images_in_flight_and_read_ahead_are_bounded(
     assert reads_while_held == [2 + 3]
     assert minting[1] == 2
     assert len(raw.store.gets) == 14
+
+
+def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An image's decoded copy is held from its decode, through its wait for
+    the GPU, to its mask: whatever the writers, only the one on the GPU and
+    two waiting are decoded at once, so a chunk's memory stays near one
+    image at a time's (MASK-PERF-2 at 4000x3000: ~0.55 GB each)."""
+    lock = threading.Lock()
+    decoded = [0, 0]  # now, most
+    real = mask_job.build_mask_artifact
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            decoded[0] += 1
+            decoded[1] = max(decoded[1], decoded[0])
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                decoded[0] -= 1
+
+    monkeypatch.setattr(mask_job, "build_mask_artifact", counted)
+    first: list[bool] = []
+
+    def first_holds_the_gpu(width: int) -> None:
+        if not first:
+            first.append(True)
+            time.sleep(0.5)  # every other image is ready for the GPU meanwhile
+
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 2 * 8, n) for n in range(1, 13)]
+    engine = _engine(tmp_path / "media.db", pool_size=9)
+    config = mb.BatchConfig(chunk_size=12, writers=8)
+    backend = _Shapes(gate=first_holds_the_gpu)
+    outcome = _run(tmp_path, "run", items, raw, config, backend=backend, engine=engine)
+    assert outcome["exit"] == 0
+    assert [r["status"] for r in outcome["progress"] if r["event"] == "item"] == ["ok"] * 12
+    assert decoded[1] == 3
+    assert mb.DECODED_AT_ONCE == 3
+
+
+def test_decode_slots_go_to_the_earliest_image_waiting() -> None:
+    slots = mp.Slots(1)
+    order: list[int] = []
+
+    def take(index: int) -> None:
+        slots.acquire(index)
+        order.append(index)
+        slots.release()
+
+    slots.acquire(0)
+    threads = [threading.Thread(target=take, args=(i,)) for i in (5, 3, 4)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 5
+    while slots.waiting() < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    slots.release()
+    for thread in threads:
+        thread.join(5)
+    assert order == [3, 4, 5]
+    two = mp.Slots(2)
+    two.acquire(7)
+    two.acquire(9)  # a second slot: no wait
+    assert two.waiting() == 0
 
 
 # --------------------------------------------------------------------------
