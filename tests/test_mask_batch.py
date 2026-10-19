@@ -3139,6 +3139,7 @@ def test_a_sized_session_keeps_its_database_and_session_settings(tmp_path: Path)
     pool = sized.get_bind().engine.pool
     assert isinstance(pool, QueuePool)
     assert (pool.size(), pool._max_overflow) == (10, 0)  # never below what the pool kept
+    assert pool._recycle == -1  # a recycle closes its connection: pre-ping replaces a dead one
     assert (sized.autoflush, sized.expire_on_commit) == (False, False)
     assert sized.get_bind().engine.url == engine.url
     sized.close()

@@ -1379,9 +1379,11 @@ def _pipeline_refusal(db: Session, writers: int) -> str | None:
 def _sized(db: Session, writers: int) -> Session:
     """``db`` for a run of ``writers`` (the command line's): a session like it
     on the same database, through a pool that keeps a connection for every
-    worker and one for the batch and lends none past them (no overflow, so
-    no connection is closed while the run lasts: ``_pipeline_refusal``). One
-    image at a time, or a pool other than a QueuePool: ``db`` itself."""
+    worker and one for the batch and lends none past them (no overflow) and
+    never recycles one (a recycle closes it; the pre-ping still replaces a
+    dead one), so no connection is closed while the run lasts
+    (``_pipeline_refusal``). One image at a time, or a pool other than a
+    QueuePool: ``db`` itself."""
     engine = db.get_bind().engine
     pool = engine.pool
     if not writers or not isinstance(pool, QueuePool):
@@ -1391,7 +1393,7 @@ def _sized(db: Session, writers: int) -> Session:
         pool_size=max(pool.size(), writers + 1),
         max_overflow=0,
         pool_pre_ping=True,  # as app.db's engine
-        pool_recycle=get_settings().db_pool_recycle,
+        pool_recycle=-1,
     )
     db.close()
     return Session(sized, autoflush=db.autoflush, expire_on_commit=db.expire_on_commit)
