@@ -41,6 +41,9 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # A deadlock fails the job instead of running to GitHub's 6 h default (each
+    # test is stopped first, at pytest-timeout's limit in pyproject.toml).
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code

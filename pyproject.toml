@@ -42,6 +42,7 @@ pytest-cov = "^7.0.0"
 grpcio-tools = "1.84.0"
 types-grpcio = "1.84.0.20260928"
 types-protobuf = "7.35.1.20260906"
+pytest-timeout = "^2.4.0"
 
 # Ruff config lives in ruff.toml, which takes precedence over any [tool.ruff]
 # table here -- keep it in one place to avoid divergent, silently-ignored config.
@@ -60,6 +61,12 @@ check_untyped_defs = true
 strict_equality = true
 plugins = []
 exclude = ["migrations/", "alembic.ini"]
+
+[tool.pytest.ini_options]
+# A deadlock fails its test instead of hanging the run (the mask batch's
+# pipeline threads): the thread method dumps every thread's stack and exits.
+timeout = 120
+timeout_method = "thread"
 
 [tool.coverage.run]
 # Generated in the build from the pinned proto (scripts/gen_spine_stubs.py).
