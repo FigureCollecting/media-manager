@@ -2764,6 +2764,12 @@ def test_the_batch_row_read_again_after_a_rollback_is_a_database_second(
     records = _item_records(tmp_path / "progress.jsonl")
     assert [r["status"] for r in records] == ["interrupted", "ok"]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
+    # the read again is the database's: its 14 statements (the batch row, the
+    # lookup, the lane's 12) and the mask row's commit; the raw GET alone is
+    # the fetch, the seed's 21 statements and its commit are its own
+    assert made[1].seconds["db"] == 14 * 0.0625 + 0.5
+    assert made[1].seconds["fetch"] == 1.0
+    assert made[1].seconds["seed"] == 21 * 0.0625 + 0.5
 
 
 def _recaptured(raw: _Raw, n: int) -> mb.WorkItem:
@@ -2799,6 +2805,15 @@ def test_the_lookup_after_a_copy_settled_by_another_original_is_a_database_secon
         ("already", "ok"),
     ]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
+    # the database holds the lookup, the lane's candidate query and the late
+    # lookup (3 statements); the seed its own 15 and its commit; the
+    # original's PUT is the upload (its picture needs no clean copy)
+    assert made[1].seconds == {
+        "db": 3 * 0.0625,
+        "fetch": 1.0,
+        "upload": 0.25,
+        "seed": 15 * 0.0625 + 0.5,
+    }
 
 
 def test_the_lanes_bucket_stages_each_put_as_an_upload_and_each_get_as_a_readback(
