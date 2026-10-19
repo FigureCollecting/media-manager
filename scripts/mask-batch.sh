@@ -21,10 +21,15 @@
 #   MASK_BATCH_RESIDENTIAL_IP   the box's residential address (the VPN check)
 #   MASK_STORE_GRANTS MASK_STORE_REVOKED   the deployment's mask policy, as media-manager reads it
 #   MASK_BATCH_NAME       the container name (default mask-batch): one batch at a time; stop it
-#                         with `docker stop -t 120 mask-batch` (it finishes the image in flight)
+#                         with `docker stop -t 120 mask-batch` (it finishes the images past the GPU;
+#                         the others in flight are not recorded and run again first)
 #   MASK_BATCH_GPUS       docker --gpus value (default all; "none" runs without a GPU)
-#   MASK_BATCH_MEMORY     docker --memory. Default 8g on the GPU (the run peaks near 2.3 GB of
-#                         RAM); 10g when the model may run on the CPU (--device auto or cpu, or
+#   MASK_BATCH_MEMORY     docker --memory. Default 8g on the GPU (one image at a time the run peaked
+#                         near 2.3 GB of RAM; the pipeline adds about 1.2-1.4 GB whatever --writers:
+#                         three copies decoded for the model at most, two originals read ahead, and
+#                         two malloc arenas (MALLOC_ARENA_MAX=2) rather than one kept per worker:
+#                         simulated at 4000x3000, 0.9 GB one at a time, 2.1 GB at 4 writers, 2.2 GB
+#                         at 12); 10g when the model may run on the CPU (--device auto or cpu, or
 #                         MASK_BATCH_GPUS=none): BiRefNet + two IS-Net sessions on the CPU are
 #                         OOM-killed at 8g (exit 137 on the same image every rerun). 10g measured.
 #   MASK_BATCH_APP_DIR    TESTS ONLY: mount this app/ over the image's /app/app
@@ -52,7 +57,7 @@ done
 
 args=(run --rm --init --name "${MASK_BATCH_NAME:-mask-batch}" --network host
       --memory "${MASK_BATCH_MEMORY:-$memory}" --user "$(id -u):$(id -g)"
-      -v "$state:/state" -w /state -e PYTHONPATH=/app)
+      -v "$state:/state" -w /state -e PYTHONPATH=/app -e MALLOC_ARENA_MAX=2)
 [ "$gpus" = "none" ] || args+=(--gpus "$gpus")
 for name in DATABASE_URL PGPASSWORD PGSSLMODE \
             S3_ENDPOINT_URL S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_SECURE \

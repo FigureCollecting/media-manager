@@ -11,10 +11,16 @@ seconds), so the stages of an image add up to the time spent in them, each
 second once. The database's seconds are timed by SQLAlchemy's events instead
 (DatabaseSeconds): every statement, commit and rollback, whichever stage runs
 it, counted once under "db" by the same rule.
+
+Pipelined (MASK-PERF-2), each image runs on a worker thread of its own with
+a session of its own, and its stages are its own wall time: the waits the
+pipeline adds are stages too ("claim", "gpu_wait", "turn_wait"), and what a
+read-ahead thread measured for it is added (``StageTimings.add``).
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple
@@ -23,21 +29,28 @@ from sqlalchemy import event
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
-    from sqlalchemy.orm import Session, SessionTransaction
+    from sqlalchemy.orm import Session, SessionTransaction, sessionmaker
 
 #: The stages, in the order a chunk reports them: the pipeline's order, the
 #: database (reached all along the way) last.
 STAGES = (
     "fetch",  # the original from the raw bucket, and its decode
+    # pipelined: the image's picture keys, its footprint read (its SQL is "db")
+    # and its place among the images in flight (app.workers.mask_pipeline)
+    "claim",
     # the clean copy minted and registered (app.workers.mask_seed), but for its
     # PUTs and its SQL: its decode, encode and phash, and the ORM's own work
     "seed",
     "readback",  # a media-bucket GET: the lane re-reading the copy it hashes
+    "gpu_wait",  # pipelined: the model call queued behind other images'
     "inference",  # the mask model's answer (BiRefNet)
     "base_keep",  # the base-keep pass: the IS-Net donors and the merge
     "analysis",  # the copy's decode, grounding and appearances
     "encode",  # the mask PNG
     "upload",  # a media-bucket PUT: the original, its clean copy, the mask
+    # pipelined: waiting for an earlier image of the same picture to end, and
+    # for the turn to write the batch row (work-list order)
+    "turn_wait",
     # every statement, commit and rollback (DatabaseSeconds), and the pool's
     # checkout and the session's rollback work around them
     "db",
@@ -75,6 +88,11 @@ class StageTimings:
             if self._inner:
                 self._inner[-1] += took
 
+    def add(self, name: str, seconds: float) -> None:
+        """``seconds`` measured elsewhere (a read-ahead thread) as ``name``:
+        inside no stage of this image's, so carved out of none."""
+        self.seconds[name] = self.seconds.get(name, 0.0) + seconds
+
     def mark(self) -> Mark:
         """Now, for ``since``: the start of seconds two events bound rather
         than a block (DatabaseSeconds)."""
@@ -98,6 +116,16 @@ def timed(timings: StageTimings | None, name: str) -> AbstractContextManager[Non
     return nullcontext() if timings is None else timings.stage(name)
 
 
+class _Charge:
+    """One thread's image and what of its database work is open."""
+
+    def __init__(self) -> None:
+        self.timings: StageTimings | None = None
+        self.statement: Mark | None = None  # a statement, or a connection's rollback
+        self.by_cursor = False  # that statement has no before_execute: its cursor run ends it
+        self.commit: Mark | None = None  # the session's commit, its statements inside
+
+
 class DatabaseSeconds:
     """Every second one session spends in its database as "db", wherever its
     SQL runs: each statement (from its execute to its result, all its cursor
@@ -116,18 +144,28 @@ class DatabaseSeconds:
     cursor) and a session rollback's own work (it expires all it holds). The
     batch's "db" stages around a transaction's first query and around each
     rollback hold those.
+
+    Pipelined (MASK-PERF-2), ``sessions`` makes each worker's session: its
+    sessions are listened to as well, and each thread charges its own image
+    (an image's SQL all runs on its worker's thread), so images timed at once
+    are each charged their own statements and commits, never another's.
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, sessions: sessionmaker[Session] | None = None) -> None:
         engine = session.get_bind().engine
-        self._timings: StageTimings | None = None
-        self._statement: Mark | None = None  # a statement, or a connection's rollback
-        self._by_cursor = False  # that statement has no before_execute: its cursor run ends it
-        self._commit: Mark | None = None  # the session's commit, its statements inside
-        self._hooks: list[tuple[Session | Engine, str, Callable[..., None]]] = [
-            (session, "before_commit", self._committing),
-            (session, "after_rollback", self._ended),
-            (session, "after_transaction_end", self._transaction_ended),
+        self._local = threading.local()
+        per_session: list[tuple[str, Callable[..., None]]] = [
+            ("before_commit", self._committing),
+            ("after_rollback", self._ended),
+            ("after_transaction_end", self._transaction_ended),
+        ]
+        targets: list[Session | sessionmaker[Session]] = [session]
+        if sessions is not None:
+            targets.append(sessions)
+        self._hooks: list[
+            tuple[Session | sessionmaker[Session] | Engine, str, Callable[..., None]]
+        ] = [
+            *((target, name, fn) for target in targets for name, fn in per_session),
             (engine, "before_execute", self._starting),
             (engine, "after_execute", self._answered),
             (engine, "before_cursor_execute", self._cursor_starting),
@@ -138,17 +176,25 @@ class DatabaseSeconds:
         for target, name, fn in self._hooks:
             event.listen(target, name, fn)
 
+    def _charge(self) -> _Charge:
+        charge: _Charge | None = getattr(self._local, "charge", None)
+        if charge is None:
+            charge = self._local.charge = _Charge()
+        return charge
+
     @contextmanager
     def charging(self, timings: StageTimings) -> Iterator[None]:
-        """The database's seconds go to ``timings`` (one image's) meanwhile."""
-        self._timings = timings
+        """The database's seconds go to ``timings`` (one image's) meanwhile,
+        for the SQL this thread runs."""
+        charge = self._charge()
+        charge.timings = timings
         try:
             yield
         finally:
-            self._timings = None
-            self._statement = None
-            self._by_cursor = False
-            self._commit = None
+            charge.timings = None
+            charge.statement = None
+            charge.by_cursor = False
+            charge.commit = None
 
     def close(self) -> None:
         """Stop listening: the session and its engine as they were."""
@@ -157,36 +203,41 @@ class DatabaseSeconds:
 
     def _starting(self, *_: object) -> None:
         # a commit open already spans its statements and its flush's rollback
-        if self._timings is not None and self._commit is None:
-            self._statement = self._timings.mark()
-            self._by_cursor = False
+        charge = self._charge()
+        if charge.timings is not None and charge.commit is None:
+            charge.statement = charge.timings.mark()
+            charge.by_cursor = False
 
     def _cursor_starting(self, *_: object) -> None:
-        if self._timings is not None and self._commit is None and self._statement is None:
-            self._statement = self._timings.mark()
-            self._by_cursor = True
+        charge = self._charge()
+        if charge.timings is not None and charge.commit is None and charge.statement is None:
+            charge.statement = charge.timings.mark()
+            charge.by_cursor = True
 
     def _cursor_answered(self, *_: object) -> None:
-        if self._by_cursor:
+        if self._charge().by_cursor:
             self._answered()
 
     def _answered(self, *_: object) -> None:
-        if self._timings is not None and self._statement is not None:
-            self._timings.since("db", self._statement)
-        self._statement = None
-        self._by_cursor = False
+        charge = self._charge()
+        if charge.timings is not None and charge.statement is not None:
+            charge.timings.since("db", charge.statement)
+        charge.statement = None
+        charge.by_cursor = False
 
     def _committing(self, *_: object) -> None:
-        self._statement = None
-        if self._timings is not None:
-            self._commit = self._timings.mark()
+        charge = self._charge()
+        charge.statement = None
+        if charge.timings is not None:
+            charge.commit = charge.timings.mark()
 
     def _ended(self, *_: object) -> None:
         # the transaction's end or an error: whatever was open is done
         self._answered()
-        if self._timings is not None and self._commit is not None:
-            self._timings.since("db", self._commit)
-        self._commit = None
+        charge = self._charge()
+        if charge.timings is not None and charge.commit is not None:
+            charge.timings.since("db", charge.commit)
+        charge.commit = None
 
     def _transaction_ended(self, session: Session, transaction: SessionTransaction) -> None:
         if transaction.parent is None:  # a flush's own ends inside its commit

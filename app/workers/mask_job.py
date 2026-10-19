@@ -42,7 +42,8 @@ import dataclasses
 import datetime as dt
 import hashlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -218,8 +219,11 @@ def _write_row(
     reason: str | None,
     origin_class: str | None,
     timings: StageTimings | None = None,
+    turn: Callable[[], None] | None = None,
     **fields: Any,
 ) -> None:
+    if turn is not None:
+        turn()
     with timed(timings, "db"):
         now = dt.datetime.now(dt.UTC)
         row = db.execute(
@@ -254,12 +258,20 @@ def _settle(
     batch: MaskBatch | None,
     revoked: Revoked | None = None,
     timings: StageTimings | None = None,
+    turn: Callable[[], None] | None = None,
+    slot: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> ItemReport:
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
     written then, the report is the whole result. ``revoked`` defaults to
     the revocations as they stand when this image is judged. ``timings``,
     when given, gets the seconds of each stage (MASK-PERF-1); its SQL's
-    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
+    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds).
+    ``turn``, when given, is called before the image's first write after its
+    judgment -- a mask registered or its row and the batch's -- and waits
+    for this image's turn to write them (MASK-PERF-2: the pipelined batch
+    writes the batch row in work-list order). ``slot``, when given, is held
+    from the copy's decode to its mask (the pipelined batch bounds the
+    copies decoded at once: app.workers.mask_pipeline.Slots)."""
     sha = obj.sha256
     try:
         # Judged over every image behind the clean copy (app.publication).
@@ -287,6 +299,7 @@ def _settle(
                 reason=reason,
                 origin_class=None,
                 timings=timings,
+                turn=turn,
             )
         return ItemReport(sha, "failed", reason, None)
     if not eligibility.eligible:
@@ -299,6 +312,7 @@ def _settle(
                 reason=eligibility.reason,
                 origin_class=eligibility.origin_class,
                 timings=timings,
+                turn=turn,
             )
         return ItemReport(sha, "ineligible", eligibility.reason, eligibility.origin_class)
 
@@ -307,7 +321,8 @@ def _settle(
             data = store.get(obj.storage_key)
         if hashlib.sha256(data).hexdigest() != sha:
             raise _Refused("source_hash_mismatch")
-        with timed(timings, "analysis"):  # the model and the encode inside count apart
+        decoded = nullcontext() if slot is None else slot()
+        with timed(timings, "analysis"), decoded:  # the model and the encode count apart
             outcome = build_mask_artifact(data, backend=backend, timings=timings)
             fields = _row_fields(outcome)
         if batch is not None and outcome.mask_png is not None and outcome.mask_sha256 is not None:
@@ -315,6 +330,8 @@ def _settle(
                 key = derived_key(outcome.mask_sha256, MASK_MIME)
                 with timed(timings, "upload"):
                     store.put(key, outcome.mask_png, MASK_MIME)
+                if turn is not None:
+                    turn()  # a mask another image shares is registered once, in order
                 register_public_object(
                     db,
                     sha256=outcome.mask_sha256,
@@ -344,6 +361,7 @@ def _settle(
                 reason=reason,
                 origin_class=eligibility.origin_class,
                 timings=timings,
+                turn=turn,
             )
         return ItemReport(sha, "failed", reason, eligibility.origin_class)
 
@@ -356,6 +374,7 @@ def _settle(
             reason=outcome.reason,
             origin_class=eligibility.origin_class,
             timings=timings,
+            turn=turn,
             **fields,
         )
     return ItemReport(
@@ -430,6 +449,8 @@ def settle_clean_copy(
     retry_failed: bool = False,
     recheck_ineligible: bool = False,
     timings: StageTimings | None = None,
+    turn: Callable[[], None] | None = None,
+    slot: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> ItemReport | None:
     """Settle ONE clean copy, by its sha, exactly as ``run_mask_batch`` settles
     each of its candidates (MASK-BATCH-1 drives the lane image by image, in its
@@ -437,7 +458,8 @@ def settle_clean_copy(
     pipeline version (unless re-driven), soft-deleted, or not a clean copy.
     Applied only: a backend that is not a mask model is refused. ``timings``,
     when given, gets the seconds of each stage (MASK-PERF-1); its SQL's
-    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds)."""
+    seconds are the caller's to time (app.workers.stage_timing.DatabaseSeconds).
+    ``turn``, ``slot``: as ``_settle`` takes them (MASK-PERF-2)."""
     if not backend.publishes_masks:
         raise ValueError(f"backend {backend.name!r} is not a mask model: dry run only")
     with timed(timings, "db"):  # the lane's first query: the pool's checkout too
@@ -450,7 +472,7 @@ def settle_clean_copy(
         )
     if not page:
         return None
-    return _settle(db, store, page[0], backend, batch, timings=timings)
+    return _settle(db, store, page[0], backend, batch, timings=timings, turn=turn, slot=slot)
 
 
 def original_settled(

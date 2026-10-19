@@ -49,7 +49,7 @@ from PIL import Image
 from sqlalchemy import create_engine, func, select
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/{n}.jpeg"
@@ -1638,6 +1638,11 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--residential-ttl", "-1"),
         ("--gpu-free-min-mib", "0"),  # would pass a full card
         ("--gpu-free-min-mib", "1023"),
+        ("--writers", "-1"),
+        ("--writers", "17"),  # more sessions than the media db's pool lends
+        ("--writers", "two"),
+        ("--prefetch", "0"),
+        ("--prefetch", "17"),  # originals held in memory
     ],
 )
 def test_a_bad_run_option_is_refused_by_the_parser(
@@ -1665,6 +1670,10 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--max-wait-seconds", "0", "max_wait_seconds", 0.0),
         ("--residential-ttl", "0.5", "residential_ttl", 0.5),
         ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
+        ("--writers", "0", "writers", 0),
+        ("--writers", "16", "writers", 16),
+        ("--prefetch", "1", "prefetch", 1),
+        ("--prefetch", "16", "prefetch", 16),
     ],
 )
 def test_the_smallest_sane_run_options_are_accepted(
@@ -2376,7 +2385,7 @@ _CHUNK_KEYS = {
     "event", "chunk", "batch_id", "count", "counts", "ranks", "seconds_per_image",
     "median_seconds", "masked", "seconds_per_masked_image", "mask_seconds_per_image",
     "peak_vram_mib", "baseline_vram_mib", "provider", "failures", "yielded",
-    "elapsed_seconds", "held_vram_mib",
+    "elapsed_seconds", "held_vram_mib", "throughput_seconds_per_image",
 }  # fmt: skip
 _STAGE_KEYS = {"stage_seconds_per_image", "stage_median_seconds", "stage_images"}
 
@@ -3061,3 +3070,215 @@ def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) 
     finally:
         other.close()
         engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# MASK-PERF-2: the pipeline's options, the throughput, the recent writes
+# --------------------------------------------------------------------------
+
+
+def test_the_pipeline_is_on_by_default_on_the_command_line() -> None:
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    assert (args.writers, args.prefetch) == (mb.DEFAULT_WRITERS, mb.DEFAULT_PREFETCH)
+    assert args.writers == 4  # the live chunk tunes it with --writers
+    assert args.prefetch == 2  # each original read ahead is decoded once more: memory
+    assert mb.BatchConfig().writers == 0  # a library caller runs one image at a time
+
+
+def test_main_passes_the_pipeline_options_and_keeps_writes_for_every_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        seen.update(config=config, store=rt.media_store)
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["--sandbox", str(tmp_path / "sb"), "run", "--worklist", str(wl), "--raw-dir"]
+    argv += [str(tmp_path / "raw"), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "3", "--prefetch", "2"]) == 0
+    assert (seen["config"].writers, seen["config"].prefetch) == (3, 2)
+    assert seen["store"].keep == 4 + 3 * 3  # each worker's original, copy and mask
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    assert seen["store"].keep == 4
+
+
+def test_main_runs_the_pipeline_on_a_pool_that_never_lends_past_what_it_keeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection a QueuePool lends past its size is closed when it comes
+    back, and any close kills the live run's kubectl port-forward: the
+    command line runs the pipeline on the same database through a pool that
+    keeps a connection for every worker and the batch, and lends no more."""
+    seen: list[Session] = []
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        seen.append(rt.open_db())
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    sandbox = tmp_path / "sb"
+    argv = ["--sandbox", str(sandbox), "run", "--worklist", str(wl), "--raw-dir"]
+    argv += [str(tmp_path / "raw"), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "9"]) == 0
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    piped, alone = (db.get_bind().engine for db in seen)
+    assert isinstance(piped.pool, QueuePool)
+    assert (piped.pool.size(), piped.pool._max_overflow) == (10, 0)
+    assert piped.url.database == alone.url.database == str(sandbox / "masks.db")
+    assert seen[0].autoflush and not seen[0].expire_on_commit  # the sandbox's session, as was
+    assert alone.pool._max_overflow == 10  # one image at a time: the session as opened
+
+
+def test_a_sized_pool_never_recycles_whatever_the_opened_one_does(tmp_path: Path) -> None:
+    """A recycle closes a pooled connection, which the pipelined run must not
+    see; the opened pool's own recycle (app.db's 1800 s) is not carried over."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'm.db'}", pool_size=10, max_overflow=20, pool_recycle=1800
+    )
+    sized = mb._sized(Session(engine), 4)
+    pool = sized.get_bind().engine.pool
+    assert engine.pool._recycle == 1800
+    assert pool._recycle == -1
+    sized.close()
+    sized.get_bind().engine.dispose()
+    engine.dispose()
+
+
+def test_a_sized_session_keeps_its_database_and_session_settings(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}", pool_size=10, max_overflow=20)
+    db = Session(engine, autoflush=False, expire_on_commit=False)
+    sized = mb._sized(db, 4)
+    pool = sized.get_bind().engine.pool
+    assert isinstance(pool, QueuePool)
+    assert (pool.size(), pool._max_overflow) == (10, 0)  # never below what the pool kept
+    assert pool._recycle == -1  # a recycle closes its connection: pre-ping replaces a dead one
+    assert (sized.autoflush, sized.expire_on_commit) == (False, False)
+    assert sized.get_bind().engine.url == engine.url
+    sized.close()
+    sized.get_bind().engine.dispose()
+    one = Session(create_engine("sqlite://", poolclass=StaticPool))
+    assert mb._sized(one, 4) is one  # not a QueuePool: _pipeline_refusal judges it
+    assert mb._sized(db, 0) is db
+    engine.dispose()
+
+
+def test_the_chunk_reports_its_throughput(db_session: Session, tmp_path: Path) -> None:
+    """Wall seconds of the chunk over its images: what a pipelined chunk
+    gains shows here, not in the per-image seconds."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+
+    class _Timed(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(3)
+            return super().predict_alpha(image)
+
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events)
+    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(chunk_size=2), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["elapsed_seconds"] == 6.0
+    assert chunk["throughput_seconds_per_image"] == 3.0
+
+
+def test_the_chunks_throughput_leaves_out_its_already_images(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """An 'already' image is one lookup: the throughput is the chunk's wall
+    seconds over the images it minted, as ``seconds_per_image`` is their
+    mean; a chunk that minted none has none."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+
+    class _Timed(_Model):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            clock.advance(3)
+            return super().predict_alpha(image)
+
+    first = raw.add(1)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, backend=_Timed(), events=events)
+    assert mb.run_batch([first, raw.add(2), first], mb.BatchConfig(chunk_size=3), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ok": 2, "already": 1}
+    assert (chunk["elapsed_seconds"], chunk["throughput_seconds_per_image"]) == (6.0, 3.0)
+    events.clear()
+    again = tmp_path / "again.jsonl"  # a fresh record: every image is found settled
+    rt = _runtime(db_session, tmp_path, raw, clock=clock, progress=again, events=events)
+    assert mb.run_batch([first], mb.BatchConfig(chunk_size=1), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"already": 1}
+    assert chunk["throughput_seconds_per_image"] is None
+
+
+def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """botocore keeps 10 connections and closes any it lent past them when it
+    comes back: the batch's clients keep one for every worker and every
+    original read ahead."""
+    for name, value in (
+        ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
+        ("RAW_S3_BUCKET", "raw"),
+        ("RAW_S3_ACCESS_KEY", "k"),
+        ("RAW_S3_SECRET_KEY", "s"),
+    ):
+        monkeypatch.setenv(name, value)
+    seen: list[tuple[int, int]] = []
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        raw, media = rt.raw_store, rt.media_store
+        assert isinstance(raw, mb.ReadOnlyStore) and isinstance(media, mb.RecentWrites)
+        pools = (raw._store, media._store)
+        seen.append(tuple(s._client.meta.config.max_pool_connections for s in pools))  # type: ignore[arg-type]
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--device", "cpu", "--no-residential-check"]
+    assert mb.main([*argv, "--writers", "12", "--prefetch", "6"]) == 0
+    assert mb.main([*argv, "--writers", "0"]) == 0
+    assert seen == [(18, 18), (10, 10)]  # never fewer than botocore's own 10
+
+
+def test_recent_writes_are_safe_from_many_workers() -> None:
+    """Workers evicting at once must not evict one copy twice (a KeyError
+    in a PUT that succeeded) nor grow past the bound."""
+    import threading
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.objects: dict[str, bytes] = {}
+
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            self.objects[key] = data
+
+        def get(self, key: str) -> bytes:
+            return self.objects[key]
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as the interpreter can
+    try:
+        store = mb.RecentWrites(_Memory(), keep=4)  # type: ignore[arg-type]
+        errors: list[BaseException] = []
+
+        def work(n: int) -> None:
+            try:
+                for i in range(3000):
+                    store.put(f"k{n}-{i}", b"x", "image/png")
+            except BaseException as exc:  # the failure itself
+                errors.append(exc)
+
+        workers = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
+    assert len(store._recent) == 4
