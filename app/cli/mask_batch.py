@@ -51,14 +51,16 @@ While the gate fails the batch waits, polling every
 loaded again, ~4 s, when the gate passes).
 
 THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
-flushed per line: a power cut loses at most the image in flight), and a run
+flushed per line: a power cut loses at most the images in flight, one or,
+pipelined, up to ``--writers``; each reruns idempotently), and a run
 skips what it lists (``--retry-failed`` re-drives its failures). Per chunk one
 JSON line on stdout: count, statuses, seconds per image (and the model's
 share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures,
 and where the seconds went: each stage's mean and median per image over the
 images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
-app.workers.stage_timing: fetch, seed, readback, inference, base_keep,
-analysis, encode, upload, db; a stage no image ran is absent) and how many
+app.workers.stage_timing: fetch, claim, seed, readback, gpu_wait, inference,
+base_keep, analysis, encode, upload, turn_wait, db; a stage no image ran is
+absent) and how many
 did (``stage_images``): each mean is over those images only, so the means
 add up to the seconds per image only when every image ran every stage. ``--dry-run``
 reads the work list and the progress file, checks the gate once and prints the
@@ -79,12 +81,20 @@ scraper window or the circuit lets no further image start or onto the GPU:
 the images past the GPU finish, the others are let go unrecorded and come
 back first. Each image's stages are its own wall time, the pipeline's waits
 among them (``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
-``throughput_seconds_per_image`` is its wall time over its images.
-``--writers 0`` runs one image at a time on the driver's own session.
+``throughput_seconds_per_image`` is its wall time over the images it minted
+(an 'already' one, a lookup, is left out, as in the seconds per image). At
+most three copies are decoded for the model at once, whatever the writers
+(the memory bound). The database pool keeps a connection for every worker
+and the batch and lends none past them, and each bucket client keeps one for
+every worker and read-ahead: no connection is closed while the run lasts (a
+close kills the kubectl port-forward the live run reaches its database
+through). ``--writers 0`` runs one image at a time on the driver's own
+session.
 
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
-SIGTERM: the image in flight is finished first).
+SIGTERM: the image in flight is finished first; pipelined, the images past
+the GPU are, the others are let go unrecorded and come back first).
 """
 
 from __future__ import annotations
@@ -160,8 +170,10 @@ OWN_MAX_MIB = (
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
 #: database session (0: one image at a time, the driver's own session); the
-#: live chunk tunes it with ``--writers``. The command line's pool keeps
-#: writers + 1 connections and lends none past them (``_sized``)...
+#: live chunk tunes it with ``--writers``. Simulated at the live costs: 5.5 s
+#: an image one at a time, 2.75 s with 2 writers, 1.78 s with 4, 1.21 s with 8,
+#: 1.05 s with 12. The command line's pool keeps writers + 1 connections and
+#: lends none past them (``_sized``)...
 DEFAULT_WRITERS = 4
 MAX_WRITERS = 16
 #: ...and the originals read, decoded and hash-checked ahead of them: two
