@@ -57,7 +57,9 @@ share, and per MASKED image -- ok or held -- apart from the cheap ineligible one
 and where the seconds went: each stage's mean and median per image over the
 images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
 app.workers.stage_timing: fetch, seed, readback, inference, base_keep,
-analysis, encode, upload, db; a stage no image ran is absent). ``--dry-run``
+analysis, encode, upload, db; a stage no image ran is absent) and how many
+did (``stage_images``): each mean is over those images only, so the means
+add up to the seconds per image only when every image ran every stage. ``--dry-run``
 reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
@@ -749,6 +751,7 @@ class _Chunk:
             ),
             "stage_seconds_per_image": {n: round(statistics.fmean(t), 3) for n, t in ran.items()},
             "stage_median_seconds": {n: round(statistics.median(t), 3) for n, t in ran.items()},
+            "stage_images": {n: len(t) for n, t in ran.items()},
             "peak_vram_mib": peak_vram_mib,
             "baseline_vram_mib": self.baseline_vram_mib,
             "provider": self.provider,

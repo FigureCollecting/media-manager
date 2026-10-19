@@ -2377,7 +2377,7 @@ _CHUNK_KEYS = {
     "peak_vram_mib", "baseline_vram_mib", "provider", "failures", "yielded",
     "elapsed_seconds", "held_vram_mib",
 }  # fmt: skip
-_STAGE_KEYS = {"stage_seconds_per_image", "stage_median_seconds"}
+_STAGE_KEYS = {"stage_seconds_per_image", "stage_median_seconds", "stage_images"}
 
 
 class _CostlyStore(LocalObjectStore):
@@ -2508,7 +2508,9 @@ def test_the_chunk_reports_where_each_images_seconds_go(
     assert list(chunk["stage_seconds_per_image"]) == list(means)
     assert chunk["stage_median_seconds"] == {**means, "inference": 3.0}
     assert list(chunk["stage_median_seconds"]) == list(means)
-    # every second of an image is in exactly one stage
+    assert chunk["stage_images"] == dict.fromkeys(means, 3)
+    assert list(chunk["stage_images"]) == list(means)
+    # every image ran every stage here, so the means add up to the mean image
     assert sum(means.values()) == chunk["seconds_per_image"]
 
 
@@ -2589,6 +2591,15 @@ def test_no_database_second_escapes_the_stages(
     stages = chunk["stage_seconds_per_image"]
     assert stages["upload"] == 0.25
     assert stages["db"] > 0.5 and stages["seed"] > 1.0  # the statements, beyond the commits
+    # each mean is over the images that ran its stage, and says how many did
+    assert chunk["stage_images"] == {
+        "fetch": 4, "seed": 4, "readback": 2, "inference": 2, "base_keep": 2,
+        "analysis": 2, "encode": 2, "upload": 2, "db": 4,
+    }  # fmt: skip
+    # so the means add up to the mean image only weighted by those counts
+    total = sum(mean * chunk["stage_images"][name] for name, mean in stages.items())
+    assert total == pytest.approx(chunk["seconds_per_image"] * len(records), abs=0.01)
+    assert sum(stages.values()) > chunk["seconds_per_image"] + 1
 
 
 def test_a_stage_that_never_ran_is_omitted_not_zero(
@@ -2604,6 +2615,7 @@ def test_a_stage_that_never_ran_is_omitted_not_zero(
     assert chunk["counts"] == {"ineligible": 1}
     assert chunk["stage_seconds_per_image"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
     assert chunk["stage_median_seconds"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
+    assert chunk["stage_images"] == {"fetch": 1, "seed": 1, "db": 1}
 
     # nothing minted (already done, by the media database): no stage at all
     events.clear()
@@ -2613,6 +2625,7 @@ def test_a_stage_that_never_ran_is_omitted_not_zero(
     assert again["counts"] == {"already": 1}
     assert again["stage_seconds_per_image"] == {}
     assert again["stage_median_seconds"] == {}
+    assert again["stage_images"] == {}
 
 
 def test_a_failed_images_seconds_are_staged_up_to_its_failure(
@@ -2655,6 +2668,9 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
         "analysis": 0.375,  # the unmasked appearance only
         "db": 0.25,  # (0 + the failed row's commit) / 2
     }
+    assert chunk["stage_images"] == {
+        "fetch": 2, "seed": 1, "readback": 1, "inference": 1, "base_keep": 1, "analysis": 1, "db": 2,
+    }  # fmt: skip
 
 
 def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) -> None:
