@@ -373,7 +373,14 @@ def _run(
     engine = engine or _engine(root / "media.db")
     if faults:
         _faults(items, raw, engine)
-    main = Session(engine, expire_on_commit=False)
+    batch_row: list[tuple[str, Any]] = []  # its UPDATEs, in order: their statements and values
+
+    @sa_event.listens_for(engine, "before_cursor_execute")
+    def _batch_row(conn: Any, cursor: Any, statement: str, params: Any, *rest: Any) -> None:
+        if statement.startswith("UPDATE mask_batches") and "finished_at" not in statement:
+            batch_row.append((statement, params))
+
+    main = Session(engine, expire_on_commit=False)  # autoflush on, as the sandbox's
     events: list[dict[str, Any]] = []
     try:
         code = mb.run_batch(items, config, _runtime(main, root, raw, backend or _Shapes(), events))
@@ -385,6 +392,7 @@ def _run(
         "media": _media(root / "media"),
         "progress": [_untimed(line) for line in _lines(root / "progress.jsonl")],
         "events": [_untimed(e) for e in events],
+        "batch_row": batch_row,
     }
     engine.dispose()
     return outcome

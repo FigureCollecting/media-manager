@@ -1047,7 +1047,9 @@ class _BatchRow:
     counts and cursor), lent to the next image's own copy of the row at its
     turn: each image's UPDATE is the one one image at a time makes. Unknown
     after an image whose last write rolled back: the next one reads the row
-    again, as one image at a time does after a rollback."""
+    again, as one image at a time does after a rollback -- at its turn,
+    before any write of its own is pending, so an autoflushing session
+    still makes one UPDATE of both (never the cursor flushed alone first)."""
 
     def __init__(self, batch: MaskBatch) -> None:
         self._state: tuple[dict[str, int], str | None] | None = (
@@ -1057,7 +1059,7 @@ class _BatchRow:
 
     def lend(self, db: Session, batch: MaskBatch) -> None:
         if self._state is None:
-            db.expire(batch, ["counts", "cursor_sha256"])
+            db.refresh(batch, ["counts", "cursor_sha256"])
             return
         counts, cursor = self._state
         set_committed_value(batch, "counts", dict(counts))
