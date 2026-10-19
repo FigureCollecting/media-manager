@@ -98,6 +98,9 @@ def test_the_run_is_on_the_gpu_with_names_not_values(tmp_path: Path) -> None:
     assert "--gpus all" in joined and "--network host" in joined and "--init" in joined
     assert "--name mask-batch" in joined
     assert "PYTHONPATH=/app" in argv  # the image's code, run from /state
+    # two malloc arenas, not one per thread: the pipeline's workers would each keep
+    # their own decodes' peak (MASK-PERF-2, 4000x3000: 2.6 GB -> 2.1 GB at 4 writers)
+    assert "MALLOC_ARENA_MAX=2" in argv
     assert f"{state}:/state" in argv
     assert f"{ca}:/run/mask-batch/pg-ca.crt:ro" in argv
     assert "PGSSLROOTCERT=/run/mask-batch/pg-ca.crt" in argv

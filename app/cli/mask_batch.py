@@ -66,7 +66,7 @@ plan: no database, no bucket, no model, nothing written.
 
 THE PIPELINE (MASK-PERF-2). The images of a chunk run ``--writers`` at a
 time (default 4), each on a worker with a database session of its own, and
-the next ``--prefetch`` originals (default 4) are read, decoded and
+the next ``--prefetch`` originals (default 2) are read, decoded and
 hash-checked ahead; the model runs on the driver's thread alone, one image
 at a time, so one image's I/O (its read, its seed, its judgment, its
 uploads and rows) overlaps another's model run. Each image's own work runs
@@ -164,8 +164,10 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: writers + 1 connections and lends none past them (``_sized``)...
 DEFAULT_WRITERS = 4
 MAX_WRITERS = 16
-#: ...and the originals read, decoded and hash-checked ahead of them.
-DEFAULT_PREFETCH = 4
+#: ...and the originals read, decoded and hash-checked ahead of them: two
+#: keep the next worker's ready, and each one read ahead is decoded once more
+#: (4000x3000: 2.6 GB peak at 4 writers with 2, 3.3 GB with 4, same speed).
+DEFAULT_PREFETCH = 2
 MAX_PREFETCH = 16
 #: The images whose copies are decoded for the model at once, whatever the
 #: writers: the one on the GPU and two waiting (app.workers.mask_pipeline.Slots).

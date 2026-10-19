@@ -3081,6 +3081,7 @@ def test_the_pipeline_is_on_by_default_on_the_command_line() -> None:
     args = mb._parser().parse_args(["run", "--worklist", "w"])
     assert (args.writers, args.prefetch) == (mb.DEFAULT_WRITERS, mb.DEFAULT_PREFETCH)
     assert args.writers == 4  # the live chunk tunes it with --writers
+    assert args.prefetch == 2  # each original read ahead is decoded once more: memory
     assert mb.BatchConfig().writers == 0  # a library caller runs one image at a time
 
 
