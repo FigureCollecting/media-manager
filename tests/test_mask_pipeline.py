@@ -569,6 +569,27 @@ def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
     assert mb.DECODED_AT_ONCE == 3
 
 
+def test_a_model_call_that_raises_still_gives_its_decode_slot_back(tmp_path: Path) -> None:
+    """More images crash the model than there are decode slots: each gives its
+    slot back as it fails, so the chunk finishes with every image failed (a
+    slot kept would leave the next image waiting for the GPU for good)."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(103, n) for n in range(1, mb.DECODED_AT_ONCE * 2 + 1)]
+    engine = _engine(tmp_path / "media.db", pool_size=5)
+    config = mb.BatchConfig(chunk_size=len(items), writers=4)
+    done: list[dict[str, Any]] = []
+    worker = threading.Thread(
+        target=lambda: done.append(_run(tmp_path, "run", items, raw, config, engine=engine)),
+        daemon=True,  # a deadlock must fail this test, not hold the suite
+    )
+    worker.start()
+    worker.join(30)
+    assert not worker.is_alive(), "a failed model call kept its decode slot: the chunk hangs"
+    (outcome,) = done
+    statuses = [r["status"] for r in outcome["progress"] if r["event"] == "item"]
+    assert statuses == ["failed"] * len(items)
+
+
 def test_decode_slots_go_to_the_earliest_image_waiting() -> None:
     slots = mp.Slots(1)
     order: list[int] = []

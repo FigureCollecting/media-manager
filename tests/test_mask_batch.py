@@ -3133,6 +3133,21 @@ def test_main_runs_the_pipeline_on_a_pool_that_never_lends_past_what_it_keeps(
     assert alone.pool._max_overflow == 10  # one image at a time: the session as opened
 
 
+def test_a_sized_pool_never_recycles_whatever_the_opened_one_does(tmp_path: Path) -> None:
+    """A recycle closes a pooled connection, which the pipelined run must not
+    see; the opened pool's own recycle (app.db's 1800 s) is not carried over."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'm.db'}", pool_size=10, max_overflow=20, pool_recycle=1800
+    )
+    sized = mb._sized(Session(engine), 4)
+    pool = sized.get_bind().engine.pool
+    assert engine.pool._recycle == 1800
+    assert pool._recycle == -1
+    sized.close()
+    sized.get_bind().engine.dispose()
+    engine.dispose()
+
+
 def test_a_sized_session_keeps_its_database_and_session_settings(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}", pool_size=10, max_overflow=20)
     db = Session(engine, autoflush=False, expire_on_commit=False)
