@@ -2512,20 +2512,83 @@ def test_the_chunk_reports_where_each_images_seconds_go(
     assert sum(means.values()) == chunk["seconds_per_image"]
 
 
+def _captured(monkeypatch: pytest.MonkeyPatch) -> list[StageTimings]:
+    """Every image's stage timings, in the order the batch made them."""
+    made: list[StageTimings] = []
+
+    class _Kept(StageTimings):
+        def __init__(self, clock: Callable[[], float]) -> None:
+            super().__init__(clock)
+            made.append(self)
+
+    monkeypatch.setattr(mb, "StageTimings", _Kept)
+    return made
+
+
+class _FullOn(_Pass):
+    """BiRefNet answering the whole frame on its ``frame``-th call (from 0):
+    the mask is held (full_frame), its PNG stored under held-masks/."""
+
+    def __init__(self, clock: _Clock, cost: float, *, frame: int) -> None:
+        super().__init__(clock, cost)
+        self._frame = frame
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        alpha = super().predict_alpha(image)
+        return np.full_like(alpha, 255) if self.calls - 1 == self._frame else alpha
+
+
 def test_no_database_second_escapes_the_stages(
     db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every SQL statement costs time too (the batch reaches the media
-    database over a tunnel): each one lands in a stage."""
+    database over a tunnel): each one lands in a stage, whichever way an
+    image settles: masked, held, its judgment raising, or ineligible."""
     raw = _Raw(tmp_path / "raw")
     clock = _Clock()
     events: list[dict[str, Any]] = []
-    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625)
-    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(), rt) == 0
+    rt = _costly_runtime(
+        db_session,
+        tmp_path,
+        raw,
+        clock,
+        monkeypatch,
+        events,
+        primary=_FullOn(clock, 2.0, frame=1),
+        statement=0.0625,
+    )
+    real_judgment = mask_job.judged_origins
+    judged: list[str] = []
+
+    def judgment(db: Session, sha256: str) -> Any:
+        judged.append(sha256)
+        if len(judged) == 3:
+            raise ValueError("an origin that will not parse")
+        return real_judgment(db, sha256)
+
+    monkeypatch.setattr(mask_job, "judged_origins", judgment)
+    made = _captured(monkeypatch)
+    items = [raw.add(1, rank=0), raw.add(2, rank=1), raw.add(3, rank=2), raw.add(4, url=PICTURE)]
+    assert mb.run_batch(items, mb.BatchConfig(), rt) == 1  # done, with a failure
+    records = _item_records(tmp_path / "progress.jsonl")
+    assert [(r["status"], r["reason"]) for r in records] == [
+        ("ok", None),
+        ("held", "full_frame"),
+        ("failed", "ValueError"),
+        ("ineligible", "user_photo"),
+    ]
+    assert any(p.parent.name == "held-masks" for p in (tmp_path / "media").rglob("*.png"))
+    # every second of every image is in exactly one stage
+    assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
+    # a mask's PUT is its upload, held or not, and nothing else is
+    assert [t.seconds.get("upload") for t in made] == [0.25, 0.25, None, None]
+    # the failed judgment's row (its statements and commit) is the database's
+    assert made[2].seconds["db"] > 0.5
+    assert set(made[2].seconds) == {"fetch", "seed", "db"}
     (chunk,) = _events(events, "chunk")
     stages = chunk["stage_seconds_per_image"]
+    assert stages["upload"] == 0.25
     assert stages["db"] > 0.5 and stages["seed"] > 1.0  # the statements, beyond the commits
-    assert sum(stages.values()) == pytest.approx(chunk["seconds_per_image"], abs=0.005)
 
 
 def test_a_stage_that_never_ran_is_omitted_not_zero(
