@@ -274,7 +274,8 @@ def _settle(
             )
     except Exception as exc:
         # A judgment that raises is this image's failure, never the batch's.
-        db.rollback()
+        with timed(timings, "db"):
+            db.rollback()
         reason = type(exc).__name__
         logger.warning("mask_judgment_failed", extra={"source_sha256": sha, "reason": reason})
         if batch is not None:
@@ -331,7 +332,8 @@ def _settle(
                     store.put(key, outcome.mask_png, MASK_MIME)
             fields["mask_storage_key"] = key
     except Exception as exc:
-        db.rollback()
+        with timed(timings, "db"):
+            db.rollback()
         reason = str(exc) if isinstance(exc, _Refused) else type(exc).__name__
         logger.warning("mask_failed", extra={"source_sha256": sha, "reason": reason})
         if batch is not None:

@@ -801,22 +801,26 @@ def is_outage_reason(reason: str | None) -> bool:
 class _Witness:
     """The media bucket as one image's lane sees it, keeping the last error
     it raised (the lane records only its class: a 503 and a 403 are both
-    ``ClientError`` there)."""
+    ``ClientError`` there). With ``timings``, each PUT is an "upload" and
+    each GET a "readback", inside whichever stage made it (the seed's too)."""
 
-    def __init__(self, store: ObjectStore) -> None:
+    def __init__(self, store: ObjectStore, timings: StageTimings | None = None) -> None:
         self._store = store
+        self._timings = timings
         self.error: Exception | None = None
 
     def get(self, key: str) -> bytes:
         try:
-            return self._store.get(key)
+            with timed(self._timings, "readback"):
+                return self._store.get(key)
         except Exception as exc:
             self.error = exc
             raise
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         try:
-            self._store.put(key, data, content_type)
+            with timed(self._timings, "upload"):
+                self._store.put(key, data, content_type)
         except Exception as exc:
             self.error = exc
             raise
@@ -863,13 +867,17 @@ def _mint(
     def raised(where: str, exc: Exception) -> dict[str, Any]:
         return failed(f"{where}:{type(exc).__name__}", is_outage(exc))
 
-    media = _Witness(rt.media_store)
+    def rolled_back(where: str, exc: Exception) -> dict[str, Any]:
+        with timed(timings, "db"):  # a round trip like any query
+            db.rollback()
+        return raised(where, exc)
+
+    media = _Witness(rt.media_store, timings)
     try:
         with timed(timings, "db"):
             settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
-        db.rollback()
-        return raised("db", exc)
+        return rolled_back("db", exc)
     if settled is not None:
         record.update(status="already", mask_status=settled)
         return record
@@ -893,8 +901,7 @@ def _mint(
             )
         clean_sha = clean.sha256
     except Exception as exc:
-        db.rollback()
-        return raised("seed", exc)
+        return rolled_back("seed", exc)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
     try:
@@ -908,12 +915,13 @@ def _mint(
             timings=timings,
         )
     except Exception as exc:
-        db.rollback()
-        return raised("settle", exc)
+        return rolled_back("settle", exc)
     record["mask_seconds"] = round(rt.monotonic() - mask_start, 3)
     if report is None:
         # another original's copy of the same picture was settled first
-        record.update(status="already", mask_status=original_settled(db, item.blob_sha256))
+        with timed(timings, "db"):
+            mask_status = original_settled(db, item.blob_sha256)
+        record.update(status="already", mask_status=mask_status)
     elif report.status == "failed":
         # the lane caught it and kept the class name; the bucket's error, if any, says more
         witnessed = media.error is not None and is_outage(media.error)

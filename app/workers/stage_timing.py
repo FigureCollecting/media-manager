@@ -20,14 +20,16 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 #: database (reached all along the way) last.
 STAGES = (
     "fetch",  # the original from the raw bucket, and its decode
-    "seed",  # the clean copy minted and registered (app.workers.mask_seed)
-    "readback",  # the lane re-reading the copy it hashes
+    # the clean copy minted and registered (app.workers.mask_seed), but for its
+    # PUTs: its decode, encode and phash, and its own queries and commit
+    "seed",
+    "readback",  # a media-bucket GET: the lane re-reading the copy it hashes
     "inference",  # the mask model's answer (BiRefNet)
     "base_keep",  # the base-keep pass: the IS-Net donors and the merge
     "analysis",  # the copy's decode, grounding and appearances
     "encode",  # the mask PNG
-    "upload",  # the mask's PUT
-    "db",  # every other query and commit
+    "upload",  # a media-bucket PUT: the original, its clean copy, the mask
+    "db",  # every other query, commit and rollback
 )
 
 

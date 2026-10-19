@@ -2414,22 +2414,17 @@ class _Pass(_Model):
         return super().predict_alpha(image)
 
 
-def _costly_runtime(
+def _costly_lane(
     db: Session,
-    tmp_path: Path,
-    raw: _Raw,
     clock: _Clock,
     monkeypatch: pytest.MonkeyPatch,
-    events: list[dict[str, Any]],
     *,
-    primary: MattingBackend | None = None,
     statement: float = 0.0,
-) -> mb.Runtime:
-    """The batch with every stage costing fake seconds on its clock: the raw
-    GET 1 s; a media PUT 0.25 s, a media GET 0.125 s; a commit 0.5 s and each
-    SQL statement ``statement`` s; BiRefNet (``primary``) 2 s; the base-keep
-    donors 0.75 + 0.5 s; each appearance (analysis) 0.375 s; the mask encode
-    0.625 s. Nothing else moves the clock."""
+    rollback: float = 0.0,
+) -> None:
+    """The lane's database and artifact costing fake seconds on ``clock``: a
+    commit 0.5 s, each SQL statement ``statement`` s, a rollback ``rollback``
+    s; each appearance (analysis) 0.375 s; the mask encode 0.625 s."""
     real_encode, real_appearance = mask_artifact.encode_mask_png, mask_artifact._appearance
 
     def encode(alpha: np.ndarray) -> bytes:
@@ -2446,6 +2441,33 @@ def _costly_runtime(
     sa_event.listen(engine, "commit", lambda conn: clock.advance(0.5))
     if statement:
         sa_event.listen(engine, "before_cursor_execute", lambda *a: clock.advance(statement))
+    if rollback:
+        real_rollback = db.rollback
+
+        def costly_rollback() -> None:
+            clock.advance(rollback)
+            real_rollback()
+
+        monkeypatch.setattr(db, "rollback", costly_rollback)
+
+
+def _costly_runtime(
+    db: Session,
+    tmp_path: Path,
+    raw: _Raw,
+    clock: _Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[dict[str, Any]],
+    *,
+    primary: MattingBackend | None = None,
+    statement: float = 0.0,
+    rollback: float = 0.0,
+) -> mb.Runtime:
+    """The batch with every stage costing fake seconds on its clock: the raw
+    GET 1 s; a media PUT 0.25 s, a media GET 0.125 s; BiRefNet (``primary``)
+    2 s; the base-keep donors 0.75 + 0.5 s; the database and the artifact as
+    in ``_costly_lane``. Nothing else moves the clock."""
+    _costly_lane(db, clock, monkeypatch, statement=statement, rollback=rollback)
     backend = BaseKeptMattingBackend(
         primary=primary or _Pass(clock, 2.0),
         donors=[_Pass(clock, 0.75), _Pass(clock, 0.5)],
@@ -2495,13 +2517,13 @@ def test_the_chunk_reports_where_each_images_seconds_go(
     assert set(chunk) == _CHUNK_KEYS | _STAGE_KEYS
     means = {
         "fetch": 1.0,  # the raw GET (and its decode)
-        "seed": 1.0,  # two PUTs (original, copy) and one commit
+        "seed": 0.5,  # its commit (its two PUTs are uploads)
         "readback": 0.125,  # the lane re-reads the copy it hashes
         "inference": 4.0,  # BiRefNet: (2 + 3 + 7) / 3
         "base_keep": 1.25,  # the two IS-Net donors
         "analysis": 0.75,  # the appearances, unmasked and masked
         "encode": 0.625,  # the mask PNG
-        "upload": 0.25,  # the mask PUT
+        "upload": 0.75,  # three PUTs: the original, its clean copy, the mask
         "db": 0.5,  # the mask row's commit
     }
     assert chunk["stage_seconds_per_image"] == means
@@ -2558,6 +2580,7 @@ def test_no_database_second_escapes_the_stages(
         events,
         primary=_FullOn(clock, 2.0, frame=1),
         statement=0.0625,
+        rollback=0.375,
     )
     real_judgment = mask_job.judged_origins
     judged: list[str] = []
@@ -2582,19 +2605,19 @@ def test_no_database_second_escapes_the_stages(
     assert any(p.parent.name == "held-masks" for p in (tmp_path / "media").rglob("*.png"))
     # every second of every image is in exactly one stage
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
-    # a mask's PUT is its upload, held or not, and nothing else is
-    assert [t.seconds.get("upload") for t in made] == [0.25, 0.25, None, None]
-    # the failed judgment's row (its statements and commit) is the database's
-    assert made[2].seconds["db"] > 0.5
-    assert set(made[2].seconds) == {"fetch", "seed", "db"}
+    # every PUT is an upload (the seed's two, the mask's held or not), nothing else is
+    assert [t.seconds["upload"] for t in made] == [0.75, 0.75, 0.5, 0.5]
+    # the failed judgment's rollback and row (statements, commit) are the database's
+    assert made[2].seconds["db"] > 0.875
+    assert set(made[2].seconds) == {"fetch", "seed", "upload", "db"}
     (chunk,) = _events(events, "chunk")
     stages = chunk["stage_seconds_per_image"]
-    assert stages["upload"] == 0.25
-    assert stages["db"] > 0.5 and stages["seed"] > 1.0  # the statements, beyond the commits
+    assert stages["upload"] == 0.625
+    assert stages["db"] > 0.5 and stages["seed"] > 0.5  # the statements, beyond the commits
     # each mean is over the images that ran its stage, and says how many did
     assert chunk["stage_images"] == {
         "fetch": 4, "seed": 4, "readback": 2, "inference": 2, "base_keep": 2,
-        "analysis": 2, "encode": 2, "upload": 2, "db": 4,
+        "analysis": 2, "encode": 2, "upload": 4, "db": 4,
     }  # fmt: skip
     # so the means add up to the mean image only weighted by those counts
     total = sum(mean * chunk["stage_images"][name] for name, mean in stages.items())
@@ -2613,9 +2636,10 @@ def test_a_stage_that_never_ran_is_omitted_not_zero(
     assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt) == 0
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"ineligible": 1}
-    assert chunk["stage_seconds_per_image"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
-    assert chunk["stage_median_seconds"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
-    assert chunk["stage_images"] == {"fetch": 1, "seed": 1, "db": 1}
+    staged = {"fetch": 1.0, "seed": 0.5, "upload": 0.5, "db": 0.5}
+    assert chunk["stage_seconds_per_image"] == staged
+    assert chunk["stage_median_seconds"] == staged
+    assert chunk["stage_images"] == dict.fromkeys(staged, 1)
 
     # nothing minted (already done, by the media database): no stage at all
     events.clear()
@@ -2632,7 +2656,8 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
     db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An outage's wait shows in its stage (a raw GET that times out after
-    4 s); an image the model fails on keeps the stages it went through."""
+    4 s); an image the model fails on keeps the stages it went through, and
+    the rollback after it is a database second."""
     raw = _Raw(tmp_path / "raw")
     clock = _Clock()
     timeout_key = raw.add(1, rank=0).storage_key
@@ -2651,26 +2676,185 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
 
     events: list[dict[str, Any]] = []
     rt = _costly_runtime(
-        db_session, tmp_path, raw, clock, monkeypatch, events, primary=_Crash(clock, 2.0)
+        db_session,
+        tmp_path,
+        raw,
+        clock,
+        monkeypatch,
+        events,
+        primary=_Crash(clock, 2.0),
+        rollback=0.25,
     )
     rt.raw_store = mb.ReadOnlyStore(_TimingOut(tmp_path / "raw", clock, get=1.0))
     items = [raw.add(1, rank=0), raw.add(2, rank=1)]
     assert mb.run_batch(items, mb.BatchConfig(), rt) == 1  # done, with failures
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"interrupted": 1, "failed": 1}
-    assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 6.25]
+    assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 6.5]
     assert chunk["stage_seconds_per_image"] == {
         "fetch": 2.5,  # (4 + 1) / 2
-        "seed": 1.0,
+        "seed": 0.5,
         "readback": 0.125,
         "inference": 2.0,  # up to the crash
         "base_keep": 1.25,  # the donors ran first
         "analysis": 0.375,  # the unmasked appearance only
-        "db": 0.25,  # (0 + the failed row's commit) / 2
+        "upload": 0.5,  # the seed's two PUTs
+        "db": 0.375,  # (0 + the rollback and the failed row's commit) / 2
     }
     assert chunk["stage_images"] == {
-        "fetch": 2, "seed": 1, "readback": 1, "inference": 1, "base_keep": 1, "analysis": 1, "db": 2,
+        "fetch": 2, "seed": 1, "readback": 1, "inference": 1, "base_keep": 1, "analysis": 1,
+        "upload": 1, "db": 2,
     }  # fmt: skip
+
+
+@pytest.mark.parametrize("where", ["db", "seed", "settle"])
+def test_the_rollback_after_a_failure_is_a_database_second(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Over the tunnel a rollback is a round trip like a query: the one after
+    a lookup, a seed or a lane that raised lands in "db"."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, rollback=0.375)
+
+    def down(*a: object, **k: object) -> None:
+        raise ConnectionError("server closed the connection")
+
+    monkeypatch.setattr(
+        mb,
+        {"db": "original_settled", "seed": "seed_clean_image", "settle": "settle_clean_copy"}[
+            where
+        ],
+        down,
+    )
+    made = _captured(monkeypatch)
+    assert mb.run_batch([raw.add(1)], mb.BatchConfig(), rt) == 1
+    (record,) = _item_records(tmp_path / "progress.jsonl")
+    assert record["reason"] == f"{where}:ConnectionError"
+    (timings,) = made
+    assert timings.seconds["db"] == 0.375  # the rollback, the lookup costing nothing here
+    assert sum(timings.seconds.values()) == record["seconds"]
+
+
+def _recaptured(raw: _Raw, n: int) -> mb.WorkItem:
+    """Picture ``n`` again in other bytes (a re-save with a text chunk)."""
+    from PIL import PngImagePlugin
+
+    meta = PngImagePlugin.PngInfo()
+    meta.add_text("Comment", "captured again")
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(_photo(n))).save(buf, format="PNG", pnginfo=meta)
+    again = buf.getvalue()
+    sha = hashlib.sha256(again).hexdigest()
+    key = f"raw-img/sha256/{sha[:2]}/{sha}.png"
+    raw.store.put(key, again, "image/png")
+    return mb.WorkItem(blob_sha256=sha, storage_key=key, url=ITEM.format(n=n), product_id="p2")
+
+
+def test_the_lookup_after_a_copy_settled_by_another_original_is_a_database_second(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane answers None for a copy another original settled first; the
+    batch then asks the database for that copy's status: those statements
+    land in "db" like every other."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625)
+    made = _captured(monkeypatch)
+    assert mb.run_batch([raw.add(1), _recaptured(raw, 1)], mb.BatchConfig(), rt) == 0
+    records = _item_records(tmp_path / "progress.jsonl")
+    assert [(r["status"], r.get("mask_status")) for r in records] == [
+        ("ok", None),
+        ("already", "ok"),
+    ]
+    assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
+
+
+def test_the_lanes_bucket_stages_each_put_as_an_upload_and_each_get_as_a_readback(
+    tmp_path: Path,
+) -> None:
+    """The media bucket as one image's lane sees it: a PUT is an upload and a
+    GET a readback, inside whichever stage made it (the seed's included),
+    and one that raises keeps its seconds and its error."""
+    clock = _Clock()
+    timings = StageTimings(clock.monotonic)
+    media = mb._Witness(_CostlyStore(tmp_path / "ok", clock, get=0.125, put=0.25), timings)
+    with timings.stage("seed"):
+        clock.advance(1.0)
+        media.put("k", b"bytes", "image/png")
+    assert media.get("k") == b"bytes"
+    assert timings.seconds == {"upload": 0.25, "seed": 1.0, "readback": 0.125}
+
+    class _Down(LocalObjectStore):
+        def get(self, key: str) -> bytes:
+            clock.advance(2.0)
+            raise TimeoutError("read timed out")
+
+        def put(self, key: str, data: bytes, content_type: str) -> None:
+            clock.advance(4.0)
+            raise ConnectionError("connection reset")
+
+    down = mb._Witness(_Down(tmp_path / "down"), timings)
+    with pytest.raises(ConnectionError):
+        down.put("k", b"bytes", "image/png")
+    assert isinstance(down.error, ConnectionError)
+    with pytest.raises(TimeoutError):
+        down.get("k")
+    assert isinstance(down.error, TimeoutError)
+    assert timings.seconds == {"upload": 4.25, "seed": 1.0, "readback": 2.125}
+
+
+@pytest.mark.parametrize(
+    ("answer", "status", "staged"),
+    [
+        ("mask", "ok", {"readback": 0.125, "analysis": 0.75, "inference": 2.0, "encode": 0.625}),
+        ("full", "held", {"readback": 0.125, "analysis": 0.75, "inference": 2.0, "encode": 0.625}),
+        ("crash", "failed", {"readback": 0.125, "analysis": 0.375, "inference": 2.0}),
+        ("judgment", "failed", {}),
+    ],
+)
+def test_settle_clean_copy_stages_its_own_seconds(
+    db_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+    status: str,
+    staged: dict[str, float],
+) -> None:
+    """On its own, over a plain bucket (no batch around it), the lane still
+    puts each second in a stage: the copy read back, the model, the mask's
+    PUT (held or not), its rows, and the rollback after a failure."""
+    clock = _Clock()
+    store = _CostlyStore(tmp_path / "media", clock, get=0.125, put=0.25)
+    obj = _seed(db_session, store, 7)
+    batch = mask_job.open_mask_batch(db_session, backend_name="stub-model")
+    _costly_lane(db_session, clock, monkeypatch, rollback=0.375)
+
+    class _Primary(_Pass):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            alpha = super().predict_alpha(image)
+            if answer == "crash":
+                raise RuntimeError("CUDA error")
+            return np.full_like(alpha, 255) if answer == "full" else alpha
+
+    def judgment(db: Session, sha256: str) -> Any:
+        raise ValueError("an origin that will not parse")
+
+    if answer == "judgment":
+        monkeypatch.setattr(mask_job, "judged_origins", judgment)
+    timings = StageTimings(clock.monotonic)
+    start = clock.monotonic()
+    report = mask_job.settle_clean_copy(
+        db_session, store, obj.sha256, backend=_Primary(clock, 2.0), batch=batch, timings=timings
+    )
+    assert report is not None and report.status == status
+    stored = status in ("ok", "held")
+    # the row's commit, and a failure's rollback before it
+    db = 0.5 if stored else 0.375 + 0.5
+    assert timings.seconds == {**staged, **({"upload": 0.25} if stored else {}), "db": db}
+    assert sum(timings.seconds.values()) == clock.monotonic() - start
 
 
 def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) -> None:
