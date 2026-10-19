@@ -53,7 +53,11 @@ THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
 flushed per line: a power cut loses at most the image in flight), and a run
 skips what it lists (``--retry-failed`` re-drives its failures). Per chunk one
 JSON line on stdout: count, statuses, seconds per image (and the model's
-share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures. ``--dry-run``
+share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures,
+and where the seconds went: each stage's mean and median per image over the
+images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
+app.workers.stage_timing: fetch, seed, readback, inference, base_keep,
+analysis, encode, upload, db; a stage no image ran is absent). ``--dry-run``
 reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
@@ -99,6 +103,7 @@ from ..workers.mask_job import (
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
+from ..workers.stage_timing import STAGES, StageTimings, timed
 
 #: The scraper's roll windows (minutes of the hour): no chunk runs in them.
 DEFAULT_BUSY_WINDOWS = "03-26,41-43,50-56"
@@ -708,6 +713,8 @@ class _Chunk:
     baseline_vram_mib: int | None
     provider: str | None
     records: list[dict[str, Any]] = field(default_factory=list)
+    #: per record, its seconds by stage (app.workers.stage_timing)
+    stages: list[dict[str, float]] = field(default_factory=list)
     yielded: bool = False
 
     def report(self, peak_vram_mib: int | None, elapsed: float) -> dict[str, Any]:
@@ -719,6 +726,13 @@ class _Chunk:
         mask_seconds = [r["mask_seconds"] for r in minted if r.get("mask_seconds") is not None]
         # an ineligible photo costs next to nothing (no model): the real rate
         masked = [r["seconds"] for r in minted if r["status"] in _MASKED]
+        # each stage over the minted images that ran it: one that never ran is absent
+        by_stage: dict[str, list[float]] = {name: [] for name in STAGES}
+        for r, stages in zip(self.records, self.stages, strict=True):
+            if r["status"] != "already" and "seconds" in r:
+                for name, took in stages.items():
+                    by_stage.setdefault(name, []).append(took)
+        ran = {name: per_image for name, per_image in by_stage.items() if per_image}
         return {
             "event": "chunk",
             "chunk": self.number,
@@ -733,6 +747,8 @@ class _Chunk:
             "mask_seconds_per_image": (
                 round(statistics.fmean(mask_seconds), 3) if mask_seconds else None
             ),
+            "stage_seconds_per_image": {n: round(statistics.fmean(t), 3) for n, t in ran.items()},
+            "stage_median_seconds": {n: round(statistics.median(t), 3) for n, t in ran.items()},
             "peak_vram_mib": peak_vram_mib,
             "baseline_vram_mib": self.baseline_vram_mib,
             "provider": self.provider,
@@ -816,8 +832,10 @@ def _mint(
     backend: MattingBackend,
     batch: Any,
     retry_failed: bool,
+    timings: StageTimings | None = None,
 ) -> dict[str, Any]:
-    """One original, start to finish; the result as its progress record."""
+    """One original, start to finish; the result as its progress record.
+    ``timings``, when given, gets the seconds of each stage (MASK-PERF-1)."""
     assert rt.raw_store is not None and rt.media_store is not None
     start = rt.monotonic()
     record: dict[str, Any] = {
@@ -844,7 +862,8 @@ def _mint(
 
     media = _Witness(rt.media_store)
     try:
-        settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
+        with timed(timings, "db"):
+            settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
         db.rollback()
         return raised("db", exc)
@@ -854,19 +873,21 @@ def _mint(
     if item.codec not in ("identity", "gzip"):
         return failed(f"unsupported_codec:{item.codec}")
     try:
-        data = _decode(rt.raw_store.get(item.storage_key), item.codec)
+        with timed(timings, "fetch"):
+            data = _decode(rt.raw_store.get(item.storage_key), item.codec)
     except Exception as exc:
         return raised("fetch", exc)
     if hashlib.sha256(data).hexdigest() != item.blob_sha256:
         return failed("raw_hash_mismatch")
     try:
-        clean = seed_clean_image(
-            db,
-            media,
-            data,
-            origins=[ImageOrigin(url=item.url, source=item.source)],
-            figure_id=item.product_id,
-        )
+        with timed(timings, "seed"):
+            clean = seed_clean_image(
+                db,
+                media,
+                data,
+                origins=[ImageOrigin(url=item.url, source=item.source)],
+                figure_id=item.product_id,
+            )
         clean_sha = clean.sha256
     except Exception as exc:
         db.rollback()
@@ -875,7 +896,13 @@ def _mint(
     mask_start = rt.monotonic()
     try:
         report = settle_clean_copy(
-            db, media, clean_sha, backend=backend, batch=batch, retry_failed=retry_failed
+            db,
+            media,
+            clean_sha,
+            backend=backend,
+            batch=batch,
+            retry_failed=retry_failed,
+            timings=timings,
         )
     except Exception as exc:
         db.rollback()
@@ -1024,13 +1051,15 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                         break
                     # an outage's casualties are re-driven without --retry-failed
                     redrive = config.retry_failed or item.blob_sha256 in interrupted
-                    record = _mint(db, item, rt, backend, batch, redrive)
+                    timings = StageTimings(rt.monotonic)
+                    record = _mint(db, item, rt, backend, batch, redrive, timings)
                     record["chunk"] = chunk_no
                     if gpu is not None and not measured and record["status"] in _RAN_MODEL:
                         gpu.measure_own()
                         measured = True
                     rt.progress.append(record)
                     chunk.records.append(record)
+                    chunk.stages.append(timings.seconds)
                     position += 1
                     if record["status"] == "interrupted":
                         streak += 1

@@ -36,6 +36,7 @@ from ..hashing import detect_mime
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .stage_timing import StageTimings
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,12 @@ class MattingBackend(ABC):
         """
         cutout = self.matte(image.convert("RGBA"))
         return np.asarray(cutout.convert("RGBA"))[..., 3].copy()
+
+    def predict_alpha_timed(self, image: Image.Image, timings: StageTimings) -> np.ndarray:
+        """``predict_alpha``, its seconds in ``timings`` (MASK-PERF-1): one
+        "inference" stage here; a backend of several passes times each."""
+        with timings.stage("inference"):
+            return self.predict_alpha(image)
 
     def load(self) -> None:
         """Open every model session now, so a broken runtime is refused before

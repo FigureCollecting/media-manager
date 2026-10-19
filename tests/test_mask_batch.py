@@ -35,15 +35,20 @@ from typing import Any
 import numpy as np
 import pytest
 from app.cli import mask_batch as mb
-from app.models import ImageMask, MaskBatch, PublicObject
+from app.models import Base, ImageMask, MaskBatch, PublicObject
 from app.object_store import LocalObjectStore
+from app.workers import mask as mask_artifact
 from app.workers import mask_job
+from app.workers.basekept import BaseKeptMattingBackend
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import seed_clean_image
 from app.workers.matting import MattingBackend, StubMattingBackend
+from app.workers.stage_timing import StageTimings
 from PIL import Image
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, func, select
+from sqlalchemy import event as sa_event
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 ITEM = "https://static.myfigurecollection.net/upload/items/2/{n}-a1b2.jpg"
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/{n}.jpeg"
@@ -2354,3 +2359,277 @@ def test_the_own_memory_is_measured_after_the_model_has_run(
     assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, poll_seconds=60), rt) == 0
     assert _events(events, "paused") == []
     assert gates.gpu is not None and gates.gpu.own_mib == OWN
+
+
+# --------------------------------------------------------------------------
+# MASK-PERF-1: where each image's seconds go
+# --------------------------------------------------------------------------
+
+#: The item record and the chunk event as they were before the stage timings:
+#: the record gains nothing, the chunk only the two stage dicts.
+_ITEM_KEYS = {
+    "event", "blob_sha256", "product_id", "head_id", "rank", "batch_id", "clean_sha256",
+    "mask_sha256", "reason", "status", "mask_seconds", "seconds", "chunk",
+}  # fmt: skip
+_CHUNK_KEYS = {
+    "event", "chunk", "batch_id", "count", "counts", "ranks", "seconds_per_image",
+    "median_seconds", "masked", "seconds_per_masked_image", "mask_seconds_per_image",
+    "peak_vram_mib", "baseline_vram_mib", "provider", "failures", "yielded",
+    "elapsed_seconds", "held_vram_mib",
+}  # fmt: skip
+_STAGE_KEYS = {"stage_seconds_per_image", "stage_median_seconds"}
+
+
+class _CostlyStore(LocalObjectStore):
+    """A bucket whose GET and PUT cost fake seconds on the batch's clock."""
+
+    def __init__(self, root: Path, clock: _Clock, *, get: float, put: float = 0.0) -> None:
+        super().__init__(root)
+        self._clock = clock
+        self._get_cost = get
+        self._put_cost = put
+
+    def get(self, key: str) -> bytes:
+        self._clock.advance(self._get_cost)
+        return super().get(key)
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        self._clock.advance(self._put_cost)
+        super().put(key, data, content_type)
+
+
+class _Pass(_Model):
+    """One model pass costing fake seconds: ``costs`` in call order, the last
+    repeating."""
+
+    def __init__(self, clock: _Clock, *costs: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._costs = costs
+        self.calls = 0
+
+    def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        self._clock.advance(self._costs[min(self.calls, len(self._costs) - 1)])
+        self.calls += 1
+        return super().predict_alpha(image)
+
+
+def _costly_runtime(
+    db: Session,
+    tmp_path: Path,
+    raw: _Raw,
+    clock: _Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[dict[str, Any]],
+    *,
+    primary: MattingBackend | None = None,
+    statement: float = 0.0,
+) -> mb.Runtime:
+    """The batch with every stage costing fake seconds on its clock: the raw
+    GET 1 s; a media PUT 0.25 s, a media GET 0.125 s; a commit 0.5 s and each
+    SQL statement ``statement`` s; BiRefNet (``primary``) 2 s; the base-keep
+    donors 0.75 + 0.5 s; each appearance (analysis) 0.375 s; the mask encode
+    0.625 s. Nothing else moves the clock."""
+    real_encode, real_appearance = mask_artifact.encode_mask_png, mask_artifact._appearance
+
+    def encode(alpha: np.ndarray) -> bytes:
+        clock.advance(0.625)
+        return real_encode(alpha)
+
+    def appearance(rgba: Image.Image) -> Any:
+        clock.advance(0.375)
+        return real_appearance(rgba)
+
+    monkeypatch.setattr(mask_artifact, "encode_mask_png", encode)
+    monkeypatch.setattr(mask_artifact, "_appearance", appearance)
+    engine = db.get_bind()
+    sa_event.listen(engine, "commit", lambda conn: clock.advance(0.5))
+    if statement:
+        sa_event.listen(engine, "before_cursor_execute", lambda *a: clock.advance(statement))
+    backend = BaseKeptMattingBackend(
+        primary=primary or _Pass(clock, 2.0),
+        donors=[_Pass(clock, 0.75), _Pass(clock, 0.5)],
+    )
+    rt = _runtime(db, tmp_path, raw, clock=clock, backend=backend, events=events)
+    rt.raw_store = mb.ReadOnlyStore(_CostlyStore(tmp_path / "raw", clock, get=1.0))
+    rt.media_store = _CostlyStore(tmp_path / "media", clock, get=0.125, put=0.25)
+    return rt
+
+
+def _item_records(progress: Path) -> list[dict[str, Any]]:
+    lines = [json.loads(line) for line in progress.read_text().splitlines()]
+    return [r for r in lines if r["event"] == "item"]
+
+
+def test_the_chunk_reports_where_each_images_seconds_go(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mask_seconds mixes the model with the bucket and the database: the chunk
+    splits each image's seconds by stage (mean and median) and changes
+    nothing else."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(
+        db_session, tmp_path, raw, clock, monkeypatch, events, primary=_Pass(clock, 2, 3, 7)
+    )
+    items = [raw.add(1, rank=0), raw.add(2, rank=1), raw.add(3, rank=2)]
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=3), rt) == 0
+
+    # unchanged: these held before the stages were timed
+    minted = _item_records(tmp_path / "progress.jsonl")
+    assert [set(r) for r in minted] == [_ITEM_KEYS] * 3
+    assert [r["status"] for r in minted] == ["ok", "ok", "ok"]
+    # 5.5 s around the model (raw 1, seed 1, settle 3.5), plus BiRefNet's 2, 3, 7
+    assert [r["seconds"] for r in minted] == [7.5, 8.5, 12.5]
+    assert [r["mask_seconds"] for r in minted] == [5.5, 6.5, 10.5]
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ok": 3}
+    assert chunk["seconds_per_image"] == 9.5
+    assert chunk["median_seconds"] == 8.5
+    assert chunk["seconds_per_masked_image"] == 9.5
+    assert chunk["mask_seconds_per_image"] == 7.5
+    assert chunk["provider"] == "FakeExecutionProvider"
+
+    # new: the stages, in pipeline order, the database last
+    assert set(chunk) == _CHUNK_KEYS | _STAGE_KEYS
+    means = {
+        "fetch": 1.0,  # the raw GET (and its decode)
+        "seed": 1.0,  # two PUTs (original, copy) and one commit
+        "readback": 0.125,  # the lane re-reads the copy it hashes
+        "inference": 4.0,  # BiRefNet: (2 + 3 + 7) / 3
+        "base_keep": 1.25,  # the two IS-Net donors
+        "analysis": 0.75,  # the appearances, unmasked and masked
+        "encode": 0.625,  # the mask PNG
+        "upload": 0.25,  # the mask PUT
+        "db": 0.5,  # the mask row's commit
+    }
+    assert chunk["stage_seconds_per_image"] == means
+    assert list(chunk["stage_seconds_per_image"]) == list(means)
+    assert chunk["stage_median_seconds"] == {**means, "inference": 3.0}
+    assert list(chunk["stage_median_seconds"]) == list(means)
+    # every second of an image is in exactly one stage
+    assert sum(means.values()) == chunk["seconds_per_image"]
+
+
+def test_no_database_second_escapes_the_stages(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every SQL statement costs time too (the batch reaches the media
+    database over a tunnel): each one lands in a stage."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events, statement=0.0625)
+    assert mb.run_batch([raw.add(1), raw.add(2)], mb.BatchConfig(), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    stages = chunk["stage_seconds_per_image"]
+    assert stages["db"] > 0.5 and stages["seed"] > 1.0  # the statements, beyond the commits
+    assert sum(stages.values()) == pytest.approx(chunk["seconds_per_image"], abs=0.005)
+
+
+def test_a_stage_that_never_ran_is_omitted_not_zero(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(db_session, tmp_path, raw, clock, monkeypatch, events)
+    # an ineligible photo is judged, never read back nor run through the model
+    assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt) == 0
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"ineligible": 1}
+    assert chunk["stage_seconds_per_image"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
+    assert chunk["stage_median_seconds"] == {"fetch": 1.0, "seed": 1.0, "db": 0.5}
+
+    # nothing minted (already done, by the media database): no stage at all
+    events.clear()
+    rt.progress = mb.Progress(tmp_path / "other.jsonl")
+    assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt) == 0
+    (again,) = _events(events, "chunk")
+    assert again["counts"] == {"already": 1}
+    assert again["stage_seconds_per_image"] == {}
+    assert again["stage_median_seconds"] == {}
+
+
+def test_a_failed_images_seconds_are_staged_up_to_its_failure(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outage's wait shows in its stage (a raw GET that times out after
+    4 s); an image the model fails on keeps the stages it went through."""
+    raw = _Raw(tmp_path / "raw")
+    clock = _Clock()
+    timeout_key = raw.add(1, rank=0).storage_key
+
+    class _TimingOut(_CostlyStore):
+        def get(self, key: str) -> bytes:
+            if key == timeout_key:
+                clock.advance(4.0)
+                raise TimeoutError("read timed out")
+            return super().get(key)
+
+    class _Crash(_Pass):
+        def predict_alpha(self, image: Image.Image) -> np.ndarray:
+            super().predict_alpha(image)
+            raise RuntimeError("CUDA error")
+
+    events: list[dict[str, Any]] = []
+    rt = _costly_runtime(
+        db_session, tmp_path, raw, clock, monkeypatch, events, primary=_Crash(clock, 2.0)
+    )
+    rt.raw_store = mb.ReadOnlyStore(_TimingOut(tmp_path / "raw", clock, get=1.0))
+    items = [raw.add(1, rank=0), raw.add(2, rank=1)]
+    assert mb.run_batch(items, mb.BatchConfig(), rt) == 1  # done, with failures
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"] == {"interrupted": 1, "failed": 1}
+    assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 6.25]
+    assert chunk["stage_seconds_per_image"] == {
+        "fetch": 2.5,  # (4 + 1) / 2
+        "seed": 1.0,
+        "readback": 0.125,
+        "inference": 2.0,  # up to the crash
+        "base_keep": 1.25,  # the donors ran first
+        "analysis": 0.375,  # the unmasked appearance only
+        "db": 0.25,  # (0 + the failed row's commit) / 2
+    }
+
+
+def test_timing_a_settle_changes_no_result(db_session: Session, tmp_path: Path) -> None:
+    """The same clean copy settled with and without the stage timings: the
+    same report, the same row, the same mask bytes."""
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    other = sessionmaker(bind=engine, expire_on_commit=False)()
+    clock = _Clock()
+    outcomes = []
+    try:
+        for db, root, timings in (
+            (db_session, tmp_path / "plain", None),
+            (other, tmp_path / "timed", StageTimings(clock.monotonic)),
+        ):
+            store = LocalObjectStore(root)
+            obj = _seed(db, store, 7)
+            batch = mask_job.open_mask_batch(db, backend_name="stub-model")
+            report = mask_job.settle_clean_copy(
+                db, store, obj.sha256, backend=_Model(), batch=batch, timings=timings
+            )
+            row = db.execute(select(ImageMask)).scalar_one()
+            columns = {
+                c.key: getattr(row, c.key)
+                for c in ImageMask.__table__.columns
+                if c.key not in ("id", "batch_id", "created_at", "updated_at")
+            }
+            files = {
+                p.relative_to(root).as_posix(): p.read_bytes()
+                for p in sorted(root.rglob("*"))
+                if p.is_file()
+            }
+            outcomes.append((report, columns, files))
+        assert outcomes[0] == outcomes[1]
+        assert outcomes[0][0] is not None and outcomes[0][0].status == "ok"
+        assert any(k.endswith(".png") for k in outcomes[0][2])  # the mask, among the files
+    finally:
+        other.close()
+        engine.dispose()

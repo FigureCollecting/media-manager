@@ -31,6 +31,7 @@ from PIL import Image, ImageFilter
 from scipy import ndimage
 
 from .matting import MattingBackend
+from .stage_timing import StageTimings, timed
 
 #: The base band starts at this fraction of the figure's height.
 BAND_FRAC = 0.78
@@ -142,9 +143,20 @@ class BaseKeptMattingBackend(MattingBackend):
         return self.primary.active_provider
 
     def predict_alpha(self, image: Image.Image) -> np.ndarray:
+        return self._alpha(image, None)
+
+    def predict_alpha_timed(self, image: Image.Image, timings: StageTimings) -> np.ndarray:
+        """BiRefNet as "inference"; the donors and the merge as "base_keep"."""
+        return self._alpha(image, timings)
+
+    def _alpha(self, image: Image.Image, timings: StageTimings | None) -> np.ndarray:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
-        answers = {f"{n}:{d.name}": d.predict_alpha(rgba) for n, d in enumerate(self.donors)}
-        alpha, _donor = base_kept_alpha(self.primary.predict_alpha(rgba), answers)
+        with timed(timings, "base_keep"):
+            answers = {f"{n}:{d.name}": d.predict_alpha(rgba) for n, d in enumerate(self.donors)}
+        with timed(timings, "inference"):
+            primary = self.primary.predict_alpha(rgba)
+        with timed(timings, "base_keep"):
+            alpha, _donor = base_kept_alpha(primary, answers)
         return alpha
 
     def matte(self, image: Image.Image) -> Image.Image:

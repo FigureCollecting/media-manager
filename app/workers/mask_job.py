@@ -66,6 +66,7 @@ from .mask import MASK_MIME, MASK_PIPELINE_VERSION, MaskOutcome, build_mask_arti
 from .mask_policy import Revoked, StoreGrants, configured_revocations, mask_eligibility, source_key
 from .mask_seed import register_public_object
 from .matting import MattingBackend, get_matting_backend
+from .stage_timing import StageTimings, timed
 
 logger = logging.getLogger(__name__)
 
@@ -216,31 +217,33 @@ def _write_row(
     status: str,
     reason: str | None,
     origin_class: str | None,
+    timings: StageTimings | None = None,
     **fields: Any,
 ) -> None:
-    now = dt.datetime.now(dt.UTC)
-    row = db.execute(
-        select(ImageMask).where(
-            ImageMask.source_sha256 == source_sha256,
-            ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        row = ImageMask(source_sha256=source_sha256, pipeline_version=MASK_PIPELINE_VERSION)
-        row.created_at = now
-        db.add(row)
-    row.status = status
-    row.reason = reason
-    row.origin_class = origin_class
-    row.batch_id = batch.id
-    row.updated_at = now
-    # Every result column is written on every settle, so a re-driven row
-    # never keeps a value from the attempt it replaces.
-    for name in _RESULT_COLUMNS:
-        setattr(row, name, fields.get(name))
-    batch.cursor_sha256 = source_sha256
-    batch.counts = {**batch.counts, status: batch.counts.get(status, 0) + 1}
-    db.commit()
+    with timed(timings, "db"):
+        now = dt.datetime.now(dt.UTC)
+        row = db.execute(
+            select(ImageMask).where(
+                ImageMask.source_sha256 == source_sha256,
+                ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = ImageMask(source_sha256=source_sha256, pipeline_version=MASK_PIPELINE_VERSION)
+            row.created_at = now
+            db.add(row)
+        row.status = status
+        row.reason = reason
+        row.origin_class = origin_class
+        row.batch_id = batch.id
+        row.updated_at = now
+        # Every result column is written on every settle, so a re-driven row
+        # never keeps a value from the attempt it replaces.
+        for name in _RESULT_COLUMNS:
+            setattr(row, name, fields.get(name))
+        batch.cursor_sha256 = source_sha256
+        batch.counts = {**batch.counts, status: batch.counts.get(status, 0) + 1}
+        db.commit()
 
 
 def _settle(
@@ -250,22 +253,25 @@ def _settle(
     backend: MattingBackend,
     batch: MaskBatch | None,
     revoked: Revoked | None = None,
+    timings: StageTimings | None = None,
 ) -> ItemReport:
     """Settle one clean image. ``batch`` is None on a dry run: nothing is
     written then, the report is the whole result. ``revoked`` defaults to
-    the revocations as they stand when this image is judged."""
+    the revocations as they stand when this image is judged. ``timings``,
+    when given, gets the seconds of each stage (MASK-PERF-1)."""
     sha = obj.sha256
     try:
-        # Judged over every image behind the clean copy (app.publication).
-        origins = judged_origins(db, sha)
-        if origins is None:
-            # Soft-deleted since it was selected: skipped and NOT recorded,
-            # as when it is deleted before selection, so a restore makes it
-            # a candidate again for a plain batch.
-            return ItemReport(sha, "skipped", "deleted", None)
-        eligibility = mask_eligibility(
-            origins, revoked=store_revocations(db) if revoked is None else revoked
-        )
+        with timed(timings, "db"):
+            # Judged over every image behind the clean copy (app.publication).
+            origins = judged_origins(db, sha)
+            if origins is None:
+                # Soft-deleted since it was selected: skipped and NOT recorded,
+                # as when it is deleted before selection, so a restore makes it
+                # a candidate again for a plain batch.
+                return ItemReport(sha, "skipped", "deleted", None)
+            eligibility = mask_eligibility(
+                origins, revoked=store_revocations(db) if revoked is None else revoked
+            )
     except Exception as exc:
         # A judgment that raises is this image's failure, never the batch's.
         db.rollback()
@@ -279,6 +285,7 @@ def _settle(
                 status="failed",
                 reason=reason,
                 origin_class=None,
+                timings=timings,
             )
         return ItemReport(sha, "failed", reason, None)
     if not eligibility.eligible:
@@ -290,32 +297,38 @@ def _settle(
                 status="ineligible",
                 reason=eligibility.reason,
                 origin_class=eligibility.origin_class,
+                timings=timings,
             )
         return ItemReport(sha, "ineligible", eligibility.reason, eligibility.origin_class)
 
     try:
-        data = store.get(obj.storage_key)
+        with timed(timings, "readback"):
+            data = store.get(obj.storage_key)
         if hashlib.sha256(data).hexdigest() != sha:
             raise _Refused("source_hash_mismatch")
-        outcome = build_mask_artifact(data, backend=backend)
-        fields = _row_fields(outcome)
+        with timed(timings, "analysis"):  # the model and the encode inside count apart
+            outcome = build_mask_artifact(data, backend=backend, timings=timings)
+            fields = _row_fields(outcome)
         if batch is not None and outcome.mask_png is not None and outcome.mask_sha256 is not None:
             if outcome.status == "ok":
                 key = derived_key(outcome.mask_sha256, MASK_MIME)
-                store.put(key, outcome.mask_png, MASK_MIME)
-                register_public_object(
-                    db,
-                    sha256=outcome.mask_sha256,
-                    kind="mask",
-                    mime=MASK_MIME,
-                    size=len(outcome.mask_png),
-                    width=outcome.width,
-                    height=outcome.height,
-                    storage_key=key,
-                )
+                with timed(timings, "upload"):
+                    store.put(key, outcome.mask_png, MASK_MIME)
+                with timed(timings, "db"):
+                    register_public_object(
+                        db,
+                        sha256=outcome.mask_sha256,
+                        kind="mask",
+                        mime=MASK_MIME,
+                        size=len(outcome.mask_png),
+                        width=outcome.width,
+                        height=outcome.height,
+                        storage_key=key,
+                    )
             else:
                 key = f"held-masks/{outcome.mask_sha256}.png"
-                store.put(key, outcome.mask_png, MASK_MIME)
+                with timed(timings, "upload"):
+                    store.put(key, outcome.mask_png, MASK_MIME)
             fields["mask_storage_key"] = key
     except Exception as exc:
         db.rollback()
@@ -329,6 +342,7 @@ def _settle(
                 status="failed",
                 reason=reason,
                 origin_class=eligibility.origin_class,
+                timings=timings,
             )
         return ItemReport(sha, "failed", reason, eligibility.origin_class)
 
@@ -340,6 +354,7 @@ def _settle(
             status=outcome.status,
             reason=outcome.reason,
             origin_class=eligibility.origin_class,
+            timings=timings,
             **fields,
         )
     return ItemReport(
@@ -413,24 +428,27 @@ def settle_clean_copy(
     batch: MaskBatch,
     retry_failed: bool = False,
     recheck_ineligible: bool = False,
+    timings: StageTimings | None = None,
 ) -> ItemReport | None:
     """Settle ONE clean copy, by its sha, exactly as ``run_mask_batch`` settles
     each of its candidates (MASK-BATCH-1 drives the lane image by image, in its
     own order). None when the copy is not a candidate: already settled at this
     pipeline version (unless re-driven), soft-deleted, or not a clean copy.
-    Applied only: a backend that is not a mask model is refused."""
+    Applied only: a backend that is not a mask model is refused. ``timings``,
+    when given, gets the seconds of each stage (MASK-PERF-1)."""
     if not backend.publishes_masks:
         raise ValueError(f"backend {backend.name!r} is not a mask model: dry run only")
-    page = _candidates(
-        db,
-        after=None,
-        page_size=1,
-        redrive=_redrive(retry_failed, recheck_ineligible),
-        only=(sha256,),
-    )
+    with timed(timings, "db"):
+        page = _candidates(
+            db,
+            after=None,
+            page_size=1,
+            redrive=_redrive(retry_failed, recheck_ineligible),
+            only=(sha256,),
+        )
     if not page:
         return None
-    return _settle(db, store, page[0], backend, batch)
+    return _settle(db, store, page[0], backend, batch, timings=timings)
 
 
 def original_settled(
