@@ -104,7 +104,6 @@ import contextlib
 import dataclasses
 import datetime as dt
 import functools
-import gzip
 import hashlib
 import ipaddress
 import json
@@ -135,6 +134,7 @@ from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 from ..config import get_settings
 from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
+from ..workers.image_limits import ImageLimitError, current_limits, gunzip_capped
 from ..workers.mask_job import (
     finish_mask_batch,
     open_mask_batch,
@@ -900,8 +900,13 @@ class _Witness:
 
 
 def _decode(stored: bytes, codec: str) -> bytes:
+    """An original's bytes from the raw bucket's object: the stored object under the byte cap (a refusal before
+    anything opens it) and a gzip one inflated only up to that cap (MM-CAPS-1: a bomb stops at the ceiling)."""
+    cap = current_limits().max_bytes
     if codec == "gzip":
-        return gzip.decompress(stored)
+        return gunzip_capped(stored, cap)
+    if len(stored) > cap:
+        raise ImageLimitError("too_large_bytes", f"{len(stored)} bytes exceeds the {cap}-byte cap")
     return stored
 
 
@@ -945,6 +950,8 @@ def _mint(
         return record
 
     def raised(where: str, exc: Exception) -> dict[str, Any]:
+        if isinstance(exc, ImageLimitError):  # the image's own fault, named by the limit it broke
+            return failed(f"refused:{exc.code}")
         return failed(f"{where}:{type(exc).__name__}", is_outage(exc))
 
     def rolled_back(where: str, exc: Exception) -> dict[str, Any]:

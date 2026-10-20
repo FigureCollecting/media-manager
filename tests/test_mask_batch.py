@@ -3282,3 +3282,113 @@ def test_recent_writes_are_safe_from_many_workers() -> None:
         sys.setswitchinterval(interval)
     assert errors == []
     assert len(store._recent) == 4
+
+
+# --------------------------------------------------------------------------
+# MM-CAPS-1: the explicit limits on an original (a decompression-bomb gate)
+# --------------------------------------------------------------------------
+
+
+def _png_claiming(width: int, height: int) -> bytes:
+    """A PNG whose header claims width x height and holds no pixels: a decompression bomb to a header read."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(b""))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_decode_stops_a_gzip_bomb_and_an_oversize_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.workers.image_limits import ImageLimitError
+
+    monkeypatch.setenv("MM_MAX_IMAGE_BYTES", "100000")
+    ok = _photo(1)
+    assert mb._decode(gzip.compress(ok), "gzip") == ok
+    assert mb._decode(ok, "identity") == ok
+    with pytest.raises(ImageLimitError) as bomb:
+        mb._decode(gzip.compress(b"\x00" * 5_000_000), "gzip")  # ~5 KB packed, 5 MB expanded
+    assert bomb.value.code == "gzip_too_large"
+    with pytest.raises(ImageLimitError) as big:
+        mb._decode(b"\x00" * 100_001, "identity")
+    assert big.value.code == "too_large_bytes"
+
+
+def test_a_bomb_original_is_one_images_refusal_and_the_rest_carry_on(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MM_MAX_IMAGE_BYTES", "100000")
+    monkeypatch.setenv("MM_MAX_IMAGE_PIXELS", "2400")  # the 60 x 40 test photos are exactly 2400
+    raw = _Raw(tmp_path / "raw")
+    good = raw.add(1, rank=0)
+    zipbomb = gzip.compress(b"\x00" * 5_000_000)
+    zsha = hashlib.sha256(zipbomb).hexdigest()
+    zkey = f"raw-img/sha256/{zsha[:2]}/{zsha}.png"
+    raw.store.put(zkey, zipbomb, "image/png")
+    bomb_zip = mb.WorkItem(
+        blob_sha256=zsha,
+        storage_key=zkey,
+        url=ITEM.format(n=2),
+        product_id="p2",
+        rank=0,
+        codec="gzip",
+    )
+    wide = _png_claiming(3000, 3000)
+    wsha = hashlib.sha256(wide).hexdigest()
+    wkey = f"raw-img/sha256/{wsha[:2]}/{wsha}.png"
+    raw.store.put(wkey, wide, "image/png")
+    bomb_px = mb.WorkItem(
+        blob_sha256=wsha, storage_key=wkey, url=ITEM.format(n=3), product_id="p3", rank=0
+    )
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch([bomb_zip, bomb_px, good], mb.BatchConfig(chunk_size=10), rt) == 1
+    (chunk,) = _events(events, "chunk")
+    assert chunk["counts"]["ok"] == 1
+    reasons = {f["blob_sha256"]: f["reason"] for f in chunk["failures"]}
+    assert reasons == {zsha: "refused:gzip_too_large", wsha: "refused:too_many_pixels"}
+    # an image's OWN fault: failed (a plain rerun does not retry it), never interrupted; nothing was seeded for either
+    assert chunk["counts"]["failed"] == 2 and chunk["counts"].get("interrupted", 0) == 0
+    assert mask_job.original_settled(db_session, zsha) is None
+    assert mask_job.original_settled(db_session, wsha) is None
+
+
+def test_seed_clean_image_refuses_a_bomb_before_it_stores_or_decodes_anything(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.workers.image_limits import ImageLimitError
+
+    monkeypatch.setenv("MM_MAX_IMAGE_PIXELS", "2400")
+    store = LocalObjectStore(tmp_path / "media")
+    puts: list[str] = []
+    real_put = store.put
+    monkeypatch.setattr(
+        store, "put", lambda key, data, ctype: (puts.append(key), real_put(key, data, ctype))[1]
+    )
+    with pytest.raises(ImageLimitError) as err:
+        seed_clean_image(
+            db_session,
+            store,
+            _png_claiming(3000, 3000),
+            origins=[ImageOrigin(url=ITEM.format(n=9), source="mfc")],
+            figure_id="f",
+        )
+    assert err.value.code == "too_many_pixels"
+    assert puts == []
+    assert mask_seed.make_clean_copy(_photo(4))[2:] == (
+        40,
+        60,
+    )  # an ordinary photo still goes through
+    with pytest.raises(ImageLimitError):
+        mask_seed.make_clean_copy(_png_claiming(3000, 3000))
+    with pytest.raises(ImageLimitError):
+        mask_seed.pixel_digest(_png_claiming(3000, 3000))
