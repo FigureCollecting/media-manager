@@ -131,8 +131,10 @@ class _Counted(LocalObjectStore):
         self.puts: list[str] = []
         self.slow: dict[str, float] = {}  # a GET's key, or a PUT's bytes' sha: its delay
         self.fail_once: set[str] = set()  # a GET's key: it times out, once
+        self.get_walls: list[float] = []  # each GET's own wall, as this machine made it
 
     def get(self, key: str) -> bytes:
+        started = time.monotonic()
         with self.lock:
             self.gets.append(key)
             failing = key in self.fail_once
@@ -142,7 +144,10 @@ class _Counted(LocalObjectStore):
             time.sleep(delay)
         if failing:
             raise TimeoutError("read timed out")
-        return super().get(key)
+        data = super().get(key)
+        with self.lock:
+            self.get_walls.append(time.monotonic() - started)
+        return data
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         delay = self.put_cost + self.slow.get(hashlib.sha256(data).hexdigest(), 0.0)
@@ -165,6 +170,7 @@ class _Shapes(MattingBackend):
         self.cost, self.gate = cost, gate
         self.lock = threading.Lock()
         self.calls: list[tuple[int, int]] = []
+        self.walls: list[float] = []  # each call's own wall, as this machine made it
         self.running = 0
         self.most = 0
 
@@ -184,8 +190,11 @@ class _Shapes(MattingBackend):
         try:
             if self.gate is not None:
                 self.gate(width)
+            started = time.monotonic()
             if self.cost:
                 time.sleep(self.cost)
+            with self.lock:
+                self.walls.append(time.monotonic() - started)
             if width == 101:
                 return np.full((H, width), 255, dtype=np.uint8)
             if width == 102:
@@ -1206,22 +1215,34 @@ def test_each_stage_is_the_images_own_wall_and_the_chunk_tells_the_throughput(
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
     events: list[dict[str, Any]] = []
-    rt = _runtime(main, root, raw, _Shapes(cost=0.08), events)
+    shapes = _Shapes(cost=0.08)
+    rt = _runtime(main, root, raw, shapes, events)
     assert mb.run_batch(items, mb.BatchConfig(chunk_size=6, writers=3), rt) == 0
     records = {r["blob_sha256"]: r for r in _lines(root / "progress.jsonl") if "status" in r}
     assert len(captured) == 6
+    # what this machine made of the run's own calls: a loaded one stretches a 0.05 s sleep
+    # to 0.25 s and more, so a stage is held to its own call's wall, not to a fixed window
+    slowest_get, slowest_model = max(raw.store.get_walls), max(shapes.walls)
+    assert len(raw.store.get_walls) == len(shapes.walls) == 6
     for timings in captured:
         seconds = timings.seconds
-        # each its own: six images queue 0.48 s of model calls, which no
-        # image's fetch or inference holds (that is gpu_wait's)
-        assert 0.05 <= seconds["fetch"] < 0.2
-        assert 0.08 <= seconds["inference"] < 0.2
+        # each its own: six images queue six model calls (about 3x one call's wall for the
+        # last in line), which no image's fetch or inference holds (that is gpu_wait's): a
+        # stage is its own call and a bounded overhead (its decode, its bookkeeping)
+        assert 0.05 <= seconds["fetch"] < slowest_get + 0.1
+        assert 0.08 <= seconds["inference"] < slowest_model + 0.1
         assert seconds["gpu_wait"] >= 0.0
         assert {"claim", "seed", "readback", "upload", "db", "turn_wait"} <= set(seconds)
     for record in records.values():
         assert record["seconds"] >= 0.05 + 0.08
     staged = sorted(round(sum(t.seconds.values()), 2) for t in captured)
-    assert staged == pytest.approx(sorted(r["seconds"] for r in records.values()), abs=0.1)
+    walls = sorted(r["seconds"] for r in records.values())
+    # the stages account for the image's wall, each second once: never above it (one clock, so on any
+    # load), and short of it only by the bookkeeping between a stage and the clock, where a loaded
+    # machine can deschedule a thread for 0.1 s and more whatever the wall: 0.1 s and a fifth of it
+    for got, wall in zip(staged, walls, strict=True):
+        assert got <= wall + 0.02
+        assert got >= wall - (0.1 + 0.2 * wall)
     chunk = next(e for e in events if e["event"] == "chunk")
     # from the unrounded elapsed seconds: within a rounding of the reported ones
     assert chunk["throughput_seconds_per_image"] == pytest.approx(
