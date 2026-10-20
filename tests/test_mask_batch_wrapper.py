@@ -52,6 +52,7 @@ def _run(
         if not k.startswith(("MASK_BATCH", "S3_", "RAW_S3", "PG"))
     }
     base.pop("DATABASE_URL", None)
+    base.pop("DB_POOL_RECYCLE", None)
     full = {
         **base,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -122,6 +123,22 @@ def test_the_run_is_on_the_gpu_with_names_not_values(tmp_path: Path) -> None:
         "--dry-run",
     ]
     assert (state / "batch.log").read_text() == '{"event": "done"}\n'
+
+
+def test_the_pool_recycle_is_passed_by_name_when_set(tmp_path: Path) -> None:
+    """Through the operator's port-forward the pool must never recycle (DB_POOL_RECYCLE=-1, the
+    batch's own engine already does; settings.db_pool_recycle reads this variable for the rest of
+    the container): a name the wrapper does not pass is a setting the container never sees."""
+    done, argv = _run(tmp_path, str(tmp_path / "s"), MASK_BATCH_IMAGE="w", DB_POOL_RECYCLE="-1")
+    assert done.returncode == 0, done.stderr
+    assert argv[argv.index("DB_POOL_RECYCLE") - 1] == "-e"  # by name...
+    assert "DB_POOL_RECYCLE=-1" not in argv and "-1" not in argv  # ...never by value
+
+
+def test_an_unset_pool_recycle_is_not_passed(tmp_path: Path) -> None:
+    done, argv = _run(tmp_path, str(tmp_path / "s"), MASK_BATCH_IMAGE="w")
+    assert done.returncode == 0, done.stderr
+    assert "DB_POOL_RECYCLE" not in argv
 
 
 def test_the_drivers_exit_status_comes_back(tmp_path: Path) -> None:

@@ -20,6 +20,8 @@
 #                         bucket, read only to the batch (the driver refuses any write to it)
 #   MASK_BATCH_RESIDENTIAL_IP   the box's residential address (the VPN check)
 #   MASK_STORE_GRANTS MASK_STORE_REVOKED   the deployment's mask policy, as media-manager reads it
+#   DB_POOL_RECYCLE      the pool's recycle seconds when set (-1 through a port-forward: a recycle reconnects
+#                         through the tunnel); media-manager's settings read it, default 1800
 #   MASK_BATCH_NAME       the container name (default mask-batch): one batch at a time; stop it
 #                         with `docker stop -t 120 mask-batch` (it finishes the images past the GPU;
 #                         the others in flight are not recorded and run again first)
@@ -62,7 +64,7 @@ args=(run --rm --init --name "${MASK_BATCH_NAME:-mask-batch}" --network host
 for name in DATABASE_URL PGPASSWORD PGSSLMODE \
             S3_ENDPOINT_URL S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_SECURE \
             RAW_S3_ENDPOINT_URL RAW_S3_REGION RAW_S3_BUCKET RAW_S3_ACCESS_KEY RAW_S3_SECRET_KEY \
-            MASK_BATCH_RESIDENTIAL_IP MASK_STORE_GRANTS MASK_STORE_REVOKED; do
+            MASK_BATCH_RESIDENTIAL_IP MASK_STORE_GRANTS MASK_STORE_REVOKED DB_POOL_RECYCLE; do
   [ -n "${!name+x}" ] && args+=(-e "$name")
 done
 if [ -n "${PGSSLROOTCERT:-}" ]; then
