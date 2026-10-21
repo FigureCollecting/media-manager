@@ -26,6 +26,7 @@ from ..hashing import compute_phash, detect_mime
 from ..models import FigureGallery, ImageVersion, PublicObject, PublicObjectImage
 from ..models import Image as ImageModel
 from ..object_store import ObjectStore, derived_key
+from .image_limits import check_image
 from .mask_policy import ImageOrigin
 
 PUBLIC_KINDS = ("sanitized", "matted", "mask")
@@ -47,6 +48,7 @@ def _picture(original: bytes) -> Image.Image:
     colour under a FULLY transparent pixel shows nothing (lossless WebP and
     PNG optimisers rewrite it) and is zeroed: two files differing only
     there show one picture, and the clean copy carries no hidden pixels."""
+    check_image(original)  # MM-CAPS-1: the header-read limits, before any pixel is decoded
     with Image.open(io.BytesIO(original)) as src:
         src.load()
         oriented = ImageOps.exif_transpose(src) or src
@@ -347,6 +349,7 @@ def seed_clean_image(
     they arrive, so each copy and its mask are judged over all of them: a
     soft delete or an ineligible origin under any capture -- the one whose
     bytes ARE the copy included -- reaches every copy (app.publication)."""
+    check_image(original)  # MM-CAPS-1: refused before anything is hashed, stored or decoded
     orig_sha = hashlib.sha256(original).hexdigest()
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
     if image is None:
