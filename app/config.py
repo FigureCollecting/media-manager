@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     environment: Literal["development", "production", "test"] = "development"
     log_level: str = "INFO"
     allow_dev_tokens: bool = False
+    # Whether the deployment grants a caller the REST /auth routes (token refresh).
+    # Outside development and test they are mounted only when this is true, and
+    # the API refuses to start if they are mounted while it is false
+    # (app.boot_guard, which also refuses dev tokens and a guessable jwt_secret).
+    auth_routes_granted: bool = False
 
     # Security
     jwt_secret: str = "dev-secret-change-me"
