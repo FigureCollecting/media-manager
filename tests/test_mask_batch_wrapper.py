@@ -125,6 +125,21 @@ def test_the_run_is_on_the_gpu_with_names_not_values(tmp_path: Path) -> None:
     assert (state / "batch.log").read_text() == '{"event": "done"}\n'
 
 
+def test_the_environment_is_passed_by_name(tmp_path: Path) -> None:
+    # media-manager's settings have no default environment: a run without it refuses to load
+    done, argv = _run(
+        tmp_path,
+        str(tmp_path / "state"),
+        "--dry-run",
+        MASK_BATCH_IMAGE="worker@sha256:abc",
+        ENVIRONMENT="production",
+        **SECRETS,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "ENVIRONMENT" in argv
+    assert "ENVIRONMENT=production" not in argv
+
+
 def test_the_pool_recycle_is_passed_by_name_when_set(tmp_path: Path) -> None:
     """Through the operator's port-forward the pool must never recycle (DB_POOL_RECYCLE=-1, the
     batch's own engine already does; settings.db_pool_recycle reads this variable for the rest of

@@ -6,10 +6,14 @@ from ..config import Settings, get_settings
 from ..db import get_db
 from ..schemas import DevTokenRequest, DevTokenResponse, RefreshTokenRequest, RefreshTokenResponse
 
+# Two routers so a deployment can mount one without the other (app.boot_guard):
+# dev_router issues tokens on request and is mounted in a dev environment only;
+# router (token refresh) is mounted there or where AUTH_ROUTES_GRANTED says so.
+dev_router = APIRouter(prefix="/auth", tags=["auth"])
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/dev-token", response_model=DevTokenResponse)
+@dev_router.post("/dev-token", response_model=DevTokenResponse)
 def issue_dev_token(
     payload: DevTokenRequest,
     settings: Settings = Depends(get_settings),

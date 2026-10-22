@@ -10,12 +10,12 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .boot_guard import enforce_boot_guard, mount_auth_routers
 from .config import Settings, get_settings
 from .db import get_db
 from .logging import setup_logging
 from .rate_limit import RateLimitMiddleware
 from .routes.album_routes import router as album_router
-from .routes.auth_routes import router as auth_router
 from .routes.external_routes import router as external_router
 from .routes.gallery_routes import router as gallery_router
 from .routes.image_routes import router as image_router
@@ -95,7 +95,7 @@ def healthz(
     )
 
 
-app.include_router(auth_router)
+mount_auth_routers(app, get_settings())
 app.include_router(image_router)
 app.include_router(serve_router)
 app.include_router(external_router)
@@ -103,3 +103,7 @@ app.include_router(album_router)
 app.include_router(tag_router)
 app.include_router(search_router)
 app.include_router(gallery_router)
+
+# Last, once every router is mounted: outside a dev environment the import fails
+# here (app.boot_guard), so uvicorn never serves an unsafe configuration.
+enforce_boot_guard(get_settings(), app)

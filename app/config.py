@@ -13,9 +13,17 @@ class Settings(BaseSettings):
 
     # App
     app_name: str = "media-manager"
-    environment: Literal["development", "production", "test"] = "development"
+    # REQUIRED, no default: a deployment that forgets ENVIRONMENT must not boot as
+    # development (dev routes mounted, app.boot_guard skipped). Unset, Settings()
+    # fails with "environment  Field required".
+    environment: Literal["development", "production", "test"]
     log_level: str = "INFO"
     allow_dev_tokens: bool = False
+    # Whether the deployment grants a caller the REST /auth routes (token refresh).
+    # Outside development and test they are mounted only when this is true, and
+    # the API refuses to start if they are mounted while it is false
+    # (app.boot_guard, which also refuses dev tokens and a guessable jwt_secret).
+    auth_routes_granted: bool = False
 
     # Security
     jwt_secret: str = "dev-secret-change-me"
@@ -90,4 +98,4 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    return Settings()  # type: ignore[call-arg]  # environment comes from the env, never a default
