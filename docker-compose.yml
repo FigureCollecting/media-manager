@@ -52,6 +52,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: images
       S3_SECURE: "false"
+      ENVIRONMENT: development
       JWT_SECRET: dev-secret-change-me
       JWT_ALGORITHM: HS256
       ALLOW_DEV_TOKENS: "true"
@@ -81,6 +82,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: images
       S3_SECURE: "false"
+      ENVIRONMENT: development
       JWT_SECRET: dev-secret-change-me
       JWT_ALGORITHM: HS256
       ALLOW_DEV_TOKENS: "true"

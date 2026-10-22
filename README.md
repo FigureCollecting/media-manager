@@ -4,7 +4,7 @@ Production-ready image microservice built with FastAPI, SQLAlchemy 2.x, Postgres
 
 Local dev (Docker/Coolify-friendly):
 
-- Copy `.env.example` to `.env` and adjust if needed.
+- Copy `.env.example` to `.env` and adjust if needed. `ENVIRONMENT` is required (`development`, `test` or `production`); unset, every process refuses to load its settings.
 - Start stack: `make dev-up`
 - Initialize DB: `make db-upgrade`
 - Watch logs: `make logs`
@@ -19,7 +19,7 @@ Endpoints (highlights):
 - Albums: CRUD, share link, cover mosaic
 - Tags/Search: tag images/albums and search by text and tags
 
-Boot guard (`app/boot_guard.py`): outside `ENVIRONMENT=development` or `test`, `/auth/dev-token` is never mounted and `/auth/refresh` is mounted only with `AUTH_ROUTES_GRANTED=true`. The API refuses to start (the import of `app.main` fails, so uvicorn exits before it binds) when `ALLOW_DEV_TOKENS` is true, `JWT_SECRET` is a known default or shorter than 32 bytes, the dev auth router is mounted, or the refresh router is mounted without `AUTH_ROUTES_GRANTED=true`. The error names every reason and never the secret.
+Boot guard (`app/boot_guard.py`): `ENVIRONMENT` has no default, so a deployment that forgets it fails to start rather than booting as development. Outside `ENVIRONMENT=development` or `test`, `/auth/dev-token` is never mounted and `/auth/refresh` is mounted only with `AUTH_ROUTES_GRANTED=true`. The API refuses to start (the import of `app.main` fails, so uvicorn exits before it binds) when `ALLOW_DEV_TOKENS` is true, `JWT_SECRET` is a known default or shorter than 32 bytes, the dev auth router is mounted, or the refresh router is mounted without `AUTH_ROUTES_GRANTED=true`. The error names every reason and never the secret.
 
 Storage layout:
 

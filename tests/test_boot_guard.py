@@ -25,6 +25,7 @@ from app.config import Settings
 from app.routes.auth_routes import dev_router
 from app.routes.auth_routes import router as auth_router
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -171,7 +172,24 @@ def _start(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+class TestEnvironmentIsRequired:
+    def test_settings_without_an_environment_do_not_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        with pytest.raises(ValidationError) as missing:
+            Settings(_env_file=None)  # type: ignore[call-arg]
+        assert "environment" in str(missing.value)
+        assert "Field required" in str(missing.value)
+
+
 class TestTheModuleRefusesToStart:
+    def test_an_unset_environment_does_not_start_and_mounts_nothing(self) -> None:
+        run = _start({"JWT_SECRET": secrets.token_urlsafe(48)})
+        assert run.returncode != 0
+        assert "environment" in run.stderr and "Field required" in run.stderr
+        assert "/auth/" not in run.stdout
+
     def test_production_with_the_default_secret_does_not_start(self) -> None:
         run = _start({"ENVIRONMENT": "production"})
         assert run.returncode != 0
