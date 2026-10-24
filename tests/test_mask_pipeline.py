@@ -1167,6 +1167,86 @@ def test_the_gate_before_each_chunk_reads_the_gpu_with_no_model_call_running(
     engine.dispose()
 
 
+def test_a_gate_that_fails_at_a_chunk_boundary_holds_the_pipeline_until_it_passes(
+    tmp_path: Path,
+) -> None:
+    """Another consumer takes the GPU while a chunk is in flight: the gate
+    before the next chunk fails, no image of it starts, the images not past
+    the GPU are let go, the model is released while the batch waits, and
+    once the gate passes the held images run first: every image once."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    busy = {"on": False}
+
+    def query() -> str:
+        return "1, 1000, 11500, 12282" if busy["on"] else "0, 2800, 9500, 12282"
+
+    measured = threading.Event()
+
+    class _Measured(mb.GpuGate):
+        def measure_own(self) -> None:
+            super().measure_own()
+            measured.set()
+
+    games: list[bool] = []
+
+    def the_game_starts(width: int) -> None:
+        if measured.is_set() and not games:  # once our model is measured, a game starts, once
+            games.append(True)
+            busy["on"] = True
+
+    def poll(seconds: float) -> None:
+        busy["on"] = False  # the game ends while the batch waits
+
+    class _Counting(_Shapes):
+        released = 0
+
+        def release(self) -> None:
+            self.released += 1
+
+    backend = _Counting(gate=the_game_starts)
+    gpu = _Measured(query=query, sleep=lambda seconds: None)
+    gates = mb.Gates(windows=(), gpu=gpu, residential=None, now=lambda: NOON)
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, backend, events, gates=gates, sleep=poll)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=2), rt) == 0
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    assert sorted(r["blob_sha256"] for r in records) == sorted(i.blob_sha256 for i in items)
+    assert {r["status"] for r in records} == {"ok"}
+    paused = [e for e in events if e["event"] == "paused"]
+    assert [e["gate"] for e in paused] == ["gpu"]
+    assert backend.released == 1
+    assert sum(e["count"] for e in events if e["event"] == "chunk") == 6
+    main.close()
+    engine.dispose()
+
+
+def test_a_put_that_failed_beside_the_seed_is_the_seeds_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PUT made before the seed broke off is what broke it, as when it ran
+    in turn: the bucket's outage (interrupted), not the error after it."""
+
+    def seed(db: Session, store: Any, data: bytes, **_: Any) -> Any:
+        store.put("aa/bb/original.png", data, "image/png")  # beside: it fails later
+        raise ValueError("a row the seed could not write")
+
+    monkeypatch.setattr(mb, "seed_clean_image", seed)
+    raw = _Raw(tmp_path / "raw")
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [], media=_Outage(root / "media", healthy=0))
+    assert mb.run_batch([raw.add(100, 1)], mb.BatchConfig(chunk_size=1, writers=1), rt) == 1
+    (record,) = (r for r in _lines(root / "progress.jsonl") if r["event"] == "item")
+    assert (record["status"], record["reason"]) == ("interrupted", "seed:ConnectionError")
+    main.close()
+    engine.dispose()
+
+
 def test_each_workers_sql_is_charged_to_its_own_images_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
