@@ -187,9 +187,14 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: database session (0: one image at a time, the driver's own session); the
 #: live chunk tunes it with ``--writers``. Simulated at the live costs: 5.5 s
 #: an image one at a time, 2.75 s with 2 writers, 1.78 s with 4, 1.21 s with 8,
-#: 1.05 s with 12. The command line's pool keeps writers + 1 connections and
-#: lends none past them (``_sized``), so the most writers keep the run at 24
-#: connections to the production database (MASK-PERF-3)...
+#: 1.05 s with 12. MASK-PERF-3, rolling, on a simulator calibrated to the live
+#: chunks (1,363 images an hour at 8 writers before it, 1,319 measured live):
+#: 2,877 at 8, about 5,500 at 16 with 100-image chunks (3 or 4 decode slots, 2
+#: or 4 read ahead alike), 6,426 at 23 (the turn, ~6 round trips an image, is
+#: then the queue). The command
+#: line's pool keeps writers + 1 connections and lends none past them
+#: (``_sized``), so the most writers keep the run at 24 connections to the
+#: production database...
 DEFAULT_WRITERS = 4
 MAX_WRITERS = 23
 #: ...and the originals read, decoded and hash-checked ahead of them: two
