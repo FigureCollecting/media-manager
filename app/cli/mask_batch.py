@@ -75,8 +75,8 @@ judgment, its uploads and rows) overlaps another's model run. The pipeline
 ROLLS across chunks: a chunk is its batch row, its gate and its report, not
 a barrier, so the next chunk's images start while the one before still has
 images in flight (its gate is read on the driver's thread, no model call
-running meanwhile), and a chunk reports, in order, once its last image
-ended. Each image's own work runs in the same order as before, and what it
+running meanwhile), and a chunk reports once its last image ended (one held
+up by a slow image after the next). Each image's own work runs in the same order as before, and what it
 writes is what one image at a time writes: images of one picture (their
 originals, captures, copies and gallery link meet:
 app.workers.mask_pipeline) wait for each other in work-list order, and from
@@ -1389,9 +1389,9 @@ class _Pipeline:
         image starts -- after the first, once the gate passed
         (``rt.gates.check``, on this thread, so no model call runs meanwhile
         and the GPU readings are another consumer's alone) -- and closes
-        (``close_chunk``), in chunk order, once its last image ended. The
-        held images go back to the front of ``remaining``, in work-list
-        order."""
+        (``close_chunk``) once its last image ended: one held up by a slow
+        image after the next. The held images go back to the front of
+        ``remaining``, in work-list order."""
         writers, prefetch, size = self.config.writers, self.config.prefetch, self.config.chunk_size
         flow = _Flow(events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots)
         flow.uploads = ThreadPoolExecutor(max_workers=2 * writers, thread_name_prefix="mask-upload")
@@ -1399,7 +1399,7 @@ class _Pipeline:
         pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
         ahead: dict[str, Future[_Fetched]] = {}
         workers: list[threading.Thread] = []
-        runs: deque[_ChunkRun] = deque()  # the chunks open, oldest first
+        runs: list[_ChunkRun] = []  # the chunks open
         lanes: dict[int, tuple[_ChunkRun, WorkItem]] = {}
         held: list[tuple[int, WorkItem]] = []
         failure: BaseException | None = None
@@ -1422,8 +1422,8 @@ class _Pipeline:
                     ahead[item.blob_sha256] = pool.submit(_read_ahead, item, self.rt)
 
         def close_ready() -> None:
-            while runs and runs[0].complete:
-                run = runs.popleft()
+            for run in [r for r in runs if r.complete]:
+                runs.remove(run)
                 run.sampler.__exit__(None, None, None)
                 close_chunk(run.chunk, run.batch, run.sampler.peak_mib)
 
@@ -1431,10 +1431,8 @@ class _Pipeline:
             """The chunk the next image is of; None when the gate held it."""
             nonlocal current
             if current is not None:
-                if current.started < size:
+                if not current.full:
                     return current
-                current.full = True
-                close_ready()
                 if not self.rt.gates.check().ok:
                     flow.hold.set()
                     return None
@@ -1464,6 +1462,7 @@ class _Pipeline:
                     workers.append(worker)
                     worker.start()
                     run.started += 1
+                    run.full = run.started == size or not remaining
                     started += 1
                     in_flight += 1
                 if not flow.hold.is_set():
@@ -1489,7 +1488,7 @@ class _Pipeline:
                     flow.hold.set()
                 close_ready()
             if failure is None:
-                for run in runs:  # every image ended: each chunk still open closes, in order
+                for run in runs:  # every image ended: each chunk still open closes
                     run.full = True
                 close_ready()
         finally:

@@ -411,7 +411,8 @@ def _run(
 def _unordered(outcome: dict[str, Any]) -> dict[str, Any]:
     """``outcome`` with what the order the images END in may change made
     order-free (MASK-PERF-3: each image is recorded, and writes its chunk's
-    batch row, as it ends): the records sorted, each chunk's ranks and
+    batch row, as it ends; each chunk reports as its last image ends): the
+    records and events sorted, each chunk's ranks and
     failures sorted, each batch row's cursor checked to be the copy of one of
     its own images and dropped, and its UPDATEs by the running total they
     wrote (one image each: no update lost)."""
@@ -438,7 +439,7 @@ def _unordered(outcome: dict[str, Any]) -> dict[str, Any]:
         **outcome,
         "tables": tables,
         "progress": sorted(progress, key=key),
-        "events": [chunked(e) for e in outcome["events"]],
+        "events": sorted((chunked(e) for e in outcome["events"]), key=key),
         "batch_row": sorted(
             (params[-1], sum(json.loads(params[1]).values()))
             for _statement, params in outcome["batch_row"]
@@ -996,10 +997,10 @@ def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_en
 ) -> None:
     """Images that end early (here an unsupported codec: no row to write)
     are recorded as they end and make way for the next while the image
-    ahead of them is held up on the GPU: never more than ``writers`` in
-    flight, every one of them unrecorded, so an outage opens the circuit
-    after at most writers - 1 images more than one at a time would have
-    tried, and a power cut loses at most ``writers`` records."""
+    ahead of them is held up (its copy's readback): never more than
+    ``writers`` in flight, every one of them unrecorded, so an outage opens
+    the circuit after at most writers - 1 images more than one at a time
+    would have tried, and a power cut loses at most ``writers`` records."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100, 1), *(raw.add(110 + n, n, codec="zstd") for n in range(2, 9))]
     lock = threading.Lock()
@@ -1017,27 +1018,21 @@ def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_en
                 minting[0] -= 1
 
     monkeypatch.setattr(mb, "_mint", counted_mint)
-    root = tmp_path / "run"
-    while_held: list[int] = []
-
-    def first_holds_the_gpu(width: int) -> None:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and len(_lines(root / "progress.jsonl")) < 7:
-            time.sleep(0.01)  # the images after it end meanwhile, each recorded
-        while_held.append(len(_lines(root / "progress.jsonl")))
-
-    config = mb.BatchConfig(chunk_size=8, writers=2)
-    backend = _Shapes(gate=first_holds_the_gpu)
-    outcome = _run(tmp_path, "run", items, raw, config, backend=backend)
-    assert outcome["exit"] == 1
-    statuses = [r["status"] for r in outcome["progress"] if r["event"] == "item"]
-    assert statuses == ["failed"] * 7 + ["ok"]
-    assert while_held == [7]
+    records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=8, writers=2), code=1
+    )
+    engine.dispose()
+    assert [r["status"] for r in records] == ["failed"] * 7 + ["ok"]
     assert minting[1] == 2
 
 
 def _slowed(
-    tmp_path: Path, items: list[mb.WorkItem], raw: _Raw, slow: mb.WorkItem, config: mb.BatchConfig
+    tmp_path: Path,
+    items: list[mb.WorkItem],
+    raw: _Raw,
+    slow: mb.WorkItem,
+    config: mb.BatchConfig,
+    code: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Engine]:
     """``items`` run with ``slow``'s clean copy read back from the bucket in
     2 s (a bucket call's tail: a 10 s upload live; a read, so no SQLite
@@ -1050,9 +1045,8 @@ def _slowed(
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
     events: list[dict[str, Any]] = []
-    assert (
-        mb.run_batch(items, config, _runtime(main, root, raw, _Shapes(), events, media=media)) == 0
-    )
+    rt = _runtime(main, root, raw, _Shapes(), events, media=media)
+    assert mb.run_batch(items, config, rt) == code
     main.close()
     records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
     return records, events, engine
@@ -1077,7 +1071,9 @@ def test_the_next_chunk_starts_before_the_slowest_image_of_the_one_before_ends(
 ) -> None:
     """No chunk barrier: a chunk is its batch row, its gate and its report;
     the next one's images start while the one before still has one in
-    flight. Each chunk still counts its own images, and reports in order."""
+    flight. Each chunk counts its own images and reports once its last one
+    ended, so one held up by a slow image reports after the next: a stuck
+    image keeps no later chunk's batch row open nor its VRAM sampler running."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
     records, events, engine = _slowed(
@@ -1087,7 +1083,7 @@ def test_the_next_chunk_starts_before_the_slowest_image_of_the_one_before_ends(
     assert order[-1] == items[2].blob_sha256  # the second chunk ended first
     assert {r["chunk"] for r in records[:-1] if r["blob_sha256"] in order[3:]} == {2}
     chunks = [e for e in events if e["event"] == "chunk"]
-    assert [(c["chunk"], c["count"]) for c in chunks] == [(1, 3), (2, 3)]
+    assert [(c["chunk"], c["count"]) for c in chunks] == [(2, 3), (1, 3)]
     with Session(engine) as db:
         rows = db.execute(select(MaskBatch).order_by(MaskBatch.id)).scalars().all()
         assert [(sum(b.counts.values()), b.status) for b in rows] == [(3, "done"), (3, "done")]
