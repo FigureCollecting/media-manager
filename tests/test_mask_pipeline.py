@@ -530,19 +530,28 @@ def test_the_next_images_io_overlaps_the_model(tmp_path: Path) -> None:
 
 
 class _Overlapping(_Counted):
-    """A media bucket whose PUTs each take ``cost`` seconds, counting how
-    many are in flight at once (and the most)."""
+    """A media bucket counting the PUTs in flight at once (and the most),
+    where an original's PUT lasts until another PUT starts (5 s at most)."""
 
-    def __init__(self, root: Path, cost: float) -> None:
-        super().__init__(root, put_cost=cost)
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
         self.in_flight = 0
         self.most = 0
+        self.started = 0
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         with self.lock:
             self.in_flight += 1
             self.most = max(self.most, self.in_flight)
+            self.started += 1
+            mine = self.started
         try:
+            deadline = time.monotonic() + 5
+            while not key.startswith("derived/") and time.monotonic() < deadline:
+                with self.lock:
+                    if self.started > mine:
+                        break
+                time.sleep(0.01)
             super().put(key, data, content_type)
         finally:
             with self.lock:
@@ -559,7 +568,7 @@ def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_co
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n * 8, n) for n in range(1, 4)]
     root = tmp_path / "run"
-    media = _Overlapping(root / "media", cost=0.3)
+    media = _Overlapping(root / "media")
     engine = _engine(tmp_path / "media.db")
     driver = threading.get_ident()
     at_commit: list[int] = []
@@ -581,6 +590,15 @@ def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_co
     assert chunk["counts"] == {"ok": 3}
 
 
+class _CopyDropped(_Counted):
+    """The bucket's connection drops on every clean copy's PUT."""
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        if key.startswith("derived/") and content_type != "image/png":
+            raise ConnectionError("connection reset by peer")
+        super().put(key, data, content_type)
+
+
 def test_a_failed_upload_fails_its_image_before_any_of_its_rows_commit(tmp_path: Path) -> None:
     """The bucket drops the clean copy's PUT: the image's seed commits
     nothing (an outage: interrupted, retried by a plain rerun), whatever ran
@@ -588,7 +606,7 @@ def test_a_failed_upload_fails_its_image_before_any_of_its_rows_commit(tmp_path:
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100, 1)]
     root = tmp_path / "run"
-    media = _Outage(root / "media", healthy=1)  # the original lands, the copy does not
+    media = _CopyDropped(root / "media")  # the original lands, the copy does not
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
     rt = _runtime(main, root, raw, _Shapes(), [], media=media)
@@ -676,7 +694,10 @@ def test_no_more_copies_than_the_decode_slots_are_decoded_for_the_model_at_once(
     def first_holds_the_gpu(width: int) -> None:
         if not first:
             first.append(True)
-            time.sleep(0.5)  # every other image is ready for the GPU meanwhile
+            deadline = time.monotonic() + 5  # every other image gets ready for the GPU meanwhile
+            while decoded[1] < (slots or 3) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)  # and one more would decode now, were a slot free
 
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 2 * 8, n) for n in range(1, 13)]
@@ -1026,6 +1047,29 @@ def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_en
     assert minting[1] == 2
 
 
+class _HeldBack(_Counted):
+    """A media bucket whose GET of ``key`` (an image's clean copy read
+    back: a bucket call's tail, a 10 s upload live; a read, so no SQLite
+    write lock is held meanwhile) lasts until ``until`` holds of the
+    progress file's lines, 10 s at most."""
+
+    def __init__(self, root: Path, key: str, until: Callable[[list[dict[str, Any]]], bool]) -> None:
+        super().__init__(root)
+        self.key, self.until, self.progress = key, until, root.parent / "progress.jsonl"
+
+    def get(self, key: str) -> bytes:
+        deadline = time.monotonic() + 10
+        while key == self.key and time.monotonic() < deadline:
+            if self.progress.exists() and self.until(_lines(self.progress)):
+                break
+            time.sleep(0.01)
+        return super().get(key)
+
+
+def _items_but_one(items: list[mb.WorkItem]) -> Callable[[list[dict[str, Any]]], bool]:
+    return lambda lines: sum(line["event"] == "item" for line in lines) >= len(items) - 1
+
+
 def _slowed(
     tmp_path: Path,
     items: list[mb.WorkItem],
@@ -1033,15 +1077,16 @@ def _slowed(
     slow: mb.WorkItem,
     config: mb.BatchConfig,
     code: int = 0,
+    until: Callable[[list[dict[str, Any]]], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Engine]:
-    """``items`` run with ``slow``'s clean copy read back from the bucket in
-    2 s (a bucket call's tail: a 10 s upload live; a read, so no SQLite
-    write lock is held meanwhile): its records, its events and its database."""
+    """``items`` run with ``slow`` held up at its copy's readback until
+    ``until`` (by default, until every other image is recorded): its
+    records, its events and its database."""
     root = tmp_path / "run"
-    media = _Counted(root / "media")
     original = LocalObjectStore.get(raw.store, slow.storage_key)
     clean, mime = mask_seed._encode(mask_seed._picture(original), original)
-    media.slow[derived_key(hashlib.sha256(clean).hexdigest(), mime)] = 2.0
+    key = derived_key(hashlib.sha256(clean).hexdigest(), mime)
+    media = _HeldBack(root / "media", key, until or _items_but_one(items))
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
     events: list[dict[str, Any]] = []
@@ -1076,9 +1121,9 @@ def test_the_next_chunk_starts_before_the_slowest_image_of_the_one_before_ends(
     image keeps no later chunk's batch row open nor its VRAM sampler running."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
-    records, events, engine = _slowed(
-        tmp_path, items, raw, items[2], mb.BatchConfig(chunk_size=3, writers=3)
-    )
+    chunk_reported = lambda lines: any(line["event"] == "chunk" for line in lines)  # noqa: E731
+    config = mb.BatchConfig(chunk_size=3, writers=3)
+    records, events, engine = _slowed(tmp_path, items, raw, items[2], config, until=chunk_reported)
     order = [r["blob_sha256"] for r in records]
     assert order[-1] == items[2].blob_sha256  # the second chunk ended first
     assert {r["chunk"] for r in records[:-1] if r["blob_sha256"] in order[3:]} == {2}
