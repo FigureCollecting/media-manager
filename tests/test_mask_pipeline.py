@@ -408,6 +408,44 @@ def _run(
     return outcome
 
 
+def _unordered(outcome: dict[str, Any]) -> dict[str, Any]:
+    """``outcome`` with what the order the images END in may change made
+    order-free (MASK-PERF-3: each image is recorded, and writes its chunk's
+    batch row, as it ends): the records sorted, each chunk's ranks and
+    failures sorted, each batch row's cursor checked to be the copy of one of
+    its own images and dropped, and its UPDATEs by the running total they
+    wrote (one image each: no update lost)."""
+
+    def chunked(line: dict[str, Any]) -> dict[str, Any]:
+        if line["event"] != "chunk":
+            return line
+        failures = sorted(line["failures"], key=lambda f: f["blob_sha256"])
+        return {**line, "ranks": sorted(line["ranks"]), "failures": failures}
+
+    def key(line: dict[str, Any]) -> tuple[str, str]:
+        return (line["event"], json.dumps(line, sort_keys=True, default=str))
+
+    progress = [chunked(line) for line in outcome["progress"]]
+    tables = dict(outcome["tables"])
+    masks = [json.loads(r) for r in tables["image_masks"]]
+    batches = []
+    for row in (json.loads(r) for r in tables["mask_batches"]):
+        mine = {m["source_sha256"] for m in masks if m["batch_id"] == row["id"]}
+        assert row.pop("cursor_sha256") in mine | ({None} if not mine else set())
+        batches.append(json.dumps(row, sort_keys=True))
+    tables["mask_batches"] = sorted(batches)
+    return {
+        **outcome,
+        "tables": tables,
+        "progress": sorted(progress, key=key),
+        "events": [chunked(e) for e in outcome["events"]],
+        "batch_row": sorted(
+            (params[-1], sum(json.loads(params[1]).values()))
+            for _statement, params in outcome["batch_row"]
+        ),
+    }
+
+
 # --------------------------------------------------------------------------
 # the pipeline writes what one image at a time writes
 # --------------------------------------------------------------------------
@@ -426,7 +464,7 @@ def test_the_pipeline_writes_what_one_image_at_a_time_writes(tmp_path: Path) -> 
     for attempt in range(3):  # three runs: three interleavings
         config = mb.BatchConfig(chunk_size=4, writers=4)
         piped = _run(tmp_path, f"piped{attempt}", items, raw, config, faults=True)
-        assert piped == alone
+        assert _unordered(piped) == _unordered(alone)
 
 
 def test_a_rerun_after_the_pipeline_is_idempotent_and_reads_no_original_again(
@@ -797,40 +835,139 @@ def test_the_batch_row_is_read_again_after_an_images_write_rolls_back(tmp_path: 
     assert statuses == ["ok", "interrupted", "ok"]
     (row,) = (json.loads(r) for r in alone["tables"]["mask_batches"])
     assert row["counts"]["ok"] == 2
-    assert piped == alone
+    assert _unordered(piped) == _unordered(alone)
 
 
-def test_no_more_than_writers_images_start_past_the_last_one_recorded(
+def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Images that end early (here an unsupported codec: no row to write)
-    are not recorded before the image ahead of them: while it is held up no
-    further image starts, so an outage opens the circuit after at most
-    writers - 1 images more than one at a time would have tried."""
+    are recorded as they end and make way for the next while the image
+    ahead of them is held up on the GPU: never more than ``writers`` in
+    flight, every one of them unrecorded, so an outage opens the circuit
+    after at most writers - 1 images more than one at a time would have
+    tried, and a power cut loses at most ``writers`` records."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100, 1), *(raw.add(110 + n, n, codec="zstd") for n in range(2, 9))]
-    started: list[str] = []
+    lock = threading.Lock()
+    minting = [0, 0]  # now, most
     real_mint = mb._mint
 
     def counted_mint(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        started.append(args[1].blob_sha256)
-        return real_mint(*args, **kwargs)
+        with lock:
+            minting[0] += 1
+            minting[1] = max(minting[1], minting[0])
+        try:
+            return real_mint(*args, **kwargs)
+        finally:
+            with lock:
+                minting[0] -= 1
 
     monkeypatch.setattr(mb, "_mint", counted_mint)
+    root = tmp_path / "run"
     while_held: list[int] = []
 
     def first_holds_the_gpu(width: int) -> None:
-        time.sleep(0.5)  # the image after it ends meanwhile
-        while_held.append(len(started))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(_lines(root / "progress.jsonl")) < 7:
+            time.sleep(0.01)  # the images after it end meanwhile, each recorded
+        while_held.append(len(_lines(root / "progress.jsonl")))
 
     config = mb.BatchConfig(chunk_size=8, writers=2)
     backend = _Shapes(gate=first_holds_the_gpu)
     outcome = _run(tmp_path, "run", items, raw, config, backend=backend)
     assert outcome["exit"] == 1
     statuses = [r["status"] for r in outcome["progress"] if r["event"] == "item"]
-    assert statuses == ["ok"] + ["failed"] * 7
-    assert while_held == [2]
-    assert len(started) == 8
+    assert statuses == ["failed"] * 7 + ["ok"]
+    assert while_held == [7]
+    assert minting[1] == 2
+
+
+def _slowed(
+    tmp_path: Path, items: list[mb.WorkItem], raw: _Raw, slow: mb.WorkItem, config: mb.BatchConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Engine]:
+    """``items`` run with ``slow``'s original PUT taking 2 s (a 10 s tail
+    live): its records, its events and its database."""
+    root = tmp_path / "run"
+    media = _Counted(root / "media")
+    media.slow[slow.blob_sha256] = 2.0
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    assert (
+        mb.run_batch(items, config, _runtime(main, root, raw, _Shapes(), events, media=media)) == 0
+    )
+    main.close()
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    return records, events, engine
+
+
+def test_a_slow_image_holds_up_no_other_image(tmp_path: Path) -> None:
+    """MASK-PERF-3: an image whose upload is slow keeps its own worker only:
+    every other image ends, is recorded as it ends and makes way for the
+    next, so nothing waits for the slowest image in flight."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=6, writers=2)
+    )
+    assert [r["status"] for r in records] == ["ok"] * 6
+    assert records[-1]["blob_sha256"] == items[0].blob_sha256  # the slow one ends last
+    engine.dispose()
+
+
+def test_the_next_chunk_starts_before_the_slowest_image_of_the_one_before_ends(
+    tmp_path: Path,
+) -> None:
+    """No chunk barrier: a chunk is its batch row, its gate and its report;
+    the next one's images start while the one before still has one in
+    flight. Each chunk still counts its own images, and reports in order."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    records, events, engine = _slowed(
+        tmp_path, items, raw, items[2], mb.BatchConfig(chunk_size=3, writers=3)
+    )
+    order = [r["blob_sha256"] for r in records]
+    assert order[-1] == items[2].blob_sha256  # the second chunk ended first
+    assert {r["chunk"] for r in records[:-1] if r["blob_sha256"] in order[3:]} == {2}
+    chunks = [e for e in events if e["event"] == "chunk"]
+    assert [(c["chunk"], c["count"]) for c in chunks] == [(1, 3), (2, 3)]
+    with Session(engine) as db:
+        rows = db.execute(select(MaskBatch).order_by(MaskBatch.id)).scalars().all()
+        assert [(sum(b.counts.values()), b.status) for b in rows] == [(3, "done"), (3, "done")]
+    engine.dispose()
+
+
+def test_the_gate_before_each_chunk_reads_the_gpu_with_no_model_call_running(
+    tmp_path: Path,
+) -> None:
+    """Rolling, the gate before the next chunk is read while the chunk before
+    still has images in flight: on the driver's thread, so no model call
+    runs from its settle to its last reading (the readings are another
+    consumer's alone, as when the chunk before had ended)."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    backend = _Shapes(cost=0.05)
+    running: list[int] = []
+
+    def settle(seconds: float) -> None:
+        running.append(backend.running)
+
+    gpu = mb.GpuGate(query=lambda: f"{backend.running}, 12000, 300, 12282", sleep=settle)
+    gates = mb.Gates(windows=(), gpu=gpu, residential=None, now=lambda: NOON)
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, backend, events, gates=gates)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=3), rt) == 0
+    chunks = [e for e in events if e["event"] == "chunk"]
+    assert [c["count"] for c in chunks] == [2, 2, 2]
+    assert running  # the settles and samples of the gates while the model was held
+    assert set(running) == {0}
+    assert "paused" not in [e["event"] for e in events]
+    main.close()
+    engine.dispose()
 
 
 def test_each_workers_sql_is_charged_to_its_own_images_db(
@@ -873,14 +1010,16 @@ def test_each_workers_sql_is_charged_to_its_own_images_db(
         assert timings.seconds["db"] >= statements[name] * cost
 
 
-def test_the_batch_rows_counts_and_cursor_are_one_image_at_a_times(tmp_path: Path) -> None:
+def test_the_batch_rows_counts_are_one_image_at_a_times(tmp_path: Path) -> None:
+    """Its cursor is the copy of the last of its images to commit (the order
+    they end in): one of its own images, as ``_unordered`` checks."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 4, n) for n in range(1, 11)]  # ok, held, empty, crash, ...
     alone = _run(tmp_path, "alone", items, raw, mb.BatchConfig(chunk_size=10))
     engine = _engine(tmp_path / "piped.db", pool_size=7)  # a connection per worker and the batch
     config = mb.BatchConfig(chunk_size=10, writers=6)
     piped = _run(tmp_path, "piped", items, raw, config, engine=engine)
-    assert piped["tables"]["mask_batches"] == alone["tables"]["mask_batches"]
+    assert _unordered(piped)["tables"] == _unordered(alone)["tables"]
     (row,) = (json.loads(r) for r in piped["tables"]["mask_batches"])
     assert sum(row["counts"].values()) == 10
 
@@ -1343,23 +1482,36 @@ def test_a_claim_finished_after_the_snapshot_still_lends_its_keys() -> None:
     assert waits == [second] and third.keys == {"a", "b"}
 
 
-def test_turns_are_taken_in_order_whoever_ends_first() -> None:
-    turns = mp.Turns()
-    taken: list[int] = []
+def test_the_turn_is_one_image_at_a_time_in_the_order_they_get_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From its first write after its judgment to its end an image holds the
+    turn: no two images write at once, and an image behind a slow one in the
+    work list writes first."""
+    log: list[tuple[str, int]] = []
+    real_turn, real_close = mb._ImageLane.turn, mb._ImageLane.close
 
-    def take(index: int) -> None:
-        turns.take(index)
-        taken.append(index)
+    def turn(lane: Any) -> None:
+        taken = lane._turned
+        real_turn(lane)
+        if not taken:
+            log.append(("in", lane._index))
 
-    second = threading.Thread(target=take, args=(2,))
-    second.start()
-    turns.take(0)
-    turns.end(1)  # ended without writing
-    time.sleep(0.05)
-    assert taken == []
-    turns.end(0)
-    second.join(timeout=5)
-    assert taken == [2]
+    def close(lane: Any) -> None:
+        if lane._turned:
+            log.append(("out", lane._index))
+        real_close(lane)
+
+    monkeypatch.setattr(mb._ImageLane, "turn", turn)
+    monkeypatch.setattr(mb._ImageLane, "close", close)
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 6)]
+    _records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=5, writers=3)
+    )
+    engine.dispose()
+    assert [step for step, _index in log] == ["in", "out"] * 5  # never two at once
+    assert [index for _step, index in log[::2]][-1] == 0  # the slow first image writes last
 
 
 def test_a_gpu_job_runs_on_the_serving_thread_and_returns_its_answer_or_error() -> None:
