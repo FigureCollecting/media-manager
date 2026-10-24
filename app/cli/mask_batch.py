@@ -1933,6 +1933,29 @@ def build_backend(args: argparse.Namespace) -> MattingBackend:
     return backend
 
 
+#: The batch's bucket clients (MASK-PERF-3): a connection that cannot be
+#: made, or a request that makes no progress -- a PUT's body sent in chunks,
+#: each within the connect timeout (urllib3 2), its answer within the read
+#: timeout -- is cut and retried with backoff (botocore's standard mode,
+#: four attempts in all), not waited on for botocore's 60 s; TCP keepalive
+#: keeps a pooled connection open through a pause between chunks. Live, a
+#: TCP and TLS connect to the bucket takes 0.5 s and a PUT 0.15-0.4 s.
+BUCKET_CONFIG: dict[str, Any] = {
+    "connect_timeout": 10,
+    "read_timeout": 30,
+    "retries": {"mode": "standard", "total_max_attempts": 4},
+    "tcp_keepalive": True,
+}
+
+
+def _media_store(connections: int) -> ObjectStore:
+    """The media bucket (S3_*), its client keeping ``connections`` (``_run``)."""
+    from ..s3 import s3_client
+
+    client = s3_client(max_pool_connections=connections, **BUCKET_CONFIG)
+    return S3ObjectStore(client=client, bucket=get_settings().s3_bucket)
+
+
 def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
     """The raw bucket, read only; its client keeps ``connections`` (``_run``)."""
     if args.raw_dir:
@@ -1952,7 +1975,7 @@ def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
         region_name=os.environ.get("RAW_S3_REGION", "us-east-1"),
         aws_access_key_id=os.environ["RAW_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["RAW_S3_SECRET_KEY"],
-        config=Config(max_pool_connections=connections),
+        config=Config(max_pool_connections=connections, **BUCKET_CONFIG),
     )
     return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
 
@@ -2034,12 +2057,7 @@ def _run(args: argparse.Namespace) -> int:
         raw_store = _raw_store(args, connections)
         opened, bucket = open_stores(args.sandbox)
         if args.sandbox is None:
-            from ..s3 import s3_client
-
-            bucket = S3ObjectStore(
-                client=s3_client(max_pool_connections=connections),
-                bucket=get_settings().s3_bucket,
-            )
+            bucket = _media_store(connections)
         db = _sized(opened, args.writers)
         if db is not opened:
             engines.append(db.get_bind().engine)

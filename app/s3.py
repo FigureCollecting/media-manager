@@ -10,9 +10,10 @@ from .config import get_settings
 logger = logging.getLogger(__name__)
 
 
-def s3_client(*, max_pool_connections: int = 10) -> Any:
+def s3_client(*, max_pool_connections: int = 10, **config: Any) -> Any:
     """A boto3 S3 client for the configured bucket, keeping up to
-    ``max_pool_connections`` connections (botocore's default: 10)."""
+    ``max_pool_connections`` connections (botocore's default: 10); ``config``
+    adds botocore Config options (the mask batch's timeouts and retries)."""
     s = get_settings()
     session = boto3.session.Session()
     return session.client(
@@ -25,6 +26,7 @@ def s3_client(*, max_pool_connections: int = 10) -> Any:
             s3={"addressing_style": "virtual"},
             signature_version="s3v4",
             max_pool_connections=max_pool_connections,
+            **config,
         ),
         use_ssl=s.s3_secure,
         verify=s.s3_secure,

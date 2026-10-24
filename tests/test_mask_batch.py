@@ -3250,6 +3250,36 @@ def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
     assert seen == [(18, 18), (10, 10)]  # never fewer than botocore's own 10
 
 
+def test_the_batchs_bucket_clients_bound_a_stalled_request_and_retry_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MASK-PERF-3: a request that stalls (a connection the home router
+    dropped, a hung PUT) is cut and retried, not waited on for botocore's
+    60 s twice over; idle connections are kept alive between chunks. The
+    API's own client keeps botocore's defaults."""
+    from app.s3 import s3_client
+
+    for name, value in (
+        ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
+        ("RAW_S3_BUCKET", "raw"),
+        ("RAW_S3_ACCESS_KEY", "k"),
+        ("RAW_S3_SECRET_KEY", "s"),
+    ):
+        monkeypatch.setenv(name, value)
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    raw = mb._raw_store(args, 12)
+    media = mb._media_store(12)
+    for store in (raw._store, media):  # type: ignore[attr-defined]
+        config = store._client.meta.config
+        assert config.max_pool_connections == 12
+        assert (config.connect_timeout, config.read_timeout) == (10, 30)
+        assert config.retries == {"mode": "standard", "total_max_attempts": 4}
+        assert config.tcp_keepalive is True
+    api = s3_client().meta.config
+    assert (api.connect_timeout, api.read_timeout, api.max_pool_connections) == (60, 60, 10)
+    assert not api.tcp_keepalive
+
+
 def test_recent_writes_are_safe_from_many_workers() -> None:
     """Workers evicting at once must not evict one copy twice (a KeyError
     in a PUT that succeeded) nor grow past the bound."""
