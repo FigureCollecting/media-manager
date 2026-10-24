@@ -1639,7 +1639,9 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--gpu-free-min-mib", "0"),  # would pass a full card
         ("--gpu-free-min-mib", "1023"),
         ("--writers", "-1"),
-        ("--writers", "17"),  # more sessions than the media db's pool lends
+        ("--writers", "24"),  # with the batch's own, more than 24 connections to the database
+        ("--decode-slots", "0"),
+        ("--decode-slots", "9"),  # ~0.55 GB each at 4000x3000
         ("--writers", "two"),
         ("--prefetch", "0"),
         ("--prefetch", "17"),  # originals held in memory
@@ -1672,6 +1674,9 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
         ("--writers", "0", "writers", 0),
         ("--writers", "16", "writers", 16),
+        ("--writers", "23", "writers", 23),
+        ("--decode-slots", "1", "decode_slots", 1),
+        ("--decode-slots", "8", "decode_slots", 8),
         ("--prefetch", "1", "prefetch", 1),
         ("--prefetch", "16", "prefetch", 16),
     ],

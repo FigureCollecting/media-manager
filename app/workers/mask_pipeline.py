@@ -23,8 +23,9 @@ memory:
   time and refuses any while the batch is held (a pause or a stop); the
   worker then lets its image go (``Held``), unrecorded, for a rerun.
 - A FEW DECODED AT ONCE (``Slots``). An image's copy is decoded for the
-  model only when a slot is free, and holds it until its mask is made: the
-  memory of the images waiting for the GPU is bounded whatever the writers.
+  model only when its units of the slots are free (one, or one per unit of
+  a big original's size), and holds them until its mask is made: the memory
+  of the images waiting for the GPU is bounded whatever the writers.
 """
 
 from __future__ import annotations
@@ -121,11 +122,13 @@ class Claims:
 
 
 class Slots:
-    """The images whose copies are decoded for the model at once (the
-    memory bound): an image holds a slot from its copy's decode, through its
-    wait for the GPU, to its mask. A slot goes to the earliest image waiting,
-    so no later image keeps the one the chunk records next waiting. A holder
-    waits for nothing but the GPU, so every slot comes back."""
+    """The copies decoded for the model at once (the memory bound): an
+    image holds its units of the slots from its copy's decode, through its
+    wait for the GPU, to its mask (MASK-PERF-3: a big original takes a unit
+    per unit of its size, app.cli.mask_batch). The slots go to the earliest
+    image waiting, whatever the units it takes, so no later image keeps the
+    one before it waiting. A holder waits for nothing but the GPU, so every
+    unit comes back."""
 
     def __init__(self, size: int) -> None:
         self._cond = threading.Condition()
@@ -136,17 +139,17 @@ class Slots:
         with self._cond:
             return len(self._waiting)
 
-    def acquire(self, index: int) -> None:
+    def acquire(self, index: int, units: int = 1) -> None:
         with self._cond:
             heapq.heappush(self._waiting, index)
-            self._cond.wait_for(lambda: self._free > 0 and self._waiting[0] == index)
+            self._cond.wait_for(lambda: self._free >= units and self._waiting[0] == index)
             heapq.heappop(self._waiting)
-            self._free -= 1
+            self._free -= units
             self._cond.notify_all()  # another slot may be free for the next one
 
-    def release(self) -> None:
+    def release(self, units: int = 1) -> None:
         with self._cond:
-            self._free += 1
+            self._free += units
             self._cond.notify_all()
 
 

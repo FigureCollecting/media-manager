@@ -7,7 +7,7 @@
         [--busy-windows SPEC] [--residential-ip IP|CIDR | --no-residential-check]
         [--ip-echo-url URL] [--residential-ttl S] [--poll-seconds S]
         [--max-wait-seconds S] [--max-consecutive-failures N] [--raw-dir DIR]
-        [--writers N] [--prefetch N]
+        [--writers N] [--prefetch N] [--decode-slots N]
     python -m app.cli.mask_batch sql ross-heads --user UUID
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
@@ -91,8 +91,9 @@ unrecorded and come back first. Each image's stages are its own wall time,
 the pipeline's waits among them (``claim``, ``gpu_wait``, ``turn_wait``);
 the chunk's ``throughput_seconds_per_image`` is its wall time over the
 images it minted (an 'already' one, a lookup, is left out, as in the
-seconds per image). At most three copies are decoded for the model at once,
-whatever the writers (the memory bound). The database pool keeps a
+seconds per image). At most ``--decode-slots`` copies (default three) are
+decoded for the model at once, whatever the writers, and an original over
+4000x3000 counts for a slot per 4000x3000 begun (the memory bound). The database pool keeps a
 connection for every worker and the batch and lends none past them, and
 each bucket client keeps one for every worker and read-ahead: no connection
 is closed while the run lasts (a close kills the kubectl port-forward the
@@ -113,6 +114,7 @@ import dataclasses
 import datetime as dt
 import functools
 import hashlib
+import io
 import ipaddress
 import itertools
 import json
@@ -135,6 +137,7 @@ from types import FrameType
 from typing import Any
 
 import httpx
+from PIL import Image as PILImage
 from sqlalchemy import Engine, create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
@@ -182,19 +185,25 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: live chunk tunes it with ``--writers``. Simulated at the live costs: 5.5 s
 #: an image one at a time, 2.75 s with 2 writers, 1.78 s with 4, 1.21 s with 8,
 #: 1.05 s with 12. The command line's pool keeps writers + 1 connections and
-#: lends none past them (``_sized``)...
+#: lends none past them (``_sized``), so the most writers keep the run at 24
+#: connections to the production database (MASK-PERF-3)...
 DEFAULT_WRITERS = 4
-MAX_WRITERS = 16
+MAX_WRITERS = 23
 #: ...and the originals read, decoded and hash-checked ahead of them: two
 #: keep the next worker's ready, and each one read ahead is decoded once more
 #: (4000x3000: 2.6 GB peak at 4 writers with 2, 3.3 GB with 4, same speed).
 DEFAULT_PREFETCH = 2
 MAX_PREFETCH = 16
 #: The images whose copies are decoded for the model at once, whatever the
-#: writers: the one on the GPU and two waiting (app.workers.mask_pipeline.Slots).
-#: Each holds ~0.55 GB at its peak at 4000x3000, so a chunk's memory stays near
-#: one image at a time's.
+#: writers: by default the one on the GPU and two waiting
+#: (app.workers.mask_pipeline.Slots); ``--decode-slots`` sizes it to the memory
+#: budget. Each holds ~0.55 GB at its peak at 4000x3000...
 DECODED_AT_ONCE = 3
+MAX_DECODE_SLOTS = 8
+#: ...so an original over that size takes a slot per unit of it (MASK-PERF-3:
+#: the memory guard; the largest the image limits let in, 64 MP, takes six),
+#: up to every slot: it is then decoded alone.
+DECODE_UNIT_PIXELS = 4000 * 3000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -760,6 +769,7 @@ class BatchConfig:
     max_consecutive_failures: int = 5
     writers: int = 0
     prefetch: int = 4
+    decode_slots: int = DECODED_AT_ONCE
 
 
 @dataclass
@@ -1052,6 +1062,8 @@ class _Fetched:
     keys: PictureKeys | None = None
     fetch_seconds: float = 0.0
     keys_seconds: float = 0.0
+    #: its width x height from its header (None: it would not open)
+    pixels: int | None = None
 
 
 def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
@@ -1067,17 +1079,29 @@ def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
     except Exception as exc:
         return _Fetched(error=exc, fetch_seconds=rt.monotonic() - start)
     fetched = rt.monotonic()
-    keys = None
+    keys = pixels = None
     if hashlib.sha256(data).hexdigest() == item.blob_sha256:
         # a picture that will not decode fails the seed before it writes a row
         with contextlib.suppress(Exception):
             keys = picture_keys(data)
+        with contextlib.suppress(Exception), PILImage.open(io.BytesIO(data)) as header:
+            pixels = header.width * header.height
     return _Fetched(
         data=data,
         keys=keys,
         fetch_seconds=fetched - start,
         keys_seconds=rt.monotonic() - fetched,
+        pixels=pixels,
     )
+
+
+def _decode_units(pixels: int | None, slots: int) -> int:
+    """The decode slots an original of ``pixels`` takes: one per
+    ``DECODE_UNIT_PIXELS`` begun, up to every slot (it is then decoded
+    alone); one when its size is unknown (it fails before its decode)."""
+    if pixels is None:
+        return 1
+    return max(1, min(slots, -(-pixels // DECODE_UNIT_PIXELS)))
 
 
 class _BatchRow:
@@ -1134,10 +1158,15 @@ class _Flow:
     written by one image at a time, in the order the images get there."""
 
     events: queue.Queue[GpuJob | _Done]
-    slots: Slots
+    #: the decode slots, ``size`` units
+    size: int
+    slots: Slots = field(init=False)
     claims: Claims = field(default_factory=Claims)
     hold: threading.Event = field(default_factory=threading.Event)
     turn: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        self.slots = Slots(self.size)
 
     def submit(self, call: Callable[[], Any]) -> Any:
         """Run ``call`` (a model call) on the driver's thread, and wait."""
@@ -1231,12 +1260,13 @@ class _ImageLane:
     def decoded(self) -> Iterator[None]:
         """Its copy decoded for the model, a slot held meanwhile: the wait
         for one is a wait for the GPU."""
+        units = _decode_units(self._fetched.pixels, self._run.flow.size)
         with self._timings.stage("gpu_wait"):
-            self._run.flow.slots.acquire(self._index)
+            self._run.flow.slots.acquire(self._index, units)
         try:
             yield
         finally:
-            self._run.flow.slots.release()
+            self._run.flow.slots.release(units)
 
     def turn(self) -> None:
         """Before the image's first write after its judgment: the turn, held
@@ -1304,7 +1334,7 @@ class _Pipeline:
         held images go back to the front of ``remaining``, in work-list
         order."""
         writers, prefetch, size = self.config.writers, self.config.prefetch, self.config.chunk_size
-        flow = _Flow(events=queue.Queue(maxsize=2 * writers), slots=Slots(DECODED_AT_ONCE))
+        flow = _Flow(events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots)
         gpu = on_the_gpu(self.backend, flow.submit)
         pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
         ahead: dict[str, Future[_Fetched]] = {}
@@ -1979,6 +2009,7 @@ def _run(args: argparse.Namespace) -> int:
         max_consecutive_failures=args.max_consecutive_failures,
         writers=args.writers,
         prefetch=args.prefetch,
+        decode_slots=args.decode_slots,
     )
     stop = threading.Event()
     previous: dict[int, Any] = {}
@@ -2134,8 +2165,9 @@ def _parser() -> argparse.ArgumentParser:
         type=_whole(0, MAX_WRITERS),
         default=DEFAULT_WRITERS,
         help=(
-            "images a chunk runs at once, each on a worker with a database connection "
-            f"of its own (0: one at a time; default {DEFAULT_WRITERS}, up to {MAX_WRITERS})"
+            "images in flight at once, across chunks, each on a worker with a database "
+            f"connection of its own (0: one at a time; default {DEFAULT_WRITERS}, up to "
+            f"{MAX_WRITERS}: 24 connections with the batch's own)"
         ),
     )
     run.add_argument(
@@ -2143,6 +2175,15 @@ def _parser() -> argparse.ArgumentParser:
         type=_whole(1, MAX_PREFETCH),
         default=DEFAULT_PREFETCH,
         help=f"originals read ahead of the workers (default {DEFAULT_PREFETCH})",
+    )
+    run.add_argument(
+        "--decode-slots",
+        type=_whole(1, MAX_DECODE_SLOTS),
+        default=DECODED_AT_ONCE,
+        help=(
+            "copies decoded for the model at once, ~0.55 GB each at 4000x3000; a bigger "
+            f"original takes one per {DECODE_UNIT_PIXELS} pixels (default {DECODED_AT_ONCE})"
+        ),
     )
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 

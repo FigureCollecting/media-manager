@@ -575,13 +575,14 @@ def test_images_in_flight_and_read_ahead_are_bounded(
     assert len(raw.store.gets) == 14
 
 
-def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("slots", [None, 5])
+def test_no_more_copies_than_the_decode_slots_are_decoded_for_the_model_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slots: int | None
 ) -> None:
     """An image's decoded copy is held from its decode, through its wait for
-    the GPU, to its mask: whatever the writers, only the one on the GPU and
-    two waiting are decoded at once, so a chunk's memory stays near one
-    image at a time's (MASK-PERF-2 at 4000x3000: ~0.55 GB each)."""
+    the GPU, to its mask: whatever the writers, only ``decode_slots`` copies
+    are decoded at once (default three: the one on the GPU and two waiting),
+    so the memory stays bounded (MASK-PERF-2 at 4000x3000: ~0.55 GB each)."""
     lock = threading.Lock()
     decoded = [0, 0]  # now, most
     real = mask_job.build_mask_artifact
@@ -608,12 +609,62 @@ def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
     items = [raw.add(100 + n % 2 * 8, n) for n in range(1, 13)]
     engine = _engine(tmp_path / "media.db", pool_size=9)
     config = mb.BatchConfig(chunk_size=12, writers=8)
+    if slots is not None:
+        config.decode_slots = slots
     backend = _Shapes(gate=first_holds_the_gpu)
     outcome = _run(tmp_path, "run", items, raw, config, backend=backend, engine=engine)
     assert outcome["exit"] == 0
     assert [r["status"] for r in outcome["progress"] if r["event"] == "item"] == ["ok"] * 12
-    assert decoded[1] == 3
-    assert mb.DECODED_AT_ONCE == 3
+    assert decoded[1] == (slots or 3)
+    assert mb.DECODED_AT_ONCE == mb.BatchConfig().decode_slots == 3
+
+
+def test_a_big_original_takes_the_decode_slots_of_its_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MASK-PERF-3's memory guard: an original over ``DECODE_UNIT_PIXELS``
+    takes a slot per unit of its size (up to every slot), so while a big
+    copy waits for the GPU no other copy is decoded beside it."""
+    monkeypatch.setattr(mb, "DECODE_UNIT_PIXELS", 100 * H)  # a 100-px-wide photo: one unit
+    lock = threading.Lock()
+    decoded = [0]
+    beside_the_big_one: list[int] = []
+    real = mask_job.build_mask_artifact
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            decoded[0] += 1
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                decoded[0] -= 1
+
+    monkeypatch.setattr(mask_job, "build_mask_artifact", counted)
+
+    def the_big_one_holds_the_gpu(width: int) -> None:
+        if width == 300:
+            time.sleep(0.5)  # every other image is ready for the GPU meanwhile
+            beside_the_big_one.append(decoded[0])
+
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(300, 1), *(raw.add(100 + n % 2 * 8, n) for n in range(2, 8))]
+    config = mb.BatchConfig(chunk_size=7, writers=6, decode_slots=3)
+    backend = _Shapes(gate=the_big_one_holds_the_gpu)
+    engine = _engine(tmp_path / "media.db", pool_size=7)
+    outcome = _run(tmp_path, "run", items, raw, config, backend=backend, engine=engine)
+    assert [r["status"] for r in outcome["progress"] if r["event"] == "item"] == ["ok"] * 7
+    assert beside_the_big_one == [1]  # three units of three: it alone
+
+
+def test_decode_units_are_the_originals_size_in_units_up_to_every_slot() -> None:
+    unit = mb.DECODE_UNIT_PIXELS
+    assert unit == 4000 * 3000  # the size the 0.55 GB peak was measured at
+    assert mb._decode_units(None, 4) == 1  # unknown (it fails before its decode)
+    assert mb._decode_units(unit, 4) == 1
+    assert mb._decode_units(unit + 1, 4) == 2
+    assert mb._decode_units(64_000_000, 8) == 6  # the largest original the limits let in
+    assert mb._decode_units(64_000_000, 3) == 3  # alone, every slot its own
 
 
 def test_a_model_call_that_raises_still_gives_its_decode_slot_back(tmp_path: Path) -> None:
@@ -661,6 +712,36 @@ def test_decode_slots_go_to_the_earliest_image_waiting() -> None:
     two.acquire(7)
     two.acquire(9)  # a second slot: no wait
     assert two.waiting() == 0
+
+
+def test_a_slot_of_several_units_waits_for_them_and_holds_back_later_images() -> None:
+    """The earliest image waiting is served first, however many units it
+    takes: a big one is not passed over for good by small ones behind it."""
+    slots = mp.Slots(3)
+    slots.acquire(0, 2)
+    order: list[int] = []
+
+    def take(index: int, units: int) -> None:
+        slots.acquire(index, units)
+        order.append(index)
+
+    big = threading.Thread(target=take, args=(1, 3))
+    big.start()
+    deadline = time.monotonic() + 5
+    while slots.waiting() < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    small = threading.Thread(target=take, args=(2, 1))  # one unit is free: still it waits
+    small.start()
+    while slots.waiting() < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    assert order == []
+    slots.release(2)
+    big.join(5)
+    assert order == [1]
+    slots.release(3)
+    small.join(5)
+    assert order == [1, 2]
 
 
 # --------------------------------------------------------------------------
