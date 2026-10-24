@@ -71,34 +71,37 @@ THE PIPELINE (MASK-PERF-2, rolling since MASK-PERF-3). The images run
 session of its own, and the next ``--prefetch`` originals (default 2) are
 read, decoded and hash-checked ahead; the model runs on the driver's thread
 alone, one image at a time, so one image's I/O (its read, its seed, its
-judgment, its uploads and rows) overlaps another's model run. The pipeline
-ROLLS across chunks: a chunk is its batch row, its gate and its report, not
-a barrier, so the next chunk's images start while the one before still has
-images in flight (its gate is read on the driver's thread, no model call
-running meanwhile), and a chunk reports once its last image ended (one held
-up by a slow image after the next). Each image's own work runs in the same order as before, and what it
-writes is what one image at a time writes: images of one picture (their
-originals, captures, copies and gallery link meet:
-app.workers.mask_pipeline) wait for each other in work-list order, and from
-its first write after its judgment to its commit an image holds the TURN,
-so the batch rows (counts, and the cursor: the last image to commit) and a
-mask two images share are written one image at a time, in the order the
-images get there. Each image is recorded as it ends, once its writes
-committed: a slow image keeps its own worker and no other. A stop, a
-scraper window, a failing gate or the circuit lets no further image start
-or onto the GPU: the images past the GPU finish, the others are let go
-unrecorded and come back first. Each image's stages are its own wall time,
-the pipeline's waits among them (``claim``, ``gpu_wait``, ``turn_wait``);
-the chunk's ``throughput_seconds_per_image`` is its wall time over the
-images it minted (an 'already' one, a lookup, is left out, as in the
-seconds per image). At most ``--decode-slots`` copies (default three) are
-decoded for the model at once, whatever the writers, and an original over
-4000x3000 counts for a slot per 4000x3000 begun (the memory bound). The database pool keeps a
-connection for every worker and the batch and lends none past them, and
-each bucket client keeps one for every worker and read-ahead: no connection
-is closed while the run lasts (a close kills the kubectl port-forward the
-live run reaches its database through). ``--writers 0`` runs one image at a
-time on the driver's own session, chunk after chunk.
+judgment, its uploads and rows) overlaps another's model run, and an image's
+original and clean copy upload beside its seed's SQL (both land before its
+rows commit). The pipeline ROLLS across chunks: a chunk is its batch row,
+its gate and its report, not a barrier, so the next chunk's images start
+while the one before still has images in flight (its gate is read on the
+driver's thread, no model call running meanwhile), and a chunk reports once
+its last image ended (one held up by a slow image after the next). Each
+image's own work runs in the same order as before, and what it writes is
+what one image at a time writes: images of one picture (their originals,
+captures, copies and gallery link meet: app.workers.mask_pipeline) wait for
+each other in work-list order, and from its first write after its judgment
+to its commit an image holds the TURN, so the batch rows (counts, and the
+cursor: the last image to commit) and a mask two images share are written
+one image at a time, in the order the images get there. Each image is
+recorded as it ends, once its writes committed: a slow image keeps its own
+worker and no other. A stop, a scraper window, a failing gate or the
+circuit lets no further image start or onto the GPU: the images past the
+GPU finish, the others are let go unrecorded and come back first. Each
+image's stages are its own wall time, the pipeline's waits among them
+(``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
+``throughput_seconds_per_image`` is its wall time over the images it minted
+(an 'already' one, a lookup, is left out, as in the seconds per image). At
+most ``--decode-slots`` copies (default three) are decoded for the model at
+once, whatever the writers, and an original over 4000x3000 takes a slot per
+4000x3000 begun (the memory bound). The database pool keeps a connection
+for every worker and the batch and lends none past them, and each bucket
+client keeps one for every PUT the workers have in flight (two each) and
+every original read ahead: no connection is closed while the run lasts (a
+close kills the kubectl port-forward the live run reaches its database
+through). ``--writers 0`` runs one image at a time on the driver's own
+session, chunk after chunk.
 
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
@@ -1330,9 +1333,6 @@ class _ImageLane:
         left it."""
         if self._turned:
             return
-        witness = self._db.info.get("witness")
-        if witness is not None:
-            witness.flush()  # its PUTs land before it takes the turn, not while holding it
         with self._timings.stage("turn_wait"):
             self._run.flow.turn.acquire()
         self._turned = True
