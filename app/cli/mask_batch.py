@@ -894,14 +894,22 @@ class _Witness:
     """The media bucket as one image's lane sees it, keeping the last error
     it raised (the lane records only its class: a 503 and a 403 are both
     ``ClientError`` there). With ``timings``, each PUT is an "upload" and
-    each GET a "readback", inside whichever stage made it (the seed's too)."""
+    each GET a "readback", inside whichever stage made it (the seed's too).
+    ``beside`` an executor (MASK-PERF-3, pipelined: the seed's original and
+    clean copy) a PUT runs on it, beside whatever the image does next, and
+    ``flush`` waits for them -- before its session commits
+    (``_WorkerSession``) and before any GET -- so its objects still land
+    before its rows; that wait is its "upload"."""
 
     def __init__(self, store: ObjectStore, timings: StageTimings | None = None) -> None:
         self._store = store
         self._timings = timings
         self.error: Exception | None = None
+        self._uploads: ThreadPoolExecutor | None = None
+        self._pending: list[Future[None]] = []
 
     def get(self, key: str) -> bytes:
+        self.flush()
         try:
             with timed(self._timings, "readback"):
                 return self._store.get(key)
@@ -910,12 +918,50 @@ class _Witness:
             raise
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
+        if self._uploads is not None:
+            self._pending.append(self._uploads.submit(self._store.put, key, data, content_type))
+            return
         try:
             with timed(self._timings, "upload"):
                 self._store.put(key, data, content_type)
         except Exception as exc:
             self.error = exc
             raise
+
+    @contextlib.contextmanager
+    def beside(self, uploads: ThreadPoolExecutor | None) -> Iterator[None]:
+        """Meanwhile each PUT runs on ``uploads`` (None: in turn, as ever)."""
+        self._uploads = uploads
+        try:
+            yield
+        finally:
+            self._uploads = None
+
+    def flush(self) -> None:
+        """Wait for every PUT in flight; the first of them that failed raises."""
+        pending, self._pending = self._pending, []
+        if not pending:
+            return
+        failed: BaseException | None = None
+        with timed(self._timings, "upload"):
+            for future in pending:
+                exc = future.exception()
+                failed = failed or exc
+        if isinstance(failed, Exception):
+            self.error = failed
+        if failed is not None:
+            raise failed
+
+
+class _WorkerSession(Session):
+    """A pipeline worker's session: the PUTs its image has in flight
+    (``info["witness"]``, a ``_Witness``) land before any commit."""
+
+    def commit(self) -> None:
+        witness = self.info.get("witness")
+        if witness is not None:
+            witness.flush()
+        super().commit()
 
 
 def _decode(stored: bytes, codec: str) -> bytes:
@@ -979,6 +1025,7 @@ def _mint(
         return raised(where, exc)
 
     media = _Witness(rt.media_store, timings)
+    db.info["witness"] = media
     try:
         if lane is not None:
             lane.claim(db)  # its footprint read, and the related images it waits for
@@ -1005,7 +1052,8 @@ def _mint(
     if lane is not None:
         lane.before_seed()  # held: nothing of it written, a rerun takes it
     try:
-        with timed(timings, "seed"):
+        # pipelined, its original's and its copy's PUTs run beside its SQL
+        with timed(timings, "seed"), media.beside(lane.uploads if lane is not None else None):
             clean = seed_clean_image(
                 db,
                 media,
@@ -1015,7 +1063,12 @@ def _mint(
             )
         clean_sha = clean.sha256
     except Exception as exc:
-        return rolled_back("seed", exc)
+        cause = exc
+        try:
+            media.flush()  # a PUT made before the error failed first: it is the cause
+        except Exception as put_failed:
+            cause = put_failed
+        return rolled_back("seed", cause)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
     try:
@@ -1164,6 +1217,8 @@ class _Flow:
     claims: Claims = field(default_factory=Claims)
     hold: threading.Event = field(default_factory=threading.Event)
     turn: threading.Lock = field(default_factory=threading.Lock)
+    #: the seeds' PUTs, beside their SQL: two an image (its original and copy)
+    uploads: ThreadPoolExecutor | None = None
 
     def __post_init__(self) -> None:
         self.slots = Slots(self.size)
@@ -1219,6 +1274,7 @@ class _ImageLane:
         timings.add("claim", fetched.keys_seconds)  # its picture keys, read ahead
         self.ahead = fetched.keys_seconds
         self.fetch_seconds = fetched.fetch_seconds
+        self.uploads = run.flow.uploads
 
     def claim(self, db: Session) -> None:
         """Before the image's first query: read its footprint, register it in
@@ -1274,6 +1330,9 @@ class _ImageLane:
         left it."""
         if self._turned:
             return
+        witness = self._db.info.get("witness")
+        if witness is not None:
+            witness.flush()  # its PUTs land before it takes the turn, not while holding it
         with self._timings.stage("turn_wait"):
             self._run.flow.turn.acquire()
         self._turned = True
@@ -1335,6 +1394,7 @@ class _Pipeline:
         order."""
         writers, prefetch, size = self.config.writers, self.config.prefetch, self.config.chunk_size
         flow = _Flow(events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots)
+        flow.uploads = ThreadPoolExecutor(max_workers=2 * writers, thread_name_prefix="mask-upload")
         gpu = on_the_gpu(self.backend, flow.submit)
         pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
         ahead: dict[str, Future[_Fetched]] = {}
@@ -1443,6 +1503,7 @@ class _Pipeline:
             pool.shutdown(wait=True, cancel_futures=True)
             for worker in workers:
                 worker.join()
+            flow.uploads.shutdown(wait=True)
             for run in runs:  # not closed: the batch broke off
                 run.sampler.__exit__(None, None, None)
         if failure is not None:
@@ -1693,7 +1754,10 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
             return 2
         # each worker's session as the batch's own is, on its engine
         sessions = sessionmaker(
-            bind=db.get_bind(), autoflush=db.autoflush, expire_on_commit=db.expire_on_commit
+            bind=db.get_bind(),
+            class_=_WorkerSession,
+            autoflush=db.autoflush,
+            expire_on_commit=db.expire_on_commit,
         )
     totals: dict[str, int] = {}
     tally = _Tally(config.max_consecutive_failures)
@@ -1948,6 +2012,14 @@ BUCKET_CONFIG: dict[str, Any] = {
 }
 
 
+def bucket_connections(writers: int, prefetch: int) -> int:
+    """The connections each bucket client keeps: one for each PUT in flight
+    (an image's original and copy at once, MASK-PERF-3) and each original
+    read ahead. botocore keeps 10 and closes any it lent past them when it
+    comes back: a new TCP and TLS connect, 0.5 s live, per PUT past them."""
+    return max(10, 2 * writers + prefetch)
+
+
 def _media_store(connections: int) -> ObjectStore:
     """The media bucket (S3_*), its client keeping ``connections`` (``_run``)."""
     from ..s3 import s3_client
@@ -2051,9 +2123,7 @@ def _run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         from .masks import open_stores
 
-        # a bucket connection for every worker and read-ahead: botocore keeps 10
-        # and closes any it lent past them when it comes back
-        connections = max(10, args.writers + args.prefetch)
+        connections = bucket_connections(args.writers, args.prefetch)
         raw_store = _raw_store(args, connections)
         opened, bucket = open_stores(args.sandbox)
         if args.sandbox is None:

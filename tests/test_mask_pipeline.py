@@ -36,7 +36,7 @@ import pytest
 from app.cli import mask_batch as mb
 from app.models import Base, FigureGallery, ImageMask, ImageVersion, MaskBatch, PublicObject
 from app.models import Image as ImageModel
-from app.object_store import LocalObjectStore
+from app.object_store import LocalObjectStore, derived_key
 from app.workers import mask_job, mask_seed
 from app.workers import mask_pipeline as mp
 from app.workers.mask_policy import ImageOrigin
@@ -528,6 +528,78 @@ def test_the_next_images_io_overlaps_the_model(tmp_path: Path) -> None:
     engine.dispose()
 
 
+class _Overlapping(_Counted):
+    """A media bucket whose PUTs each take ``cost`` seconds, counting how
+    many are in flight at once (and the most)."""
+
+    def __init__(self, root: Path, cost: float) -> None:
+        super().__init__(root, put_cost=cost)
+        self.in_flight = 0
+        self.most = 0
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        with self.lock:
+            self.in_flight += 1
+            self.most = max(self.most, self.in_flight)
+        try:
+            super().put(key, data, content_type)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_commits(
+    tmp_path: Path,
+) -> None:
+    """MASK-PERF-3: pipelined, an image's PUTs run beside its own work (its
+    original's and its clean copy's beside each other and its seed's SQL),
+    and every one of them has landed before any commit of its rows: one
+    writer, so whatever is in flight at a commit is that image's."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n * 8, n) for n in range(1, 4)]
+    root = tmp_path / "run"
+    media = _Overlapping(root / "media", cost=0.3)
+    engine = _engine(tmp_path / "media.db")
+    driver = threading.get_ident()
+    at_commit: list[int] = []
+
+    @sa_event.listens_for(engine, "commit")
+    def _commit(conn: Any) -> None:
+        if threading.get_ident() != driver:
+            at_commit.append(media.in_flight)
+
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, _Shapes(), events, media=media)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=3, writers=1), rt) == 0
+    main.close()
+    engine.dispose()
+    assert media.most == 2  # an image's original and clean copy at once
+    assert len(at_commit) == 6 and set(at_commit) == {0}  # its seed's and its mask's
+    (chunk,) = (e for e in events if e["event"] == "chunk")
+    assert chunk["counts"] == {"ok": 3}
+
+
+def test_a_failed_upload_fails_its_image_before_any_of_its_rows_commit(tmp_path: Path) -> None:
+    """The bucket drops the clean copy's PUT: the image's seed commits
+    nothing (an outage: interrupted, retried by a plain rerun), whatever ran
+    beside the PUT meanwhile."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1)]
+    root = tmp_path / "run"
+    media = _Outage(root / "media", healthy=1)  # the original lands, the copy does not
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [], media=media)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, writers=1), rt) == 1
+    (record,) = (r for r in _lines(root / "progress.jsonl") if r["event"] == "item")
+    assert (record["status"], record["reason"]) == ("interrupted", "seed:ConnectionError")
+    with Session(engine) as db:
+        assert db.execute(select(ImageModel)).first() is None
+    main.close()
+    engine.dispose()
+
+
 def test_the_gpu_is_one_stream_on_the_drivers_thread(tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw", cost=0.01)
     items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 13)]
@@ -967,11 +1039,14 @@ def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_en
 def _slowed(
     tmp_path: Path, items: list[mb.WorkItem], raw: _Raw, slow: mb.WorkItem, config: mb.BatchConfig
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Engine]:
-    """``items`` run with ``slow``'s original PUT taking 2 s (a 10 s tail
-    live): its records, its events and its database."""
+    """``items`` run with ``slow``'s clean copy read back from the bucket in
+    2 s (a bucket call's tail: a 10 s upload live; a read, so no SQLite
+    write lock is held meanwhile): its records, its events and its database."""
     root = tmp_path / "run"
     media = _Counted(root / "media")
-    media.slow[slow.blob_sha256] = 2.0
+    original = LocalObjectStore.get(raw.store, slow.storage_key)
+    clean, mime = mask_seed._encode(mask_seed._picture(original), original)
+    media.slow[derived_key(hashlib.sha256(clean).hexdigest(), mime)] = 2.0
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
     events: list[dict[str, Any]] = []

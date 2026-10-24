@@ -3224,8 +3224,8 @@ def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """botocore keeps 10 connections and closes any it lent past them when it
-    comes back: the batch's clients keep one for every worker and every
-    original read ahead."""
+    comes back: the batch's clients keep one for every PUT a worker has in
+    flight and every original read ahead."""
     for name, value in (
         ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
         ("RAW_S3_BUCKET", "raw"),
@@ -3247,7 +3247,9 @@ def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
     argv = ["run", "--worklist", str(wl), "--device", "cpu", "--no-residential-check"]
     assert mb.main([*argv, "--writers", "12", "--prefetch", "6"]) == 0
     assert mb.main([*argv, "--writers", "0"]) == 0
-    assert seen == [(18, 18), (10, 10)]  # never fewer than botocore's own 10
+    # an image's original and copy PUT at once (MASK-PERF-3), never fewer than botocore's own 10
+    assert seen == [(2 * 12 + 6,) * 2, (10, 10)]
+    assert mb.bucket_connections(16, 4) == 36
 
 
 def test_the_batchs_bucket_clients_bound_a_stalled_request_and_retry_it(
