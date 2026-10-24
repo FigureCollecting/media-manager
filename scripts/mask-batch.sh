@@ -29,12 +29,15 @@
 #   MASK_BATCH_GPUS       docker --gpus value (default all; "none" runs without a GPU)
 #   MASK_BATCH_MEMORY     docker --memory. Default 8g on the GPU (one image at a time the run peaked
 #                         near 2.3 GB of RAM; the pipeline adds about 1.2-1.4 GB whatever --writers:
-#                         three copies decoded for the model at most, two originals read ahead, and
+#                         --decode-slots copies decoded for the model at most (three; an original
+#                         over 4000x3000 takes a slot per 4000x3000), two originals read ahead, and
 #                         two malloc arenas (MALLOC_ARENA_MAX=2) rather than one kept per worker:
 #                         simulated at 4000x3000, 0.9 GB one at a time, 2.1 GB at 4 writers, 2.2 GB
-#                         at 12); 10g when the model may run on the CPU (--device auto or cpu, or
-#                         MASK_BATCH_GPUS=none): BiRefNet + two IS-Net sessions on the CPU are
-#                         OOM-killed at 8g (exit 137 on the same image every rerun). 10g measured.
+#                         at 12; rolling (MASK-PERF-3), 2.6 GB at 16 writers with 3 slots and 2 read
+#                         ahead, 2.9 GB with 4 and 4); 10g when the model may run on the CPU
+#                         (--device auto or cpu, or MASK_BATCH_GPUS=none): BiRefNet + two IS-Net
+#                         sessions on the CPU are OOM-killed at 8g (exit 137 on the same image every
+#                         rerun). 10g measured.
 #   MASK_BATCH_APP_DIR    TESTS ONLY: mount this app/ over the image's /app/app
 set -euo pipefail
 

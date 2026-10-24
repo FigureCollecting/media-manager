@@ -1639,7 +1639,9 @@ def test_another_process_on_the_gpu_still_pauses_the_batch(
         ("--gpu-free-min-mib", "0"),  # would pass a full card
         ("--gpu-free-min-mib", "1023"),
         ("--writers", "-1"),
-        ("--writers", "17"),  # more sessions than the media db's pool lends
+        ("--writers", "24"),  # with the batch's own, more than 24 connections to the database
+        ("--decode-slots", "0"),
+        ("--decode-slots", "9"),  # ~0.55 GB each at 4000x3000
         ("--writers", "two"),
         ("--prefetch", "0"),
         ("--prefetch", "17"),  # originals held in memory
@@ -1672,6 +1674,9 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--gpu-free-min-mib", "1024", "gpu_free_min_mib", 1024),
         ("--writers", "0", "writers", 0),
         ("--writers", "16", "writers", 16),
+        ("--writers", "23", "writers", 23),
+        ("--decode-slots", "1", "decode_slots", 1),
+        ("--decode-slots", "8", "decode_slots", 8),
         ("--prefetch", "1", "prefetch", 1),
         ("--prefetch", "16", "prefetch", 16),
     ],
@@ -3219,8 +3224,8 @@ def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """botocore keeps 10 connections and closes any it lent past them when it
-    comes back: the batch's clients keep one for every worker and every
-    original read ahead."""
+    comes back: the batch's clients keep one for every PUT a worker has in
+    flight and every original read ahead."""
     for name, value in (
         ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
         ("RAW_S3_BUCKET", "raw"),
@@ -3242,7 +3247,39 @@ def test_the_buckets_keep_a_connection_for_every_worker_and_read_ahead(
     argv = ["run", "--worklist", str(wl), "--device", "cpu", "--no-residential-check"]
     assert mb.main([*argv, "--writers", "12", "--prefetch", "6"]) == 0
     assert mb.main([*argv, "--writers", "0"]) == 0
-    assert seen == [(18, 18), (10, 10)]  # never fewer than botocore's own 10
+    # an image's original and copy PUT at once (MASK-PERF-3), never fewer than botocore's own 10
+    assert seen == [(2 * 12 + 6,) * 2, (10, 10)]
+    assert mb.bucket_connections(16, 4) == 36
+
+
+def test_the_batchs_bucket_clients_bound_a_stalled_request_and_retry_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MASK-PERF-3: a request that stalls (a connection the home router
+    dropped, a hung PUT) is cut and retried, not waited on for botocore's
+    60 s twice over; idle connections are kept alive between chunks. The
+    API's own client keeps botocore's defaults."""
+    from app.s3 import s3_client
+
+    for name, value in (
+        ("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9"),
+        ("RAW_S3_BUCKET", "raw"),
+        ("RAW_S3_ACCESS_KEY", "k"),
+        ("RAW_S3_SECRET_KEY", "s"),
+    ):
+        monkeypatch.setenv(name, value)
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    raw = mb._raw_store(args, 12)
+    media = mb._media_store(12)
+    for store in (raw._store, media):  # type: ignore[attr-defined]
+        config = store._client.meta.config
+        assert config.max_pool_connections == 12
+        assert (config.connect_timeout, config.read_timeout) == (10, 30)
+        assert config.retries == {"mode": "standard", "total_max_attempts": 4}
+        assert config.tcp_keepalive is True
+    api = s3_client().meta.config
+    assert (api.connect_timeout, api.read_timeout, api.max_pool_connections) == (60, 60, 10)
+    assert not api.tcp_keepalive
 
 
 def test_recent_writes_are_safe_from_many_workers() -> None:

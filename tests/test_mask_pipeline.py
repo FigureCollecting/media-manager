@@ -36,7 +36,7 @@ import pytest
 from app.cli import mask_batch as mb
 from app.models import Base, FigureGallery, ImageMask, ImageVersion, MaskBatch, PublicObject
 from app.models import Image as ImageModel
-from app.object_store import LocalObjectStore
+from app.object_store import LocalObjectStore, derived_key
 from app.workers import mask_job, mask_seed
 from app.workers import mask_pipeline as mp
 from app.workers.mask_policy import ImageOrigin
@@ -408,6 +408,45 @@ def _run(
     return outcome
 
 
+def _unordered(outcome: dict[str, Any]) -> dict[str, Any]:
+    """``outcome`` with what the order the images END in may change made
+    order-free (MASK-PERF-3: each image is recorded, and writes its chunk's
+    batch row, as it ends; each chunk reports as its last image ends): the
+    records and events sorted, each chunk's ranks and
+    failures sorted, each batch row's cursor checked to be the copy of one of
+    its own images and dropped, and its UPDATEs by the running total they
+    wrote (one image each: no update lost)."""
+
+    def chunked(line: dict[str, Any]) -> dict[str, Any]:
+        if line["event"] != "chunk":
+            return line
+        failures = sorted(line["failures"], key=lambda f: f["blob_sha256"])
+        return {**line, "ranks": sorted(line["ranks"]), "failures": failures}
+
+    def key(line: dict[str, Any]) -> tuple[str, str]:
+        return (line["event"], json.dumps(line, sort_keys=True, default=str))
+
+    progress = [chunked(line) for line in outcome["progress"]]
+    tables = dict(outcome["tables"])
+    masks = [json.loads(r) for r in tables["image_masks"]]
+    batches = []
+    for row in (json.loads(r) for r in tables["mask_batches"]):
+        mine = {m["source_sha256"] for m in masks if m["batch_id"] == row["id"]}
+        assert row.pop("cursor_sha256") in mine | ({None} if not mine else set())
+        batches.append(json.dumps(row, sort_keys=True))
+    tables["mask_batches"] = sorted(batches)
+    return {
+        **outcome,
+        "tables": tables,
+        "progress": sorted(progress, key=key),
+        "events": sorted((chunked(e) for e in outcome["events"]), key=key),
+        "batch_row": sorted(
+            (params[-1], sum(json.loads(params[1]).values()))
+            for _statement, params in outcome["batch_row"]
+        ),
+    }
+
+
 # --------------------------------------------------------------------------
 # the pipeline writes what one image at a time writes
 # --------------------------------------------------------------------------
@@ -426,7 +465,7 @@ def test_the_pipeline_writes_what_one_image_at_a_time_writes(tmp_path: Path) -> 
     for attempt in range(3):  # three runs: three interleavings
         config = mb.BatchConfig(chunk_size=4, writers=4)
         piped = _run(tmp_path, f"piped{attempt}", items, raw, config, faults=True)
-        assert piped == alone
+        assert _unordered(piped) == _unordered(alone)
 
 
 def test_a_rerun_after_the_pipeline_is_idempotent_and_reads_no_original_again(
@@ -490,6 +529,96 @@ def test_the_next_images_io_overlaps_the_model(tmp_path: Path) -> None:
     engine.dispose()
 
 
+class _Overlapping(_Counted):
+    """A media bucket counting the PUTs in flight at once (and the most),
+    where an original's PUT lasts until another PUT starts (5 s at most)."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.in_flight = 0
+        self.most = 0
+        self.started = 0
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        with self.lock:
+            self.in_flight += 1
+            self.most = max(self.most, self.in_flight)
+            self.started += 1
+            mine = self.started
+        try:
+            deadline = time.monotonic() + 5
+            while not key.startswith("derived/") and time.monotonic() < deadline:
+                with self.lock:
+                    if self.started > mine:
+                        break
+                time.sleep(0.01)
+            super().put(key, data, content_type)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_commits(
+    tmp_path: Path,
+) -> None:
+    """MASK-PERF-3: pipelined, an image's PUTs run beside its own work (its
+    original's and its clean copy's beside each other and its seed's SQL),
+    and every one of them has landed before any commit of its rows: one
+    writer, so whatever is in flight at a commit is that image's."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n * 8, n) for n in range(1, 4)]
+    root = tmp_path / "run"
+    media = _Overlapping(root / "media")
+    engine = _engine(tmp_path / "media.db")
+    driver = threading.get_ident()
+    at_commit: list[int] = []
+
+    @sa_event.listens_for(engine, "commit")
+    def _commit(conn: Any) -> None:
+        if threading.get_ident() != driver:
+            at_commit.append(media.in_flight)
+
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, _Shapes(), events, media=media)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=3, writers=1), rt) == 0
+    main.close()
+    engine.dispose()
+    assert media.most == 2  # an image's original and clean copy at once
+    assert len(at_commit) == 6 and set(at_commit) == {0}  # its seed's and its mask's
+    (chunk,) = (e for e in events if e["event"] == "chunk")
+    assert chunk["counts"] == {"ok": 3}
+
+
+class _CopyDropped(_Counted):
+    """The bucket's connection drops on every clean copy's PUT."""
+
+    def put(self, key: str, data: bytes, content_type: str) -> None:
+        if key.startswith("derived/") and content_type != "image/png":
+            raise ConnectionError("connection reset by peer")
+        super().put(key, data, content_type)
+
+
+def test_a_failed_upload_fails_its_image_before_any_of_its_rows_commit(tmp_path: Path) -> None:
+    """The bucket drops the clean copy's PUT: the image's seed commits
+    nothing (an outage: interrupted, retried by a plain rerun), whatever ran
+    beside the PUT meanwhile."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1)]
+    root = tmp_path / "run"
+    media = _CopyDropped(root / "media")  # the original lands, the copy does not
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [], media=media)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=1, writers=1), rt) == 1
+    (record,) = (r for r in _lines(root / "progress.jsonl") if r["event"] == "item")
+    assert (record["status"], record["reason"]) == ("interrupted", "seed:ConnectionError")
+    with Session(engine) as db:
+        assert db.execute(select(ImageModel)).first() is None
+    main.close()
+    engine.dispose()
+
+
 def test_the_gpu_is_one_stream_on_the_drivers_thread(tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw", cost=0.01)
     items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 13)]
@@ -537,13 +666,14 @@ def test_images_in_flight_and_read_ahead_are_bounded(
     assert len(raw.store.gets) == 14
 
 
-def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("slots", [None, 5])
+def test_no_more_copies_than_the_decode_slots_are_decoded_for_the_model_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slots: int | None
 ) -> None:
     """An image's decoded copy is held from its decode, through its wait for
-    the GPU, to its mask: whatever the writers, only the one on the GPU and
-    two waiting are decoded at once, so a chunk's memory stays near one
-    image at a time's (MASK-PERF-2 at 4000x3000: ~0.55 GB each)."""
+    the GPU, to its mask: whatever the writers, only ``decode_slots`` copies
+    are decoded at once (default three: the one on the GPU and two waiting),
+    so the memory stays bounded (MASK-PERF-2 at 4000x3000: ~0.55 GB each)."""
     lock = threading.Lock()
     decoded = [0, 0]  # now, most
     real = mask_job.build_mask_artifact
@@ -564,18 +694,71 @@ def test_no_more_than_three_copies_are_decoded_for_the_model_at_once(
     def first_holds_the_gpu(width: int) -> None:
         if not first:
             first.append(True)
-            time.sleep(0.5)  # every other image is ready for the GPU meanwhile
+            deadline = time.monotonic() + 5  # every other image gets ready for the GPU meanwhile
+            while decoded[1] < (slots or 3) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)  # and one more would decode now, were a slot free
 
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 2 * 8, n) for n in range(1, 13)]
     engine = _engine(tmp_path / "media.db", pool_size=9)
     config = mb.BatchConfig(chunk_size=12, writers=8)
+    if slots is not None:
+        config.decode_slots = slots
     backend = _Shapes(gate=first_holds_the_gpu)
     outcome = _run(tmp_path, "run", items, raw, config, backend=backend, engine=engine)
     assert outcome["exit"] == 0
     assert [r["status"] for r in outcome["progress"] if r["event"] == "item"] == ["ok"] * 12
-    assert decoded[1] == 3
-    assert mb.DECODED_AT_ONCE == 3
+    assert decoded[1] == (slots or 3)
+    assert mb.DECODED_AT_ONCE == mb.BatchConfig().decode_slots == 3
+
+
+def test_a_big_original_takes_the_decode_slots_of_its_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MASK-PERF-3's memory guard: an original over ``DECODE_UNIT_PIXELS``
+    takes a slot per unit of its size (up to every slot), so while a big
+    copy waits for the GPU no other copy is decoded beside it."""
+    monkeypatch.setattr(mb, "DECODE_UNIT_PIXELS", 100 * H)  # a 100-px-wide photo: one unit
+    lock = threading.Lock()
+    decoded = [0]
+    beside_the_big_one: list[int] = []
+    real = mask_job.build_mask_artifact
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            decoded[0] += 1
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                decoded[0] -= 1
+
+    monkeypatch.setattr(mask_job, "build_mask_artifact", counted)
+
+    def the_big_one_holds_the_gpu(width: int) -> None:
+        if width == 300:
+            time.sleep(0.5)  # every other image is ready for the GPU meanwhile
+            beside_the_big_one.append(decoded[0])
+
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(300, 1), *(raw.add(100 + n % 2 * 8, n) for n in range(2, 8))]
+    config = mb.BatchConfig(chunk_size=7, writers=6, decode_slots=3)
+    backend = _Shapes(gate=the_big_one_holds_the_gpu)
+    engine = _engine(tmp_path / "media.db", pool_size=7)
+    outcome = _run(tmp_path, "run", items, raw, config, backend=backend, engine=engine)
+    assert [r["status"] for r in outcome["progress"] if r["event"] == "item"] == ["ok"] * 7
+    assert beside_the_big_one == [1]  # three units of three: it alone
+
+
+def test_decode_units_are_the_originals_size_in_units_up_to_every_slot() -> None:
+    unit = mb.DECODE_UNIT_PIXELS
+    assert unit == 4000 * 3000  # the size the 0.55 GB peak was measured at
+    assert mb._decode_units(None, 4) == 1  # unknown (it fails before its decode)
+    assert mb._decode_units(unit, 4) == 1
+    assert mb._decode_units(unit + 1, 4) == 2
+    assert mb._decode_units(64_000_000, 8) == 6  # the largest original the limits let in
+    assert mb._decode_units(64_000_000, 3) == 3  # alone, every slot its own
 
 
 def test_a_model_call_that_raises_still_gives_its_decode_slot_back(tmp_path: Path) -> None:
@@ -623,6 +806,36 @@ def test_decode_slots_go_to_the_earliest_image_waiting() -> None:
     two.acquire(7)
     two.acquire(9)  # a second slot: no wait
     assert two.waiting() == 0
+
+
+def test_a_slot_of_several_units_waits_for_them_and_holds_back_later_images() -> None:
+    """The earliest image waiting is served first, however many units it
+    takes: a big one is not passed over for good by small ones behind it."""
+    slots = mp.Slots(3)
+    slots.acquire(0, 2)
+    order: list[int] = []
+
+    def take(index: int, units: int) -> None:
+        slots.acquire(index, units)
+        order.append(index)
+
+    big = threading.Thread(target=take, args=(1, 3))
+    big.start()
+    deadline = time.monotonic() + 5
+    while slots.waiting() < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    small = threading.Thread(target=take, args=(2, 1))  # one unit is free: still it waits
+    small.start()
+    while slots.waiting() < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    assert order == []
+    slots.release(2)
+    big.join(5)
+    assert order == [1]
+    slots.release(3)
+    small.join(5)
+    assert order == [1, 2]
 
 
 # --------------------------------------------------------------------------
@@ -797,40 +1010,241 @@ def test_the_batch_row_is_read_again_after_an_images_write_rolls_back(tmp_path: 
     assert statuses == ["ok", "interrupted", "ok"]
     (row,) = (json.loads(r) for r in alone["tables"]["mask_batches"])
     assert row["counts"]["ok"] == 2
-    assert piped == alone
+    assert _unordered(piped) == _unordered(alone)
 
 
-def test_no_more_than_writers_images_start_past_the_last_one_recorded(
+def test_no_more_than_writers_images_are_in_flight_and_each_is_recorded_as_it_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Images that end early (here an unsupported codec: no row to write)
-    are not recorded before the image ahead of them: while it is held up no
-    further image starts, so an outage opens the circuit after at most
-    writers - 1 images more than one at a time would have tried."""
+    are recorded as they end and make way for the next while the image
+    ahead of them is held up (its copy's readback): never more than
+    ``writers`` in flight, every one of them unrecorded, so an outage opens
+    the circuit after at most writers - 1 images more than one at a time
+    would have tried, and a power cut loses at most ``writers`` records."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100, 1), *(raw.add(110 + n, n, codec="zstd") for n in range(2, 9))]
-    started: list[str] = []
+    lock = threading.Lock()
+    minting = [0, 0]  # now, most
     real_mint = mb._mint
 
     def counted_mint(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        started.append(args[1].blob_sha256)
-        return real_mint(*args, **kwargs)
+        with lock:
+            minting[0] += 1
+            minting[1] = max(minting[1], minting[0])
+        try:
+            return real_mint(*args, **kwargs)
+        finally:
+            with lock:
+                minting[0] -= 1
 
     monkeypatch.setattr(mb, "_mint", counted_mint)
-    while_held: list[int] = []
+    records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=8, writers=2), code=1
+    )
+    engine.dispose()
+    assert [r["status"] for r in records] == ["failed"] * 7 + ["ok"]
+    assert minting[1] == 2
 
-    def first_holds_the_gpu(width: int) -> None:
-        time.sleep(0.5)  # the image after it ends meanwhile
-        while_held.append(len(started))
 
-    config = mb.BatchConfig(chunk_size=8, writers=2)
-    backend = _Shapes(gate=first_holds_the_gpu)
-    outcome = _run(tmp_path, "run", items, raw, config, backend=backend)
-    assert outcome["exit"] == 1
-    statuses = [r["status"] for r in outcome["progress"] if r["event"] == "item"]
-    assert statuses == ["ok"] + ["failed"] * 7
-    assert while_held == [2]
-    assert len(started) == 8
+class _HeldBack(_Counted):
+    """A media bucket whose GET of ``key`` (an image's clean copy read
+    back: a bucket call's tail, a 10 s upload live; a read, so no SQLite
+    write lock is held meanwhile) lasts until ``until`` holds of the
+    progress file's lines, 10 s at most."""
+
+    def __init__(self, root: Path, key: str, until: Callable[[list[dict[str, Any]]], bool]) -> None:
+        super().__init__(root)
+        self.key, self.until, self.progress = key, until, root.parent / "progress.jsonl"
+
+    def get(self, key: str) -> bytes:
+        deadline = time.monotonic() + 10
+        while key == self.key and time.monotonic() < deadline:
+            if self.progress.exists() and self.until(_lines(self.progress)):
+                break
+            time.sleep(0.01)
+        return super().get(key)
+
+
+def _items_but_one(items: list[mb.WorkItem]) -> Callable[[list[dict[str, Any]]], bool]:
+    return lambda lines: sum(line["event"] == "item" for line in lines) >= len(items) - 1
+
+
+def _slowed(
+    tmp_path: Path,
+    items: list[mb.WorkItem],
+    raw: _Raw,
+    slow: mb.WorkItem,
+    config: mb.BatchConfig,
+    code: int = 0,
+    until: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Engine]:
+    """``items`` run with ``slow`` held up at its copy's readback until
+    ``until`` (by default, until every other image is recorded): its
+    records, its events and its database."""
+    root = tmp_path / "run"
+    original = LocalObjectStore.get(raw.store, slow.storage_key)
+    clean, mime = mask_seed._encode(mask_seed._picture(original), original)
+    key = derived_key(hashlib.sha256(clean).hexdigest(), mime)
+    media = _HeldBack(root / "media", key, until or _items_but_one(items))
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, _Shapes(), events, media=media)
+    assert mb.run_batch(items, config, rt) == code
+    main.close()
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    return records, events, engine
+
+
+def test_a_slow_image_holds_up_no_other_image(tmp_path: Path) -> None:
+    """MASK-PERF-3: an image whose upload is slow keeps its own worker only:
+    every other image ends, is recorded as it ends and makes way for the
+    next, so nothing waits for the slowest image in flight."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=6, writers=2)
+    )
+    assert [r["status"] for r in records] == ["ok"] * 6
+    assert records[-1]["blob_sha256"] == items[0].blob_sha256  # the slow one ends last
+    engine.dispose()
+
+
+def test_the_next_chunk_starts_before_the_slowest_image_of_the_one_before_ends(
+    tmp_path: Path,
+) -> None:
+    """No chunk barrier: a chunk is its batch row, its gate and its report;
+    the next one's images start while the one before still has one in
+    flight. Each chunk counts its own images and reports once its last one
+    ended, so one held up by a slow image reports after the next: a stuck
+    image keeps no later chunk's batch row open nor its VRAM sampler running."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    chunk_reported = lambda lines: any(line["event"] == "chunk" for line in lines)  # noqa: E731
+    config = mb.BatchConfig(chunk_size=3, writers=3)
+    records, events, engine = _slowed(tmp_path, items, raw, items[2], config, until=chunk_reported)
+    order = [r["blob_sha256"] for r in records]
+    assert order[-1] == items[2].blob_sha256  # the second chunk ended first
+    assert {r["chunk"] for r in records[:-1] if r["blob_sha256"] in order[3:]} == {2}
+    chunks = [e for e in events if e["event"] == "chunk"]
+    assert [(c["chunk"], c["count"]) for c in chunks] == [(2, 3), (1, 3)]
+    with Session(engine) as db:
+        rows = db.execute(select(MaskBatch).order_by(MaskBatch.id)).scalars().all()
+        assert [(sum(b.counts.values()), b.status) for b in rows] == [(3, "done"), (3, "done")]
+    engine.dispose()
+
+
+def test_the_gate_before_each_chunk_reads_the_gpu_with_no_model_call_running(
+    tmp_path: Path,
+) -> None:
+    """Rolling, the gate before the next chunk is read while the chunk before
+    still has images in flight: on the driver's thread, so no model call
+    runs from its settle to its last reading (the readings are another
+    consumer's alone, as when the chunk before had ended)."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    backend = _Shapes(cost=0.05)
+    running: list[int] = []
+
+    def settle(seconds: float) -> None:
+        running.append(backend.running)
+
+    gpu = mb.GpuGate(query=lambda: f"{backend.running}, 12000, 300, 12282", sleep=settle)
+    gates = mb.Gates(windows=(), gpu=gpu, residential=None, now=lambda: NOON)
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, backend, events, gates=gates)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=3), rt) == 0
+    chunks = [e for e in events if e["event"] == "chunk"]
+    assert [c["count"] for c in chunks] == [2, 2, 2]
+    assert running  # the settles and samples of the gates while the model was held
+    assert set(running) == {0}
+    assert "paused" not in [e["event"] for e in events]
+    main.close()
+    engine.dispose()
+
+
+def test_a_gate_that_fails_at_a_chunk_boundary_holds_the_pipeline_until_it_passes(
+    tmp_path: Path,
+) -> None:
+    """Another consumer takes the GPU while a chunk is in flight: the gate
+    before the next chunk fails, no image of it starts, the images not past
+    the GPU are let go, the model is released while the batch waits, and
+    once the gate passes the held images run first: every image once."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 7)]
+    busy = {"on": False}
+
+    def query() -> str:
+        return "1, 1000, 11500, 12282" if busy["on"] else "0, 2800, 9500, 12282"
+
+    measured = threading.Event()
+
+    class _Measured(mb.GpuGate):
+        def measure_own(self) -> None:
+            super().measure_own()
+            measured.set()
+
+    games: list[bool] = []
+
+    def the_game_starts(width: int) -> None:
+        if measured.is_set() and not games:  # once our model is measured, a game starts, once
+            games.append(True)
+            busy["on"] = True
+
+    def poll(seconds: float) -> None:
+        busy["on"] = False  # the game ends while the batch waits
+
+    class _Counting(_Shapes):
+        released = 0
+
+        def release(self) -> None:
+            self.released += 1
+
+    backend = _Counting(gate=the_game_starts)
+    gpu = _Measured(query=query, sleep=lambda seconds: None)
+    gates = mb.Gates(windows=(), gpu=gpu, residential=None, now=lambda: NOON)
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, backend, events, gates=gates, sleep=poll)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=2), rt) == 0
+    records = [r for r in _lines(root / "progress.jsonl") if r["event"] == "item"]
+    assert sorted(r["blob_sha256"] for r in records) == sorted(i.blob_sha256 for i in items)
+    assert {r["status"] for r in records} == {"ok"}
+    paused = [e for e in events if e["event"] == "paused"]
+    assert [e["gate"] for e in paused] == ["gpu"]
+    assert backend.released == 1
+    assert sum(e["count"] for e in events if e["event"] == "chunk") == 6
+    main.close()
+    engine.dispose()
+
+
+def test_a_put_that_failed_beside_the_seed_is_the_seeds_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PUT made before the seed broke off is what broke it, as when it ran
+    in turn: the bucket's outage (interrupted), not the error after it."""
+
+    def seed(db: Session, store: Any, data: bytes, **_: Any) -> Any:
+        store.put("aa/bb/original.png", data, "image/png")  # beside: it fails later
+        raise ValueError("a row the seed could not write")
+
+    monkeypatch.setattr(mb, "seed_clean_image", seed)
+    raw = _Raw(tmp_path / "raw")
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [], media=_Outage(root / "media", healthy=0))
+    assert mb.run_batch([raw.add(100, 1)], mb.BatchConfig(chunk_size=1, writers=1), rt) == 1
+    (record,) = (r for r in _lines(root / "progress.jsonl") if r["event"] == "item")
+    assert (record["status"], record["reason"]) == ("interrupted", "seed:ConnectionError")
+    main.close()
+    engine.dispose()
 
 
 def test_each_workers_sql_is_charged_to_its_own_images_db(
@@ -873,14 +1287,16 @@ def test_each_workers_sql_is_charged_to_its_own_images_db(
         assert timings.seconds["db"] >= statements[name] * cost
 
 
-def test_the_batch_rows_counts_and_cursor_are_one_image_at_a_times(tmp_path: Path) -> None:
+def test_the_batch_rows_counts_are_one_image_at_a_times(tmp_path: Path) -> None:
+    """Its cursor is the copy of the last of its images to commit (the order
+    they end in): one of its own images, as ``_unordered`` checks."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100 + n % 4, n) for n in range(1, 11)]  # ok, held, empty, crash, ...
     alone = _run(tmp_path, "alone", items, raw, mb.BatchConfig(chunk_size=10))
     engine = _engine(tmp_path / "piped.db", pool_size=7)  # a connection per worker and the batch
     config = mb.BatchConfig(chunk_size=10, writers=6)
     piped = _run(tmp_path, "piped", items, raw, config, engine=engine)
-    assert piped["tables"]["mask_batches"] == alone["tables"]["mask_batches"]
+    assert _unordered(piped)["tables"] == _unordered(alone)["tables"]
     (row,) = (json.loads(r) for r in piped["tables"]["mask_batches"])
     assert sum(row["counts"].values()) == 10
 
@@ -1343,23 +1759,36 @@ def test_a_claim_finished_after_the_snapshot_still_lends_its_keys() -> None:
     assert waits == [second] and third.keys == {"a", "b"}
 
 
-def test_turns_are_taken_in_order_whoever_ends_first() -> None:
-    turns = mp.Turns()
-    taken: list[int] = []
+def test_the_turn_is_one_image_at_a_time_in_the_order_they_get_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From its first write after its judgment to its end an image holds the
+    turn: no two images write at once, and an image behind a slow one in the
+    work list writes first."""
+    log: list[tuple[str, int]] = []
+    real_turn, real_close = mb._ImageLane.turn, mb._ImageLane.close
 
-    def take(index: int) -> None:
-        turns.take(index)
-        taken.append(index)
+    def turn(lane: Any) -> None:
+        taken = lane._turned
+        real_turn(lane)
+        if not taken:
+            log.append(("in", lane._index))
 
-    second = threading.Thread(target=take, args=(2,))
-    second.start()
-    turns.take(0)
-    turns.end(1)  # ended without writing
-    time.sleep(0.05)
-    assert taken == []
-    turns.end(0)
-    second.join(timeout=5)
-    assert taken == [2]
+    def close(lane: Any) -> None:
+        if lane._turned:
+            log.append(("out", lane._index))
+        real_close(lane)
+
+    monkeypatch.setattr(mb._ImageLane, "turn", turn)
+    monkeypatch.setattr(mb._ImageLane, "close", close)
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 6)]
+    _records, _events, engine = _slowed(
+        tmp_path, items, raw, items[0], mb.BatchConfig(chunk_size=5, writers=3)
+    )
+    engine.dispose()
+    assert [step for step, _index in log] == ["in", "out"] * 5  # never two at once
+    assert [index for _step, index in log[::2]][-1] == 0  # the slow first image writes last
 
 
 def test_a_gpu_job_runs_on_the_serving_thread_and_returns_its_answer_or_error() -> None:

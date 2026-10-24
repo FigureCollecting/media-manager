@@ -7,7 +7,7 @@
         [--busy-windows SPEC] [--residential-ip IP|CIDR | --no-residential-check]
         [--ip-echo-url URL] [--residential-ttl S] [--poll-seconds S]
         [--max-wait-seconds S] [--max-consecutive-failures N] [--raw-dir DIR]
-        [--writers N] [--prefetch N]
+        [--writers N] [--prefetch N] [--decode-slots N]
     python -m app.cli.mask_batch sql ross-heads --user UUID
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
@@ -66,30 +66,42 @@ add up to the seconds per image only when every image ran every stage. ``--dry-r
 reads the work list and the progress file, checks the gate once and prints the
 plan: no database, no bucket, no model, nothing written.
 
-THE PIPELINE (MASK-PERF-2). The images of a chunk run ``--writers`` at a
-time (default 4), each on a worker with a database session of its own, and
-the next ``--prefetch`` originals (default 2) are read, decoded and
-hash-checked ahead; the model runs on the driver's thread alone, one image
-at a time, so one image's I/O (its read, its seed, its judgment, its
-uploads and rows) overlaps another's model run. Each image's own work runs
-in the same order as before, and what it writes is what one image at a
-time writes: images of one picture (their originals, captures, copies and
-gallery link meet: app.workers.mask_pipeline) wait for each other in
-work-list order, and the batch row is written in that order. A record is
-written, in work-list order, once its image's writes committed. A stop, a
-scraper window or the circuit lets no further image start or onto the GPU:
-the images past the GPU finish, the others are let go unrecorded and come
-back first. Each image's stages are its own wall time, the pipeline's waits
-among them (``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
+THE PIPELINE (MASK-PERF-2, rolling since MASK-PERF-3). The images run
+``--writers`` at a time (default 4), each on a worker with a database
+session of its own, and the next ``--prefetch`` originals (default 2) are
+read, decoded and hash-checked ahead; the model runs on the driver's thread
+alone, one image at a time, so one image's I/O (its read, its seed, its
+judgment, its uploads and rows) overlaps another's model run, and an image's
+original and clean copy upload beside its seed's SQL (both land before its
+rows commit). The pipeline ROLLS across chunks: a chunk is its batch row,
+its gate and its report, not a barrier, so the next chunk's images start
+while the one before still has images in flight (its gate is read on the
+driver's thread, no model call running meanwhile), and a chunk reports once
+its last image ended (one held up by a slow image after the next). Each
+image's own work runs in the same order as before, and what it writes is
+what one image at a time writes: images of one picture (their originals,
+captures, copies and gallery link meet: app.workers.mask_pipeline) wait for
+each other in work-list order, and from its first write after its judgment
+to its commit an image holds the TURN, so the batch rows (counts, and the
+cursor: the last image to commit) and a mask two images share are written
+one image at a time, in the order the images get there. Each image is
+recorded as it ends, once its writes committed: a slow image keeps its own
+worker and no other. A stop, a scraper window, a failing gate or the
+circuit lets no further image start or onto the GPU: the images past the
+GPU finish, the others are let go unrecorded and come back first. Each
+image's stages are its own wall time, the pipeline's waits among them
+(``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
 ``throughput_seconds_per_image`` is its wall time over the images it minted
 (an 'already' one, a lookup, is left out, as in the seconds per image). At
-most three copies are decoded for the model at once, whatever the writers
-(the memory bound). The database pool keeps a connection for every worker
-and the batch and lends none past them, and each bucket client keeps one for
-every worker and read-ahead: no connection is closed while the run lasts (a
+most ``--decode-slots`` copies (default three) are decoded for the model at
+once, whatever the writers, and an original over 4000x3000 takes a slot per
+4000x3000 begun (the memory bound). The database pool keeps a connection
+for every worker and the batch and lends none past them, and each bucket
+client keeps one for every PUT the workers have in flight (two each) and
+every original read ahead: no connection is closed while the run lasts (a
 close kills the kubectl port-forward the live run reaches its database
 through). ``--writers 0`` runs one image at a time on the driver's own
-session.
+session, chunk after chunk.
 
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
@@ -105,7 +117,9 @@ import dataclasses
 import datetime as dt
 import functools
 import hashlib
+import io
 import ipaddress
+import itertools
 import json
 import math
 import os
@@ -126,6 +140,7 @@ from types import FrameType
 from typing import Any
 
 import httpx
+from PIL import Image as PILImage
 from sqlalchemy import Engine, create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
@@ -141,7 +156,7 @@ from ..workers.mask_job import (
     original_settled,
     settle_clean_copy,
 )
-from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Slots, Turns, on_the_gpu
+from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Slots, on_the_gpu
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import PictureKeys, picture_keys, seed_clean_image, seed_footprint
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
@@ -172,20 +187,31 @@ DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: database session (0: one image at a time, the driver's own session); the
 #: live chunk tunes it with ``--writers``. Simulated at the live costs: 5.5 s
 #: an image one at a time, 2.75 s with 2 writers, 1.78 s with 4, 1.21 s with 8,
-#: 1.05 s with 12. The command line's pool keeps writers + 1 connections and
-#: lends none past them (``_sized``)...
+#: 1.05 s with 12. MASK-PERF-3, rolling, on a simulator calibrated to the live
+#: chunks (1,363 images an hour at 8 writers before it, 1,319 measured live):
+#: 2,877 at 8, about 5,500 at 16 with 100-image chunks (3 or 4 decode slots, 2
+#: or 4 read ahead alike), 6,426 at 23 (the turn, ~6 round trips an image, is
+#: then the queue). The command
+#: line's pool keeps writers + 1 connections and lends none past them
+#: (``_sized``), so the most writers keep the run at 24 connections to the
+#: production database...
 DEFAULT_WRITERS = 4
-MAX_WRITERS = 16
+MAX_WRITERS = 23
 #: ...and the originals read, decoded and hash-checked ahead of them: two
 #: keep the next worker's ready, and each one read ahead is decoded once more
 #: (4000x3000: 2.6 GB peak at 4 writers with 2, 3.3 GB with 4, same speed).
 DEFAULT_PREFETCH = 2
 MAX_PREFETCH = 16
 #: The images whose copies are decoded for the model at once, whatever the
-#: writers: the one on the GPU and two waiting (app.workers.mask_pipeline.Slots).
-#: Each holds ~0.55 GB at its peak at 4000x3000, so a chunk's memory stays near
-#: one image at a time's.
+#: writers: by default the one on the GPU and two waiting
+#: (app.workers.mask_pipeline.Slots); ``--decode-slots`` sizes it to the memory
+#: budget. Each holds ~0.55 GB at its peak at 4000x3000...
 DECODED_AT_ONCE = 3
+MAX_DECODE_SLOTS = 8
+#: ...so an original over that size takes a slot per unit of it (MASK-PERF-3:
+#: the memory guard; the largest the image limits let in, 64 MP, takes six),
+#: up to every slot: it is then decoded alone.
+DECODE_UNIT_PIXELS = 4000 * 3000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -751,6 +777,7 @@ class BatchConfig:
     max_consecutive_failures: int = 5
     writers: int = 0
     prefetch: int = 4
+    decode_slots: int = DECODED_AT_ONCE
 
 
 @dataclass
@@ -875,14 +902,22 @@ class _Witness:
     """The media bucket as one image's lane sees it, keeping the last error
     it raised (the lane records only its class: a 503 and a 403 are both
     ``ClientError`` there). With ``timings``, each PUT is an "upload" and
-    each GET a "readback", inside whichever stage made it (the seed's too)."""
+    each GET a "readback", inside whichever stage made it (the seed's too).
+    ``beside`` an executor (MASK-PERF-3, pipelined: the seed's original and
+    clean copy) a PUT runs on it, beside whatever the image does next, and
+    ``flush`` waits for them -- before its session commits
+    (``_WorkerSession``) and before any GET -- so its objects still land
+    before its rows; that wait is its "upload"."""
 
     def __init__(self, store: ObjectStore, timings: StageTimings | None = None) -> None:
         self._store = store
         self._timings = timings
         self.error: Exception | None = None
+        self._uploads: ThreadPoolExecutor | None = None
+        self._pending: list[Future[None]] = []
 
     def get(self, key: str) -> bytes:
+        self.flush()
         try:
             with timed(self._timings, "readback"):
                 return self._store.get(key)
@@ -891,12 +926,50 @@ class _Witness:
             raise
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
+        if self._uploads is not None:
+            self._pending.append(self._uploads.submit(self._store.put, key, data, content_type))
+            return
         try:
             with timed(self._timings, "upload"):
                 self._store.put(key, data, content_type)
         except Exception as exc:
             self.error = exc
             raise
+
+    @contextlib.contextmanager
+    def beside(self, uploads: ThreadPoolExecutor | None) -> Iterator[None]:
+        """Meanwhile each PUT runs on ``uploads`` (None: in turn, as ever)."""
+        self._uploads = uploads
+        try:
+            yield
+        finally:
+            self._uploads = None
+
+    def flush(self) -> None:
+        """Wait for every PUT in flight; the first of them that failed raises."""
+        pending, self._pending = self._pending, []
+        if not pending:
+            return
+        failed: BaseException | None = None
+        with timed(self._timings, "upload"):
+            for future in pending:
+                exc = future.exception()
+                failed = failed or exc
+        if isinstance(failed, Exception):
+            self.error = failed
+        if failed is not None:
+            raise failed
+
+
+class _WorkerSession(Session):
+    """A pipeline worker's session: the PUTs its image has in flight
+    (``info["witness"]``, a ``_Witness``) land before any commit."""
+
+    def commit(self) -> None:
+        witness = self.info.get("witness")
+        if witness is not None:
+            witness.flush()
+        super().commit()
 
 
 def _decode(stored: bytes, codec: str) -> bytes:
@@ -960,6 +1033,7 @@ def _mint(
         return raised(where, exc)
 
     media = _Witness(rt.media_store, timings)
+    db.info["witness"] = media
     try:
         if lane is not None:
             lane.claim(db)  # its footprint read, and the related images it waits for
@@ -986,7 +1060,8 @@ def _mint(
     if lane is not None:
         lane.before_seed()  # held: nothing of it written, a rerun takes it
     try:
-        with timed(timings, "seed"):
+        # pipelined, its original's and its copy's PUTs run beside its SQL
+        with timed(timings, "seed"), media.beside(lane.uploads if lane is not None else None):
             clean = seed_clean_image(
                 db,
                 media,
@@ -996,7 +1071,12 @@ def _mint(
             )
         clean_sha = clean.sha256
     except Exception as exc:
-        return rolled_back("seed", exc)
+        cause = exc
+        try:
+            media.flush()  # a PUT made before the error failed first: it is the cause
+        except Exception as put_failed:
+            cause = put_failed
+        return rolled_back("seed", cause)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
     try:
@@ -1043,6 +1123,8 @@ class _Fetched:
     keys: PictureKeys | None = None
     fetch_seconds: float = 0.0
     keys_seconds: float = 0.0
+    #: its width x height from its header (None: it would not open)
+    pixels: int | None = None
 
 
 def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
@@ -1058,17 +1140,29 @@ def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
     except Exception as exc:
         return _Fetched(error=exc, fetch_seconds=rt.monotonic() - start)
     fetched = rt.monotonic()
-    keys = None
+    keys = pixels = None
     if hashlib.sha256(data).hexdigest() == item.blob_sha256:
         # a picture that will not decode fails the seed before it writes a row
         with contextlib.suppress(Exception):
             keys = picture_keys(data)
+        with contextlib.suppress(Exception), PILImage.open(io.BytesIO(data)) as header:
+            pixels = header.width * header.height
     return _Fetched(
         data=data,
         keys=keys,
         fetch_seconds=fetched - start,
         keys_seconds=rt.monotonic() - fetched,
+        pixels=pixels,
     )
+
+
+def _decode_units(pixels: int | None, slots: int) -> int:
+    """The decode slots an original of ``pixels`` takes: one per
+    ``DECODE_UNIT_PIXELS`` begun, up to every slot (it is then decoded
+    alone); one when its size is unknown (it fails before its decode)."""
+    if pixels is None:
+        return 1
+    return max(1, min(slots, -(-pixels // DECODE_UNIT_PIXELS)))
 
 
 class _BatchRow:
@@ -1114,27 +1208,57 @@ class _Done:
 
 
 @dataclass(eq=False)
-class _ChunkRun:
-    """What one chunk's workers share: the claims, the turns, the batch row,
-    the hold, the decode slots, and the queue to the driver's thread (a GPU job or an image
-    done; at most one of either per worker, so never more than ``writers``)."""
+class _Flow:
+    """What every image in flight shares, whichever chunk it is of (the
+    pipeline rolls across chunk boundaries, MASK-PERF-3): the queue to the
+    driver's thread (a GPU job or an image done; at most one of either per
+    worker, so never more than ``writers``), the claims, the hold, the
+    decode slots, and the TURN: the lock an image holds from its first write
+    after its judgment (a mask registered, or its row and its chunk's batch
+    row) to its commit, so the batch rows and a mask two images share are
+    written by one image at a time, in the order the images get there."""
 
-    batch: MaskBatch
     events: queue.Queue[GpuJob | _Done]
+    #: the decode slots, ``size`` units
+    size: int
+    slots: Slots = field(init=False)
     claims: Claims = field(default_factory=Claims)
-    turns: Turns = field(default_factory=Turns)
     hold: threading.Event = field(default_factory=threading.Event)
-    slots: Slots = field(default_factory=lambda: Slots(DECODED_AT_ONCE))
-    row: _BatchRow = field(init=False)
+    turn: threading.Lock = field(default_factory=threading.Lock)
+    #: the seeds' PUTs, beside their SQL: two an image (its original and copy)
+    uploads: ThreadPoolExecutor | None = None
 
     def __post_init__(self) -> None:
-        self.row = _BatchRow(self.batch)
+        self.slots = Slots(self.size)
 
     def submit(self, call: Callable[[], Any]) -> Any:
         """Run ``call`` (a model call) on the driver's thread, and wait."""
         job = GpuJob(call)
         self.events.put(job)
         return job.wait()
+
+
+@dataclass(eq=False)
+class _ChunkRun:
+    """One chunk in flight: its record and batch row (the row as the last
+    image to write it left it), its VRAM sampler, and its images started
+    and ended. ``full``: no further image of it starts."""
+
+    flow: _Flow
+    chunk: _Chunk
+    batch: MaskBatch
+    sampler: Any
+    row: _BatchRow = field(init=False)
+    started: int = 0
+    ended: int = 0
+    full: bool = False
+
+    def __post_init__(self) -> None:
+        self.row = _BatchRow(self.batch)
+
+    @property
+    def complete(self) -> bool:
+        return self.full and self.ended == self.started
 
 
 class _ImageLane:
@@ -1158,13 +1282,14 @@ class _ImageLane:
         timings.add("claim", fetched.keys_seconds)  # its picture keys, read ahead
         self.ahead = fetched.keys_seconds
         self.fetch_seconds = fetched.fetch_seconds
+        self.uploads = run.flow.uploads
 
     def claim(self, db: Session) -> None:
         """Before the image's first query: read its footprint, register it in
         work-list order and wait for every earlier image it meets."""
         self.before_seed()  # held before it began: not even a query
         with self._timings.stage("claim"):
-            since = self._run.claims.snapshot()
+            since = self._run.flow.claims.snapshot()
             shas, digests = {self._item.blob_sha256}, set()
             keys = self._fetched.keys
             if keys is not None:
@@ -1174,11 +1299,11 @@ class _ImageLane:
                 footprint = seed_footprint(db, shas=shas, digests=digests)
             except BaseException:
                 self._registered = True
-                self._run.claims.skip(self._index)
+                self._run.flow.claims.skip(self._index)
                 raise
             # the seed reads its gallery link by the product and the URL
             footprint.add(f"gallery {self._item.product_id} {self._item.url or ''}")
-            self._claim, waits = self._run.claims.register(self._index, footprint, since)
+            self._claim, waits = self._run.flow.claims.register(self._index, footprint, since)
             self._registered = True
         with self._timings.stage("turn_wait"):
             for earlier in waits:
@@ -1192,52 +1317,57 @@ class _ImageLane:
         return self._fetched.data
 
     def before_seed(self) -> None:
-        if self._run.hold.is_set():
+        if self._run.flow.hold.is_set():
             raise Held
 
     @contextlib.contextmanager
     def decoded(self) -> Iterator[None]:
         """Its copy decoded for the model, a slot held meanwhile: the wait
         for one is a wait for the GPU."""
+        units = _decode_units(self._fetched.pixels, self._run.flow.size)
         with self._timings.stage("gpu_wait"):
-            self._run.slots.acquire(self._index)
+            self._run.flow.slots.acquire(self._index, units)
         try:
             yield
         finally:
-            self._run.slots.release()
+            self._run.flow.slots.release(units)
 
     def turn(self) -> None:
-        """Before the image's batch-row writes: once every image before it
-        has ended; the row as the last of them left it."""
+        """Before the image's first write after its judgment: the turn, held
+        to its end (``close``); its chunk's row as the last image to write it
+        left it."""
         if self._turned:
             return
         with self._timings.stage("turn_wait"):
-            self._run.turns.take(self._index)
+            self._run.flow.turn.acquire()
         self._turned = True
         self._run.row.lend(self._db, self._batch)
 
     def close(self) -> None:
         """The image ended (recorded, held or broken): whoever waits goes on."""
         if not self._registered:
-            self._run.claims.skip(self._index)
+            self._run.flow.claims.skip(self._index)
         if self._turned:
             self._run.row.keep(self._batch)
+            self._run.flow.turn.release()
         if self._claim is not None:
-            self._run.claims.finish(self._claim)
-        self._run.turns.end(self._index)
+            self._run.flow.claims.finish(self._claim)
 
 
 class _Pipeline:
-    """A chunk's images, ``writers`` at a time (each on a worker thread with
+    """The work, ``writers`` images at a time (each on a worker thread with
     a session of its own, ``_mint`` as ever), ``prefetch`` originals read
-    ahead, the model on the driver's thread alone. Records are taken in
-    work-list order, each once its image's writes committed. A stop, a scraper
-    window or the circuit HOLDS the chunk: no further image starts or gets
-    onto the GPU; the images already past the GPU finish, the others are let
-    go unrecorded (``Held``) and come back first for the next chunk. At most
-    ``writers`` images are under way past the last one recorded, so an outage
-    opens the circuit after at most ``writers`` - 1 images more than one at a
-    time would have tried."""
+    ahead, the model on the driver's thread alone (MASK-PERF-2), ROLLING
+    across chunks (MASK-PERF-3): a chunk is its batch row, its gate and its
+    report, never a barrier. Each image is recorded as it ends, once its
+    writes committed, so a slow image keeps its own worker and no other. A
+    stop, a scraper window, a failing gate or the circuit HOLDS the pipeline:
+    no further image starts or gets onto the GPU; the images already past
+    the GPU finish, the others are let go unrecorded (``Held``) and come back
+    first. At most ``writers`` images are in flight, every one unrecorded,
+    so an outage opens the circuit after at most ``writers`` - 1 images more
+    than one at a time would have tried, and a power cut loses at most
+    ``writers`` records (each image reruns idempotently)."""
 
     def __init__(
         self,
@@ -1251,60 +1381,100 @@ class _Pipeline:
         self.rt, self.config, self.backend, self.sql = rt, config, backend, sql
         self.sessions, self.interrupted = sessions, interrupted
 
-    def run_chunk(
+    def roll(
         self,
-        items: list[WorkItem],
-        batch: MaskBatch,
-        chunk: _Chunk,
-        take: Callable[[dict[str, Any], dict[str, float]], bool],
-    ) -> list[WorkItem]:
-        """Run ``items``; ``take`` each record (True: hold, the circuit is
-        open). Returns the items not done: the held ones, then the unstarted."""
-        writers, prefetch = self.config.writers, self.config.prefetch
-        run = _ChunkRun(batch=batch, events=queue.Queue(maxsize=2 * writers))
-        gpu = on_the_gpu(self.backend, run.submit)
+        remaining: deque[WorkItem],
+        open_chunk: Callable[[], tuple[_Chunk, MaskBatch]],
+        close_chunk: Callable[[_Chunk, MaskBatch, int | None], None],
+        take: Callable[[_Chunk, dict[str, Any], dict[str, float]], bool],
+    ) -> None:
+        """Run ``remaining`` (each item popped as its image starts) until it
+        is empty or the pipeline is held; ``take`` each record (True: hold,
+        the circuit is open). A chunk opens (``open_chunk``) as its first
+        image starts -- after the first, once the gate passed
+        (``rt.gates.check``, on this thread, so no model call runs meanwhile
+        and the GPU readings are another consumer's alone) -- and closes
+        (``close_chunk``) once its last image ended: one held up by a slow
+        image after the next. The held images go back to the front of
+        ``remaining``, in work-list order."""
+        writers, prefetch, size = self.config.writers, self.config.prefetch, self.config.chunk_size
+        flow = _Flow(events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots)
+        flow.uploads = ThreadPoolExecutor(max_workers=2 * writers, thread_name_prefix="mask-upload")
+        gpu = on_the_gpu(self.backend, flow.submit)
         pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
-        ahead: dict[int, Future[_Fetched]] = {}
+        ahead: dict[str, Future[_Fetched]] = {}
         workers: list[threading.Thread] = []
-        done: dict[int, _Done] = {}
-        held: list[int] = []
+        runs: list[_ChunkRun] = []  # the chunks open
+        lanes: dict[int, tuple[_ChunkRun, WorkItem]] = {}
+        held: list[tuple[int, WorkItem]] = []
         failure: BaseException | None = None
-        started = emitted = in_flight = 0
+        current: _ChunkRun | None = None
+        started = in_flight = 0
 
         def holding() -> bool:
-            if not run.hold.is_set():
+            if not flow.hold.is_set():
                 if self.rt.stop_requested():
-                    run.hold.set()
+                    flow.hold.set()
                 elif self.rt.gates.busy() is not None:
-                    chunk.yielded = True
-                    run.hold.set()
-            return run.hold.is_set()
+                    for run in runs:
+                        run.chunk.yielded = True
+                    flow.hold.set()
+            return flow.hold.is_set()
 
         def read_ahead() -> None:
-            for i in range(started, min(len(items), started + prefetch)):
-                if i not in ahead:
-                    ahead[i] = pool.submit(_read_ahead, items[i], self.rt)
+            for item in itertools.islice(remaining, prefetch):
+                if item.blob_sha256 not in ahead:
+                    ahead[item.blob_sha256] = pool.submit(_read_ahead, item, self.rt)
+
+        def close_ready() -> None:
+            for run in [r for r in runs if r.complete]:
+                runs.remove(run)
+                run.sampler.__exit__(None, None, None)
+                close_chunk(run.chunk, run.batch, run.sampler.peak_mib)
+
+        def next_run() -> _ChunkRun | None:
+            """The chunk the next image is of; None when the gate held it."""
+            nonlocal current
+            if current is not None:
+                if not current.full:
+                    return current
+                if not self.rt.gates.check().ok:
+                    flow.hold.set()
+                    return None
+            chunk, batch = open_chunk()
+            sampler = self.rt.vram()
+            sampler.__enter__()
+            current = _ChunkRun(flow=flow, chunk=chunk, batch=batch, sampler=sampler)
+            runs.append(current)
+            return current
 
         try:
             while True:
-                # at most ``writers`` images past the last one recorded: one that
-                # ends early (no row to write) never lets the chunk run further ahead
-                while started - emitted < writers and started < len(items) and not holding():
-                    read_ahead()
+                while in_flight < writers and remaining and not holding():
+                    run = next_run()
+                    if run is None:
+                        break
+                    item = remaining.popleft()
+                    fetched = ahead.pop(item.blob_sha256, None)
+                    if fetched is None:
+                        fetched = pool.submit(_read_ahead, item, self.rt)
+                    lanes[started] = (run, item)
                     worker = threading.Thread(
                         target=self._work,
-                        args=(run, gpu, started, items[started], ahead.pop(started)),
+                        args=(run, gpu, started, item, fetched),
                         name=f"mask-image-{started}",
                     )
                     workers.append(worker)
                     worker.start()
+                    run.started += 1
+                    run.full = run.started == size or not remaining
                     started += 1
                     in_flight += 1
-                if not run.hold.is_set():
+                if not flow.hold.is_set():
                     read_ahead()
                 if not in_flight:
                     break
-                event = run.events.get()
+                event = flow.events.get()
                 if isinstance(event, GpuJob):
                     if holding():
                         event.refuse()
@@ -1312,21 +1482,24 @@ class _Pipeline:
                         event.run()
                     continue
                 in_flight -= 1
-                done[event.index] = event
-                while emitted in done:
-                    ended = done.pop(emitted)
-                    emitted += 1
-                    if ended.error is not None:
-                        failure = failure or ended.error
-                        run.hold.set()
-                    elif ended.record is None:
-                        held.append(ended.index)
-                    elif take(ended.record, ended.stages):
-                        run.hold.set()
+                run, item = lanes.pop(event.index)
+                run.ended += 1
+                if event.error is not None:
+                    failure = failure or event.error
+                    flow.hold.set()
+                elif event.record is None:
+                    held.append((event.index, item))
+                elif take(run.chunk, event.record, event.stages):
+                    flow.hold.set()
+                close_ready()
+            if failure is None:
+                for run in runs:  # every image ended: each chunk still open closes
+                    run.full = True
+                close_ready()
         finally:
-            run.hold.set()
+            flow.hold.set()
             while in_flight:  # the driver broke off: let every worker go
-                event = run.events.get()
+                event = flow.events.get()
                 if isinstance(event, GpuJob):
                     event.refuse()
                 else:
@@ -1334,9 +1507,12 @@ class _Pipeline:
             pool.shutdown(wait=True, cancel_futures=True)
             for worker in workers:
                 worker.join()
+            flow.uploads.shutdown(wait=True)
+            for run in runs:  # not closed: the batch broke off
+                run.sampler.__exit__(None, None, None)
         if failure is not None:
             raise failure
-        return [items[i] for i in held] + items[started:]
+        remaining.extendleft(item for _index, item in sorted(held, reverse=True))
 
     def _work(
         self,
@@ -1367,11 +1543,10 @@ class _Pipeline:
             if lane is not None:
                 lane.close()
             else:
-                run.claims.skip(index)
-                run.turns.end(index)
+                run.flow.claims.skip(index)
             with contextlib.suppress(Exception):
                 db.close()
-            run.events.put(_Done(index, record, timings.seconds, error))
+            run.flow.events.put(_Done(index, record, timings.seconds, error))
 
 
 def _pipeline_refusal(db: Session, writers: int) -> str | None:
@@ -1583,23 +1758,53 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
             return 2
         # each worker's session as the batch's own is, on its engine
         sessions = sessionmaker(
-            bind=db.get_bind(), autoflush=db.autoflush, expire_on_commit=db.expire_on_commit
+            bind=db.get_bind(),
+            class_=_WorkerSession,
+            autoflush=db.autoflush,
+            expire_on_commit=db.expire_on_commit,
         )
     totals: dict[str, int] = {}
     tally = _Tally(config.max_consecutive_failures)
     remaining = deque(pending)
     chunk_no = 0
     loaded = False
+    gpu = rt.gates.gpu
     # each image's statements, commits and rollbacks as its "db"
     sql = DatabaseSeconds(db, sessions)
     pipeline = (
         None if sessions is None else _Pipeline(rt, config, backend, sql, sessions, interrupted)
     )
+
+    def open_chunk() -> tuple[_Chunk, MaskBatch]:
+        nonlocal chunk_no
+        chunk_no += 1
+        chunk = _Chunk(
+            number=chunk_no,
+            batch_id=None,
+            started=rt.monotonic(),
+            baseline_vram_mib=gpu.last.used_mib if gpu is not None and gpu.last else None,
+            provider=backend.active_provider,
+        )
+        batch = open_mask_batch(db, backend_name=backend.name)
+        chunk.batch_id = batch.id
+        return chunk, batch
+
+    def close_chunk(chunk: _Chunk, batch: MaskBatch, peak_vram_mib: int | None) -> None:
+        finish_mask_batch(db, batch)
+        report = chunk.report(peak_vram_mib, rt.monotonic() - chunk.started)
+        report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
+        rt.emit(report)
+        rt.progress.append(report)
+        for status, n in report["counts"].items():
+            totals[status] = totals.get(status, 0) + n
+
+    def take(chunk: _Chunk, record: dict[str, Any], stages: dict[str, float]) -> bool:
+        return tally.take(rt, chunk, gpu, record, stages)
+
     try:
         while remaining:
             if _wait_for_gate(rt, config, backend if loaded else None):
                 loaded = False
-            gpu = rt.gates.gpu
             if not loaded:
                 if gpu is not None:
                     gpu.mark_loading()
@@ -1610,35 +1815,27 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                     rt.emit({"event": "refused", "detail": str(exc)})
                     return 2
                 loaded = True
-            chunk_no += 1
-            chunk = _Chunk(
-                number=chunk_no,
-                batch_id=None,
-                started=rt.monotonic(),
-                baseline_vram_mib=gpu.last.used_mib if gpu is not None and gpu.last else None,
-                provider=backend.active_provider,
-            )
-            batch = open_mask_batch(db, backend_name=backend.name)
-            chunk.batch_id = batch.id
-            todo = [remaining.popleft() for _ in range(min(config.chunk_size, len(remaining)))]
-            take = functools.partial(tally.take, rt, chunk, gpu)
-            with rt.vram() as sampler:
-                if pipeline is None:
+            if pipeline is None:
+                chunk, batch = open_chunk()
+                todo = [remaining.popleft() for _ in range(min(config.chunk_size, len(remaining)))]
+                with rt.vram() as sampler:
                     left = _one_at_a_time(
-                        todo, rt, config, backend, db, batch, sql, interrupted, chunk, take
+                        todo,
+                        rt,
+                        config,
+                        backend,
+                        db,
+                        batch,
+                        sql,
+                        interrupted,
+                        chunk,
+                        functools.partial(take, chunk),
                     )
-                else:
-                    left = pipeline.run_chunk(todo, batch, chunk, take)
-            remaining.extendleft(reversed(left))
-            finish_mask_batch(db, batch)
-            circuit_open = tally.streak >= config.max_consecutive_failures
-            report = chunk.report(sampler.peak_mib, rt.monotonic() - chunk.started)
-            report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
-            rt.emit(report)
-            rt.progress.append(report)
-            for status, n in report["counts"].items():
-                totals[status] = totals.get(status, 0) + n
-            if circuit_open:
+                remaining.extendleft(reversed(left))
+                close_chunk(chunk, batch, sampler.peak_mib)
+            else:
+                pipeline.roll(remaining, open_chunk, close_chunk, take)
+            if tally.streak >= config.max_consecutive_failures:
                 rt.emit(
                     {
                         "event": "circuit_open",
@@ -1804,6 +2001,37 @@ def build_backend(args: argparse.Namespace) -> MattingBackend:
     return backend
 
 
+#: The batch's bucket clients (MASK-PERF-3): a connection that cannot be
+#: made, or a request that makes no progress -- a PUT's body sent in chunks,
+#: each within the connect timeout (urllib3 2), its answer within the read
+#: timeout -- is cut and retried with backoff (botocore's standard mode,
+#: four attempts in all), not waited on for botocore's 60 s; TCP keepalive
+#: keeps a pooled connection open through a pause between chunks. Live, a
+#: TCP and TLS connect to the bucket takes 0.5 s and a PUT 0.15-0.4 s.
+BUCKET_CONFIG: dict[str, Any] = {
+    "connect_timeout": 10,
+    "read_timeout": 30,
+    "retries": {"mode": "standard", "total_max_attempts": 4},
+    "tcp_keepalive": True,
+}
+
+
+def bucket_connections(writers: int, prefetch: int) -> int:
+    """The connections each bucket client keeps: one for each PUT in flight
+    (an image's original and copy at once, MASK-PERF-3) and each original
+    read ahead. botocore keeps 10 and closes any it lent past them when it
+    comes back: a new TCP and TLS connect, 0.5 s live, per PUT past them."""
+    return max(10, 2 * writers + prefetch)
+
+
+def _media_store(connections: int) -> ObjectStore:
+    """The media bucket (S3_*), its client keeping ``connections`` (``_run``)."""
+    from ..s3 import s3_client
+
+    client = s3_client(max_pool_connections=connections, **BUCKET_CONFIG)
+    return S3ObjectStore(client=client, bucket=get_settings().s3_bucket)
+
+
 def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
     """The raw bucket, read only; its client keeps ``connections`` (``_run``)."""
     if args.raw_dir:
@@ -1823,7 +2051,7 @@ def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
         region_name=os.environ.get("RAW_S3_REGION", "us-east-1"),
         aws_access_key_id=os.environ["RAW_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["RAW_S3_SECRET_KEY"],
-        config=Config(max_pool_connections=connections),
+        config=Config(max_pool_connections=connections, **BUCKET_CONFIG),
     )
     return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
 
@@ -1880,6 +2108,7 @@ def _run(args: argparse.Namespace) -> int:
         max_consecutive_failures=args.max_consecutive_failures,
         writers=args.writers,
         prefetch=args.prefetch,
+        decode_slots=args.decode_slots,
     )
     stop = threading.Event()
     previous: dict[int, Any] = {}
@@ -1898,18 +2127,11 @@ def _run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         from .masks import open_stores
 
-        # a bucket connection for every worker and read-ahead: botocore keeps 10
-        # and closes any it lent past them when it comes back
-        connections = max(10, args.writers + args.prefetch)
+        connections = bucket_connections(args.writers, args.prefetch)
         raw_store = _raw_store(args, connections)
         opened, bucket = open_stores(args.sandbox)
         if args.sandbox is None:
-            from ..s3 import s3_client
-
-            bucket = S3ObjectStore(
-                client=s3_client(max_pool_connections=connections),
-                bucket=get_settings().s3_bucket,
-            )
+            bucket = _media_store(connections)
         db = _sized(opened, args.writers)
         if db is not opened:
             engines.append(db.get_bind().engine)
@@ -2035,8 +2257,9 @@ def _parser() -> argparse.ArgumentParser:
         type=_whole(0, MAX_WRITERS),
         default=DEFAULT_WRITERS,
         help=(
-            "images a chunk runs at once, each on a worker with a database connection "
-            f"of its own (0: one at a time; default {DEFAULT_WRITERS}, up to {MAX_WRITERS})"
+            "images in flight at once, across chunks, each on a worker with a database "
+            f"connection of its own (0: one at a time; default {DEFAULT_WRITERS}, up to "
+            f"{MAX_WRITERS}: 24 connections with the batch's own)"
         ),
     )
     run.add_argument(
@@ -2044,6 +2267,15 @@ def _parser() -> argparse.ArgumentParser:
         type=_whole(1, MAX_PREFETCH),
         default=DEFAULT_PREFETCH,
         help=f"originals read ahead of the workers (default {DEFAULT_PREFETCH})",
+    )
+    run.add_argument(
+        "--decode-slots",
+        type=_whole(1, MAX_DECODE_SLOTS),
+        default=DECODED_AT_ONCE,
+        help=(
+            "copies decoded for the model at once, ~0.55 GB each at 4000x3000; a bigger "
+            f"original takes one per {DECODE_UNIT_PIXELS} pixels (default {DECODED_AT_ONCE})"
+        ),
     )
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
 
