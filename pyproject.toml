@@ -72,6 +72,14 @@ timeout_method = "thread"
 # Generated in the build from the pinned proto (scripts/gen_spine_stubs.py).
 omit = ["app/spine/media_v1/media_pb2*"]
 
+[tool.coverage.report]
+# Coverage minimum: a pytest --cov run below this total fails (line coverage,
+# measured 98.67 on 2026-10-25; floored). Raise it when coverage rises.
+# precision = 2 makes the comparison use the exact total; at the default 0 a
+# total of 98.67 rounds to 99 and would pass fail_under = 99.
+fail_under = 98
+precision = 2
+
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
