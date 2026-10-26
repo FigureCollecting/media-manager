@@ -67,17 +67,9 @@ jobs:
         run: poetry run python scripts/gen_spine_stubs.py
 
       - name: Run tests with coverage
-        run: poetry run pytest --cov=app --cov-report=xml --cov-report=term-missing
+        run: poetry run pytest --cov=app --cov-report=term-missing
         env:
           TESTING: "true"
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml
-          flags: media-manager
-          fail_ci_if_error: false
-          verbose: true
 
   build:
     name: Build Application
