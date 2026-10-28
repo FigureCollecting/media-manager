@@ -458,6 +458,23 @@ def test_a_mask_whose_derivative_landed_is_retried_on_failed_precondition(
     assert _batches(lines)[0]["ReportMask"]["stored"] == 1
 
 
+def test_a_derivative_landed_in_an_earlier_batch_still_makes_its_mask_unregistered(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", extra_originals=("a2",))
+    first, last = sorted([a["origin"], *a["others"]])
+    fake.depict(first)  # the copy lands in batch 0; its masks are due in batch 1
+    fake.fail("ReportMask", C.FAILED_PRECONDITION, C.FAILED_PRECONDITION)
+    code, lines = _run(db_session, url, attempts=2, batch_size=1)
+    assert code == rp.EXIT_REFUSED
+    landed, due = _batches(lines)[:2]
+    assert landed["ReportDerivative"]["ok"] == 1 and landed["ReportMask"]["calls"] == 0
+    assert due["batch"] == 1 and due["ReportMask"]["unregistered"] == 1
+    assert due["ReportMask"]["orphan"] == 0 and due["orphans"] == []
+    assert len(fake.sent("ReportMask")) == 2  # retried: the derivative had landed
+
+
 def test_a_refused_report_is_counted_by_status_and_the_run_ends_1(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
@@ -557,6 +574,39 @@ def test_a_copy_with_no_mask_rows_is_reported_without_an_appearance(
     assert code == rp.EXIT_DONE
     sent = fake.sent("ReportDerivative")[0]
     assert not sent.HasField("thumbhash") and not sent.HasField("dominant_color")
+
+
+def test_a_collectors_own_photo_judged_ineligible_still_has_its_clean_copy_reported(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    """An MFC /upload/pictures/ photo gets no mask (mask_policy: user_photo),
+    but its sanitized copy is public and must reach the spine, or it never
+    shows in the picker."""
+    fake, url = spine
+    pic = seed_copy(db_session, "pic", masks=())
+    db_session.add(
+        ImageMask(
+            source_sha256=pic["clean"],
+            pipeline_version="mask-v1",
+            status="ineligible",
+            reason="user_photo",
+            origin_class="user_photo",
+            created_at=AT,
+            updated_at=AT,
+        )
+    )
+    db_session.commit()
+    plan = rp.load_plan(db_session)
+    assert plan.copy_of == {pic["origin"]: pic["clean"]} and pic["clean"] in plan.live
+    assert plan.masked == set() and plan.reports_for(pic["clean"]) == []
+    pid = fake.depict(pic["origin"])
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    sent = fake.sent("ReportDerivative")
+    assert [r.derivative_sha256.hex() for r in sent] == [pic["clean"]]
+    assert fake.depictions[pid]["state"] == "derived"
+    assert fake.sent("ReportMask") == [] and fake.sent("WithdrawMask") == []
+    assert _batches(lines)[0]["local"]["refused"] == {}
 
 
 def test_a_lease_the_mesh_refuses_stops_the_run(
@@ -1206,3 +1256,125 @@ def test_the_exit_reads_failures_from_the_persisted_counts(
     counts: dict[str, int], failed: bool
 ) -> None:
     assert rp._failed(counts) is failed
+
+
+# ---------------------------------------------------------------------------
+# GKPH-S3-2: the index for the run, a batch's details at a time
+# ---------------------------------------------------------------------------
+
+
+def test_a_mask_the_batch_writes_during_a_run_waits_for_the_next_run(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    """The mask batch runs alongside the replay. A mask row written after the
+    run read its index is left to the next run, which lands it: the run's
+    details never hold a row its ``published`` has not seen."""
+    fake, url = spine
+    a = seed_copy(db_session, "a")
+    b = seed_copy(db_session, "b", masks=())
+    for seed in (a, b):
+        fake.depict(seed["origin"])
+    late = sha("mask:late")
+    lines: list[dict[str, Any]] = []
+
+    def batch_writes_after_the_index(line: dict[str, Any]) -> None:
+        lines.append(line)
+        if line.get("event") != "plan":
+            return
+        db_session.add(
+            PublicObject(
+                sha256=late,
+                kind="mask",
+                mime="image/png",
+                bytes=5,
+                width=100,
+                height=200,
+                storage_key=f"d/{late}",
+                created_at=AT,
+            )
+        )
+        db_session.add(
+            ImageMask(
+                source_sha256=b["clean"],
+                pipeline_version="mask-v1",
+                status="ok",
+                mask_sha256=late,
+                created_at=AT,
+                updated_at=AT,
+                **GROUND,
+            )
+        )
+        db_session.commit()
+
+    clock = Clock()
+    client = SpineMediaClient(
+        open_channel(url), policy=RetryPolicy(max_attempts=2, initial_backoff=0.01)
+    )
+    code = rp.run_replay(
+        db_session,
+        rp.ReplayConfig(),
+        connect=lambda: client,
+        emit=batch_writes_after_the_index,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert code == rp.EXIT_DONE
+    assert fake.published(a["masks"][0])
+    assert not fake.published(late)  # written after the index: not this run's
+    assert {d["state"] for d in fake.depictions.values()} == {"derived"}
+
+    code, lines = _run(db_session, url, clock=clock)
+    assert code == rp.EXIT_DONE
+    assert fake.published(late)  # the next run lands it
+    assert len(fake.sent("ReportDerivative")) == 2  # nothing pending was reported twice
+    assert _batches(lines)[0]["ReportMask"]["stored"] == 1
+
+
+def test_a_plans_details_are_read_a_chunk_of_copies_at_a_time(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeds = [seed_copy(db_session, f"k{i}", masks=(("mask-v1", "ok", f"k{i}"),)) for i in range(5)]
+    monkeypatch.setattr(rp, "DETAIL_CHUNK", 2)
+    plan = rp.load_plan(db_session)
+    assert set(plan.copies) == {s["clean"] for s in seeds}
+    for s in seeds:
+        assert [m.mask_sha256 for m in plan.reports_for(s["clean"])] == s["masks"]
+    index = rp.load_plan(db_session, details=False)
+    assert index.copies == {} and index.reports == {} and index.copy_of == plan.copy_of
+    index.load(db_session, [seeds[3]["clean"]])
+    assert set(index.copies) == {seeds[3]["clean"]}
+
+
+def test_an_image_that_minted_two_live_copies_reports_the_lowest_in_either_order(
+    db_session: Session,
+) -> None:
+    """The index streams copies in the database's order; the copy an image
+    minted is the lowest live one, whichever comes first."""
+    expected = {}
+    for tag in ("p", "q"):
+        seed = seed_copy(db_session, tag, masks=())
+        image = db_session.execute(select(Image).where(Image.sha256 == seed["origin"])).scalar_one()
+        version = ImageVersion(image_id=image.id, version_no=3, storage_key=f"d/again-{tag}")
+        db_session.add(version)
+        db_session.flush()
+        # p's second copy sorts below its first, q's above: one replaces, one keeps
+        second = "0" * 64 if tag == "p" else "f" * 64
+        db_session.add(
+            PublicObject(
+                sha256=second,
+                kind="sanitized",
+                mime="image/jpeg",
+                bytes=10,
+                width=100,
+                height=200,
+                storage_key=f"d/{second}",
+                image_version_id=version.id,
+                pixel_sha256=sha(f"px:again-{tag}"),
+                own_pixel_sha256=sha(f"own:again-{tag}"),
+                created_at=AT,
+            )
+        )
+        db_session.commit()
+        expected[seed["origin"]] = min(seed["clean"], second)
+    plan = rp.load_plan(db_session, details=False)
+    assert {o: plan.copy_of[o] for o in expected} == expected

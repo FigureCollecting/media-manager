@@ -17,6 +17,14 @@ reported (the origin would answer 404 for it): it is refused locally by name
 Store eligibility is NOT re-judged here: run ``masks reevaluate --apply``
 first, as for the origin.
 
+THE INDEX AND THE DETAILS. The run holds only the plan's index for its whole
+length (each original's copy, the live copies, the published mask bytes, the
+masked copies), read in streamed columns, and reads each batch's copies (their
+records and mask rows) when the batch comes: its memory is the index plus one
+batch, never the whole media DB (the whole plan measured 2.37 GB at 282k
+originals, GKPH-S3-2). The mask batch may write while a run goes: a mask row
+written after the index was read waits for the next run.
+
 PER BATCH of at most 200 originals, in sha order:
   1. LeasePendingImages{origin_sha256: the batch}, repeated until the batch's
      pending depictions are drained. Every returned origin_sha256 is checked
@@ -104,6 +112,10 @@ LEASE_MAX_ITEMS = 200
 MAX_LEASE_ROUNDS = 50
 #: Seconds added to the lease's own when a stopped batch is resumed.
 LEASE_MARGIN_SECONDS = 5
+#: Copies whose details one query reads (an IN list of their shas).
+DETAIL_CHUNK = 500
+#: Rows the index fetches at a time (a server-side cursor on Postgres).
+INDEX_FETCH = 10_000
 #: Warnings quoted per batch line (all are counted).
 WARNINGS_QUOTED = 5
 #: The reason sent for a withdrawn row that records none: the spine refuses
@@ -130,9 +142,15 @@ class Withdrawal:
 
 @dataclass
 class Plan:
+    """The INDEX, held for the whole run (``copy_of``, ``live``,
+    ``published``, ``masked``), and the DETAILS of the copies last
+    :meth:`load`-ed (``copies``, ``reports``, ``withdrawals``,
+    ``objectless``): the run loads one batch's copies at a time, so its
+    memory is the index plus one batch, whatever the size of the media DB."""
+
     #: origin sha -> the clean copy reported for its depictions (live copies only)
     copy_of: dict[str, str]
-    #: the live clean copies' records
+    #: the live clean copies' records (loaded copies only)
     copies: dict[str, msg.CopyRecord]
     live: set[str]
     #: mask bytes some ok row of a live copy carries
@@ -143,6 +161,11 @@ class Plan:
     masked: set[str] = field(default_factory=set)
     #: copy -> published mask bytes with no ``mask`` public object (never sent)
     objectless: dict[str, list[str]] = field(default_factory=dict)
+    #: the newest mask row the index read: a row written after it (the mask
+    #: batch runs alongside) waits for the next run, as it did when the whole
+    #: plan was read at once, so a withdrawal is never judged against a
+    #: ``published`` that has not seen the row
+    last_mask_id: int = 0
     _originals: dict[str, list[str]] | None = field(default=None, init=False, repr=False)
 
     def originals_of(self, copy: str) -> list[str]:
@@ -159,6 +182,80 @@ class Plan:
 
     def withdrawals_for(self, copy: str) -> list[Withdrawal]:
         return self.withdrawals.get(copy, [])
+
+    def load(self, db: Session, copies: Iterable[str]) -> None:
+        """Read the details of ``copies`` (read only), replacing the last
+        ones: their records when live, their reports, withdrawals and
+        objectless masks."""
+        self.copies, self.reports, self.withdrawals, self.objectless = {}, {}, {}, {}
+        wanted = sorted(set(copies))
+        for i in range(0, len(wanted), DETAIL_CHUNK):
+            self._load_chunk(db, wanted[i : i + DETAIL_CHUNK])
+
+    def _load_chunk(self, db: Session, chunk: list[str]) -> None:
+        mask_rows = list(
+            db.execute(
+                select(ImageMask)
+                .where(ImageMask.source_sha256.in_(chunk), ImageMask.id <= self.last_mask_id)
+                .order_by(ImageMask.id)
+            ).scalars()
+        )
+        by_copy: dict[str, list[ImageMask]] = {}
+        for row in mask_rows:
+            by_copy.setdefault(row.source_sha256, []).append(row)
+        mask_shas = sorted({r.mask_sha256 for r in mask_rows if r.mask_sha256})
+        mask_objects = {
+            o.sha256: o
+            for o in db.execute(
+                select(PublicObject).where(
+                    PublicObject.kind == "mask", PublicObject.sha256.in_(mask_shas)
+                )
+            ).scalars()
+        }
+        for obj in db.execute(
+            select(PublicObject).where(
+                PublicObject.kind == "sanitized", PublicObject.sha256.in_(chunk)
+            )
+        ).scalars():
+            if obj.sha256 not in self.live:
+                continue
+            look = _appearance(by_copy.get(obj.sha256, []))
+            self.copies[obj.sha256] = msg.CopyRecord(
+                sha256=obj.sha256,
+                mime=obj.mime,
+                width=obj.width,
+                height=obj.height,
+                generated_at=obj.created_at,
+                thumbhash=look.plain_thumbhash if look else None,
+                dominant_color=look.plain_dominant_color if look else None,
+                own_grounding=look.own_alpha_grounding if look else None,
+            )
+        for row in mask_rows:
+            if not row.mask_sha256 or row.status not in ("ok", "withdrawn"):
+                continue
+            if row.status == "ok" and row.source_sha256 in self.live:
+                mask_obj = mask_objects.get(row.mask_sha256)
+                if mask_obj is None:
+                    self.objectless.setdefault(row.source_sha256, []).append(row.mask_sha256)
+                    continue
+                self.reports.setdefault(row.source_sha256, []).append(
+                    msg.MaskRecord(
+                        clean_sha256=row.source_sha256,
+                        pipeline_version=row.pipeline_version,
+                        mask_sha256=row.mask_sha256,
+                        mime=mask_obj.mime,
+                        generated_at=mask_obj.created_at,
+                        grounding={name: getattr(row, name) for name in GROUNDING_FIELDS},
+                        thumbhash=row.masked_thumbhash,
+                        dominant_color=row.masked_dominant_color,
+                    )
+                )
+            elif row.mask_sha256 not in self.published:
+                if row.status == "withdrawn":
+                    withdrawn = Withdrawal(row.mask_sha256, row.reason or NO_REASON, row.updated_at)
+                else:
+                    withdrawn = Withdrawal(row.mask_sha256, "deleted", None)
+                self.withdrawals.setdefault(row.source_sha256, []).append(withdrawn)
 
 
 def _dead_copies(db: Session) -> set[str]:
@@ -202,99 +299,75 @@ def _appearance(rows: list[ImageMask]) -> ImageMask | None:
     return (current or sorted(measured, key=lambda r: (r.updated_at, r.id)))[-1]
 
 
-def load_plan(db: Session) -> Plan:
-    """Everything the replay sends, read from the media DB (read only)."""
+def load_plan(db: Session, *, details: bool = True) -> Plan:
+    """Everything the replay sends, read from the media DB (read only).
+    ``details=False``: the index only; :meth:`Plan.load` reads a batch's
+    copies when the batch comes (the run's way)."""
     dead = _dead_copies(db)
-    copies_rows = db.execute(
-        select(PublicObject, ImageVersion.image_id)
+    # Columns, never entities, streamed: the index reads one row per clean
+    # copy, per original and per mask row of the whole media DB.
+    live: set[str] = set()
+    #: image -> the lowest live copy minted from it
+    owned: dict[int, str] = {}
+    for copy, image_id in db.execute(
+        select(PublicObject.sha256, ImageVersion.image_id)
         .join(ImageVersion, ImageVersion.id == PublicObject.image_version_id)
         .where(PublicObject.kind == "sanitized")
-    ).all()
-    live = {obj.sha256 for obj, _ in copies_rows if obj.sha256 not in dead}
-    owned: dict[int, str] = {}
-    for obj, image_id in sorted(copies_rows, key=lambda r: r[0].sha256):
-        if obj.sha256 in live:
-            owned.setdefault(image_id, obj.sha256)
-    behind: dict[int, set[str]] = {}
+        .execution_options(yield_per=INDEX_FETCH)
+    ):
+        if copy in dead:
+            continue
+        live.add(copy)
+        if image_id not in owned or copy < owned[image_id]:
+            owned[image_id] = copy
+    #: image -> the lowest live copy it is linked behind (only the lowest is
+    #: ever reported, when the image minted none)
+    behind: dict[int, str] = {}
     for copy, image_id in db.execute(
-        select(PublicObjectImage.sha256, PublicObjectImage.image_id).join(
+        select(PublicObjectImage.sha256, PublicObjectImage.image_id)
+        .join(
             PublicObject,
             and_(PublicObject.sha256 == PublicObjectImage.sha256, PublicObject.kind == "sanitized"),
         )
-    ).all():
-        if copy in live:
-            behind.setdefault(image_id, set()).add(copy)
-    for image_id, copy in owned.items():
-        behind.setdefault(image_id, set()).add(copy)
-    shas = dict(
-        db.execute(
-            select(ImageModel.id, ImageModel.sha256).where(ImageModel.id.in_(list(behind)))
-        ).all()
+        .execution_options(yield_per=INDEX_FETCH)
+    ):
+        if copy in live and (image_id not in behind or copy < behind[image_id]):
+            behind[image_id] = copy
+    # Every image's sha, filtered here: an IN list of every id behind a copy
+    # is one bound value per original.
+    copy_of: dict[str, str] = {}
+    for image_id, origin in db.execute(
+        select(ImageModel.id, ImageModel.sha256).execution_options(yield_per=INDEX_FETCH)
+    ):
+        mapped = owned.get(image_id) or behind.get(image_id)
+        if mapped:
+            copy_of[origin] = mapped
+    del behind, owned
+
+    published: set[str] = set()
+    masked: set[str] = set()
+    last_mask_id = 0
+    for mask_id, source, status, mask_sha in db.execute(
+        select(
+            ImageMask.id, ImageMask.source_sha256, ImageMask.status, ImageMask.mask_sha256
+        ).execution_options(yield_per=INDEX_FETCH)
+    ):
+        last_mask_id = max(last_mask_id, mask_id)
+        if not mask_sha or status not in ("ok", "withdrawn"):
+            continue
+        masked.add(source)
+        if status == "ok" and source in live:
+            published.add(mask_sha)
+    plan = Plan(
+        copy_of=copy_of,
+        copies={},
+        live=live,
+        published=published,
+        masked=masked,
+        last_mask_id=last_mask_id,
     )
-    copy_of = {
-        shas[image_id]: owned.get(image_id) or min(copies)
-        for image_id, copies in behind.items()
-        if image_id in shas
-    }
-
-    mask_rows = list(db.execute(select(ImageMask).order_by(ImageMask.id)).scalars())
-    by_copy: dict[str, list[ImageMask]] = {}
-    for row in mask_rows:
-        by_copy.setdefault(row.source_sha256, []).append(row)
-    mask_objects = {
-        o.sha256: o
-        for o in db.execute(select(PublicObject).where(PublicObject.kind == "mask")).scalars()
-    }
-
-    copies: dict[str, msg.CopyRecord] = {}
-    for obj, _ in copies_rows:
-        if obj.sha256 not in live:
-            continue
-        look = _appearance(by_copy.get(obj.sha256, []))
-        copies[obj.sha256] = msg.CopyRecord(
-            sha256=obj.sha256,
-            mime=obj.mime,
-            width=obj.width,
-            height=obj.height,
-            generated_at=obj.created_at,
-            thumbhash=look.plain_thumbhash if look else None,
-            dominant_color=look.plain_dominant_color if look else None,
-            own_grounding=look.own_alpha_grounding if look else None,
-        )
-
-    published = {
-        r.mask_sha256
-        for r in mask_rows
-        if r.status == "ok" and r.mask_sha256 and r.source_sha256 in live
-    }
-    plan = Plan(copy_of=copy_of, copies=copies, live=live, published=published)
-    for row in mask_rows:
-        if not row.mask_sha256 or row.status not in ("ok", "withdrawn"):
-            continue
-        plan.masked.add(row.source_sha256)
-        if row.status == "ok" and row.source_sha256 in live:
-            mask_obj = mask_objects.get(row.mask_sha256)
-            if mask_obj is None:
-                plan.objectless.setdefault(row.source_sha256, []).append(row.mask_sha256)
-                continue
-            plan.reports.setdefault(row.source_sha256, []).append(
-                msg.MaskRecord(
-                    clean_sha256=row.source_sha256,
-                    pipeline_version=row.pipeline_version,
-                    mask_sha256=row.mask_sha256,
-                    mime=mask_obj.mime,
-                    generated_at=mask_obj.created_at,
-                    grounding={name: getattr(row, name) for name in GROUNDING_FIELDS},
-                    thumbhash=row.masked_thumbhash,
-                    dominant_color=row.masked_dominant_color,
-                )
-            )
-        elif row.mask_sha256 not in published:
-            if row.status == "withdrawn":
-                withdrawn = Withdrawal(row.mask_sha256, row.reason or NO_REASON, row.updated_at)
-            else:
-                withdrawn = Withdrawal(row.mask_sha256, "deleted", None)
-            plan.withdrawals.setdefault(row.source_sha256, []).append(withdrawn)
+    if details:
+        plan.load(db, live | masked)
     return plan
 
 
@@ -450,6 +523,8 @@ class _Run:
     started: dt.datetime
     ledger: SpineReportRun | None
     owner: str
+    #: copies this run reported a derivative for and whose masks are not yet
+    #: due: dropped once they are, so the run holds no more as it passes
     landed: set[str] = field(default_factory=set)
     withdrawn_now: set[str] = field(default_factory=set)
 
@@ -667,6 +742,7 @@ class _Run:
                 clean = self._lease_and_report(report)
             for copy in batch.copies_due:
                 self._report_masks(report, copy)
+                self.landed.discard(copy)  # its masks are due once per run: now
                 self._restores(report, copy)
                 self._withdrawals(report, copy)
         except _Stop as stop:
@@ -767,7 +843,7 @@ def run_replay(
     """Replay the media DB into the spine. ``connect`` opens the client, and
     is never called on a dry run. Returns the exit status."""
     started = now()
-    plan = load_plan(db)
+    plan = load_plan(db, details=False)
     ledger: SpineReportRun | None = None
     cursor: str | None = None
     if config.dry_run:
@@ -819,6 +895,7 @@ def run_replay(
         }
     )
     for batch in batches:
+        plan.load(db, {plan.copy_of[o] for o in batch.origins}.union(batch.copies_due))
         if config.dry_run:
             emit(run.plan_only(batch).line(None))
             continue
