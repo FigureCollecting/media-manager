@@ -94,7 +94,9 @@ def gallery_origins(db: Session, image_id: int) -> list[ImageOrigin]:
         .where(FigureGallery.image_id == image_id, FigureGallery.deleted_at.is_(None))
         .order_by(FigureGallery.id)
     ).scalars()
-    return [ImageOrigin(url=g.source_url, source=g.source) for g in rows]
+    return [
+        ImageOrigin(url=g.source_url, source=g.source, source_class=g.source_class) for g in rows
+    ]
 
 
 def images_behind(db: Session, sha256: str) -> list[int] | None:

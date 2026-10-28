@@ -238,6 +238,11 @@ class FigureGallery(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     caption: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(50), nullable=False, default="mfc")
+    #: Who made the image, as the capture lane classified it (the spine's
+    #: product_image.source_class, carried by the mask work list); NULL when
+    #: it did not. ``manufacturer_press`` on an MFC picture = the official
+    #: gallery list (GAL3, app.workers.mask_policy). Set once, never replaced.
+    source_class: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
     )

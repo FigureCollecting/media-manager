@@ -11,10 +11,12 @@
     python -m app.cli.mask_batch sql ross-heads --user UUID
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
+    python -m app.cli.mask_batch sql official-gallery-worklist [--shard I/N]
 
 THE WORK. A work list is JSON lines, one per ORIGINAL the spine captured
 (``blob_sha256``, its ``storage_key`` in the raw bucket, ``codec``, the origin
-``url`` and ``source``, ``product_id``, ``head_id``, ``rank``): Ross's
+``url`` and ``source``, its ``source_class`` (GAL3: kept on the gallery link,
+app.workers.mask_policy), ``product_id``, ``head_id``, ``rank``): Ross's
 holdings ranked 0 (owned), 1 (ordered), 2 (wished), the rest of the catalog 9.
 The ``sql`` commands print the read-only queries that produce it (run by the
 operator against the coordinator and spine databases; psql output is fine,
@@ -223,6 +225,8 @@ DECODE_UNIT_PIXELS = 4000 * 3000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _MAX_RANK = 99
+#: product_image.source_class's vocabulary (the spine's CHECK, fc-aggregation 0027).
+SOURCE_CLASSES = ("manufacturer_press", "retailer_studio", "user_photo", "unknown")
 #: The recorded statuses a run does not count as done.
 _REDO = ("failed", "interrupted")
 #: The statuses of an image that got a mask (published, or held for review).
@@ -248,6 +252,9 @@ class WorkItem:
     head_id: str | None = None
     rank: int = 9
     codec: str = "identity"
+    #: The spine's product_image.source_class (GAL3: ``manufacturer_press``
+    #: = MFC's official gallery list); None when the capture lane gave none.
+    source_class: str | None = None
 
     def as_row(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -272,6 +279,9 @@ def _item(row: dict[str, Any], where: str) -> WorkItem:
     codec = row.get("codec", "identity")
     if not isinstance(codec, str):
         raise ValueError(f"{where}: codec must be a string")
+    source_class = row.get("source_class")
+    if source_class is not None and source_class not in SOURCE_CLASSES:
+        raise ValueError(f"{where}: source_class must be one of {', '.join(SOURCE_CLASSES)}")
     return WorkItem(
         blob_sha256=sha,
         storage_key=str(_field(row, "storage_key", where)),
@@ -281,11 +291,15 @@ def _item(row: dict[str, Any], where: str) -> WorkItem:
         head_id=_field(row, "head_id", where, required=False),
         rank=rank,
         codec=codec,
+        source_class=source_class,
     )
 
 
-def _parse(entries: Iterable[tuple[str, int, str]]) -> tuple[list[WorkItem], int]:
+def _parse(
+    entries: Iterable[tuple[str, int, str]], *, every_row: bool = False
+) -> tuple[list[WorkItem], int]:
     best: dict[str, tuple[int, WorkItem]] = {}
+    rows: list[WorkItem] = []
     skipped = 0
     for order, (label, n, line) in enumerate(entries):
         text = line.strip()
@@ -302,9 +316,12 @@ def _parse(entries: Iterable[tuple[str, int, str]]) -> tuple[list[WorkItem], int
         if not isinstance(row, dict):  # pragma: no cover - "{" always decodes to a dict
             raise ValueError(f"{where}: not a JSON object")
         item = _item(row, where)
+        rows.append(item)
         held = best.get(item.blob_sha256)
         if held is None or item.rank < held[1].rank:
             best[item.blob_sha256] = (order, item)
+    if every_row:
+        return rows, skipped
     ordered = sorted(best.values(), key=lambda kept: (kept[1].rank, kept[0]))
     return [item for _, item in ordered], skipped
 
@@ -317,13 +334,17 @@ def parse_worklist(lines: Iterable[str], label: str = "work list") -> tuple[list
     return _parse((label, n, line) for n, line in enumerate(lines, 1))
 
 
-def read_worklists(paths: Sequence[Path]) -> tuple[list[WorkItem], int]:
+def read_worklists(paths: Sequence[Path], *, every_row: bool = False) -> tuple[list[WorkItem], int]:
+    """As ``parse_worklist``, over the files in order; ``every_row`` keeps
+    every valid row in file order instead (one per depiction: ``masks
+    official-gallery`` judges each link, not each original once)."""
+
     def entries() -> Iterable[tuple[str, int, str]]:
         for path in paths:
             for n, line in enumerate(Path(path).read_text().splitlines(), 1):
                 yield str(path), n, line
 
-    return _parse(entries())
+    return _parse(entries(), every_row=every_row)
 
 
 # --------------------------------------------------------------------------
@@ -1078,7 +1099,9 @@ def _mint(
                 db,
                 media,
                 data,
-                origins=[ImageOrigin(url=item.url, source=item.source)],
+                origins=[
+                    ImageOrigin(url=item.url, source=item.source, source_class=item.source_class)
+                ],
                 figure_id=item.product_id,
             )
         clean_sha = clean.sha256
@@ -1908,7 +1931,8 @@ _IMAGE_COLUMNS = """json_build_object(
     'product_id', pi.product_id,
     'head_id', {head},
     'rank', {rank},
-    'position', pi.position)"""
+    'position', pi.position,
+    'source_class', pi.source_class)"""
 
 _IMAGE_JOINS = """JOIN source s ON s.id = pi.source_id
 JOIN raw.blob b ON b.sha256 = pi.blob_sha256
@@ -1990,16 +2014,20 @@ ORDER BY m.rank, m.head_id, pi.position NULLS LAST, pi.blob_sha256;
     )
 
 
+def _shard_clause(shard: str | None) -> str:
+    if shard is None:
+        return ""
+    m = re.fullmatch(r"(\d+)/(\d+)", shard)
+    if not m or not 0 <= int(m[1]) < int(m[2]):
+        raise ValueError(f"bad shard {shard!r}: want I/N with 0 <= I < N")
+    return f"\n  AND get_byte(pi.blob_sha256, 0) % {int(m[2])} = {int(m[1])}"
+
+
 def catalog_worklist_sql(shard: str | None = None) -> str:
     """The whole catalog's live MFC item images (spine db), rank 9; ``shard``
     ``I/N`` keeps the originals whose sha's first byte is I modulo N, so the
     list can be fetched in pieces."""
-    where = ""
-    if shard is not None:
-        m = re.fullmatch(r"(\d+)/(\d+)", shard)
-        if not m or not 0 <= int(m[1]) < int(m[2]):
-            raise ValueError(f"bad shard {shard!r}: want I/N with 0 <= I < N")
-        where = f"\n  AND get_byte(pi.blob_sha256, 0) % {int(m[2])} = {int(m[1])}"
+    where = _shard_clause(shard)
     columns = _IMAGE_COLUMNS.format(head="NULL", rank="9")
     return (
         _SQL_HEAD
@@ -2007,6 +2035,26 @@ def catalog_worklist_sql(shard: str | None = None) -> str:
 SELECT {columns}
 FROM product_image pi
 {_IMAGE_JOINS}{where}
+ORDER BY pi.product_id, pi.position NULLS LAST, pi.blob_sha256;
+"""
+        + _SQL_TAIL
+    )
+
+
+def official_gallery_worklist_sql(shard: str | None = None) -> str:
+    """GAL3: the live MFC images the gallery-capture lane took from MFC's
+    official gallery list (spine db: source_class ``manufacturer_press``),
+    rank 9, sharded as ``catalog_worklist_sql``. Input to ``masks
+    official-gallery`` and then to ``mask_batch run``."""
+    where = _shard_clause(shard)
+    columns = _IMAGE_COLUMNS.format(head="NULL", rank="9")
+    return (
+        _SQL_HEAD
+        + f"""-- GAL3: MFC's official gallery list, as the gallery-capture lane recorded it (spine db).
+SELECT {columns}
+FROM product_image pi
+{_IMAGE_JOINS}
+  AND pi.source_class = 'manufacturer_press'{where}
 ORDER BY pi.product_id, pi.position NULLS LAST, pi.blob_sha256;
 """
         + _SQL_TAIL
@@ -2204,6 +2252,8 @@ def _sql(args: argparse.Namespace) -> int:
             sql = ross_heads_sql(args.user)
         elif args.query == "ross-worklist":
             sql = ross_worklist_sql(Path(args.heads).read_text().splitlines())
+        elif args.query == "official-gallery-worklist":
+            sql = official_gallery_worklist_sql(args.shard)
         else:
             sql = catalog_worklist_sql(args.shard)
     except (OSError, ValueError) as exc:
@@ -2321,6 +2371,10 @@ def _parser() -> argparse.ArgumentParser:
     ross.add_argument("--heads", required=True)
     catalog = queries.add_parser("catalog-worklist", help="spine db: every MFC item image")
     catalog.add_argument("--shard")
+    gallery = queries.add_parser(
+        "official-gallery-worklist", help="spine db: MFC's official gallery list (GAL3)"
+    )
+    gallery.add_argument("--shard")
     return p
 
 

@@ -22,7 +22,7 @@ SAMPLE = Path(__file__).resolve().parent / "fixtures" / "mask_sample"
 _LINE_KEYS = {"time", "level", "service", "version", "event", "msg", "code", "duration_ms",
               "trace_id", "span_id", "job", "run_id", "exit", "err"}  # fmt: skip
 #: The report's lists of records: one line each, their count on job.end.
-_RECORD_LISTS = {"items", "withdrawn", "restored"}
+_RECORD_LISTS = {"items", "withdrawn", "restored", "requeued", "still_refused", "failed"}
 
 
 def _decode(value: object) -> object:
@@ -352,6 +352,74 @@ class TestStoreRevocation:
     ) -> None:
         assert cli.main(["--sandbox", sandbox, "revoke-store", " ", "--apply"]) == 2
         assert "source" in _refusal(capsys)
+
+
+class TestOfficialGallery:
+    """GAL3 ``official-gallery``: the sample's collector photo (sample:8) as
+    if the gallery-capture lane had taken it from MFC's official list."""
+
+    @staticmethod
+    def _worklist(tmp_path: Path, **row: object) -> Path:
+        import hashlib
+
+        entry = next(
+            e for e in json.loads((SAMPLE / "manifest.json").read_text())["entries"]
+            if e["figure_id"] == "sample:8"
+        )  # fmt: skip
+        original = (SAMPLE / "originals" / f"{entry['name']}.png").read_bytes()
+        sha = hashlib.sha256(original).hexdigest()
+        line = {
+            "blob_sha256": sha,
+            "storage_key": f"raw-img/sha256/{sha[:2]}/{sha}.png",
+            "url": entry["origins"][0]["url"],
+            "source": "mfc",
+            "product_id": "sample:8",
+            "rank": 9,
+            "source_class": "manufacturer_press",
+            **row,
+        }
+        path = tmp_path / "gallery.jsonl"
+        path.write_text("BEGIN\n" + json.dumps(line) + "\nROLLBACK\n")
+        return path
+
+    def test_a_dry_run_unless_applied_then_the_next_run_masks_it(
+        self, sandbox: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], model: None
+    ) -> None:
+        from app.models import FigureGallery, ImageMask
+
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        worklist = str(self._worklist(tmp_path))
+
+        code, dry = _run(capsys, "--sandbox", sandbox, "official-gallery", "--worklist", worklist)
+        assert code == 0
+        assert (dry["dry_run"], dry["official_gallery"], dry["skipped_lines"]) == (True, True, 2)
+        assert dry["counts"]["provenance_recorded"] == 1 and len(dry["requeued"]) == 1
+        assert {g.source_class for g in _rows(sandbox, FigureGallery)} == {None}
+        refused = [m.status for m in _rows(sandbox, ImageMask)].count("ineligible")
+        assert refused == 2  # sample:8, and sample:4 (a store listing, never granted)
+
+        code, applied = _run(
+            capsys, "--sandbox", sandbox, "official-gallery", "--worklist", worklist, "--apply"
+        )
+        assert (code, applied["dry_run"], applied["requeued"]) == (0, False, dry["requeued"])
+        assert [m.status for m in _rows(sandbox, ImageMask)].count("ineligible") == 1
+
+        code, run = _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        assert code == 0
+        assert [(i["figure_ids"], i["status"], i["origin_class"]) for i in run["items"]] == [
+            (["sample:8"], "ok", "official_gallery")
+        ]
+
+    def test_a_malformed_work_list_is_refused_before_any_change(
+        self, sandbox: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad = str(self._worklist(tmp_path, source_class="press"))
+        assert cli.main(["--sandbox", sandbox, "official-gallery", "--worklist", bad]) == 2
+        assert "source_class" in _refusal(capsys)
+        missing = str(tmp_path / "missing.jsonl")
+        assert cli.main(["--sandbox", sandbox, "official-gallery", "--worklist", missing]) == 2
+        assert "missing.jsonl" in _refusal(capsys)
 
 
 class TestRefusals:
