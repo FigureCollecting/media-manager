@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 import grpc
 
+from ..telemetry.grpc_client import intercept
 from . import field_rules as fr
 from .media_v1 import media_pb2, media_pb2_grpc
 
@@ -146,8 +147,12 @@ def target_from_url(url: str) -> str:
 
 
 def open_channel(url: str) -> grpc.Channel:
-    """A plaintext channel to the mesh, gRPC's built-in retries off."""
-    return grpc.insecure_channel(target_from_url(url), options=[("grpc.enable_retries", 0)])
+    """A plaintext channel to the mesh, gRPC's built-in retries off. Every call
+    carries the active trace's traceparent (app.telemetry.grpc_client), so the
+    spine's rpc.in line is in the run's trace."""
+    target = target_from_url(url)
+    channel = grpc.insecure_channel(target, options=[("grpc.enable_retries", 0)])
+    return intercept(channel, target)
 
 
 class SpineMediaClient:

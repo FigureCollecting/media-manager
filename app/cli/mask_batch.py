@@ -53,8 +53,12 @@ loaded again, ~4 s, when the gate passes).
 THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
 flushed per line: a power cut loses at most the images in flight, one or,
 pipelined, up to ``--writers``; each reruns idempotently), and a run
-skips what it lists (``--retry-failed`` re-drives its failures). Per chunk one
-JSON line on stdout: count, statuses, seconds per image (and the model's
+skips what it lists (``--retry-failed`` re-drives its failures). A run is one
+root span in the estate's log lines on stdout (LG-U11, app.telemetry):
+job.start, one ``app.<event>`` line per event, job.end with the counts and
+``exit``; each chunk is an ITEM (fc-shared's job model: a new root trace
+linked to the run) in which its images are minted and its line written, and
+every line carries run_id. Per chunk one ``app.chunk`` line: count, statuses, seconds per image (and the model's
 share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures,
 and where the seconds went: each stage's mean and median per image over the
 images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
@@ -146,9 +150,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 
+from .. import telemetry
 from ..config import get_settings
 from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
+from ..telemetry.events import EventLines
+from ..telemetry.tracing import NULL_ITEM, Item
 from ..workers.image_limits import ImageLimitError, current_limits, gunzip_capped
 from ..workers.mask_job import (
     finish_mask_batch,
@@ -793,6 +800,9 @@ class Runtime:
     monotonic: Callable[[], float]
     emit: Callable[[dict[str, Any]], None]
     stop_requested: Callable[[], bool]
+    #: Each chunk as an item of the run (LG-U11, fc-shared's job model: its own
+    #: trace, linked to the run); outside a run, no item.
+    open_item: Callable[[int], Item] = lambda _number: NULL_ITEM
 
 
 class _Stopped(Exception):
@@ -815,6 +825,8 @@ class _Chunk:
     #: per record, its seconds by stage (app.workers.stage_timing)
     stages: list[dict[str, float]] = field(default_factory=list)
     yielded: bool = False
+    #: The chunk's item: its images and its line run in it (Runtime.open_item).
+    item: Item = field(default=NULL_ITEM, repr=False)
 
     def report(self, peak_vram_mib: int | None, elapsed: float) -> dict[str, Any]:
         counts: dict[str, int] = {}
@@ -1460,8 +1472,9 @@ class _Pipeline:
                         fetched = pool.submit(_read_ahead, item, self.rt)
                     lanes[started] = (run, item)
                     worker = threading.Thread(
-                        target=self._work,
-                        args=(run, gpu, started, item, fetched),
+                        # the image's work in its chunk's item (LG-U11): its lines in that trace
+                        target=run.chunk.item.run,
+                        args=(functools.partial(self._work, run, gpu, started, item, fetched),),
                         name=f"mask-image-{started}",
                     )
                     workers.append(worker)
@@ -1775,6 +1788,8 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         None if sessions is None else _Pipeline(rt, config, backend, sql, sessions, interrupted)
     )
 
+    open_items: dict[int, Item] = {}  # the chunks' items not yet ended
+
     def open_chunk() -> tuple[_Chunk, MaskBatch]:
         nonlocal chunk_no
         chunk_no += 1
@@ -1784,19 +1799,26 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
             started=rt.monotonic(),
             baseline_vram_mib=gpu.last.used_mib if gpu is not None and gpu.last else None,
             provider=backend.active_provider,
+            item=rt.open_item(chunk_no),
         )
-        batch = open_mask_batch(db, backend_name=backend.name)
+        open_items[chunk_no] = chunk.item
+        batch = chunk.item.run(lambda: open_mask_batch(db, backend_name=backend.name))
         chunk.batch_id = batch.id
         return chunk, batch
 
     def close_chunk(chunk: _Chunk, batch: MaskBatch, peak_vram_mib: int | None) -> None:
-        finish_mask_batch(db, batch)
-        report = chunk.report(peak_vram_mib, rt.monotonic() - chunk.started)
-        report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
-        rt.emit(report)
-        rt.progress.append(report)
-        for status, n in report["counts"].items():
-            totals[status] = totals.get(status, 0) + n
+        def close() -> None:
+            finish_mask_batch(db, batch)
+            report = chunk.report(peak_vram_mib, rt.monotonic() - chunk.started)
+            report["held_vram_mib"] = gpu.own_mib if gpu is not None else None
+            rt.emit(report)
+            rt.progress.append(report)
+            for status, n in report["counts"].items():
+                totals[status] = totals.get(status, 0) + n
+
+        chunk.item.run(close)
+        open_items.pop(chunk.number, None)
+        chunk.item.end()
 
     def take(chunk: _Chunk, record: dict[str, Any], stages: dict[str, float]) -> bool:
         return tally.take(rt, chunk, gpu, record, stages)
@@ -1817,22 +1839,29 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                 loaded = True
             if pipeline is None:
                 chunk, batch = open_chunk()
-                todo = [remaining.popleft() for _ in range(min(config.chunk_size, len(remaining)))]
-                with rt.vram() as sampler:
-                    left = _one_at_a_time(
-                        todo,
-                        rt,
-                        config,
-                        backend,
-                        db,
-                        batch,
-                        sql,
-                        interrupted,
-                        chunk,
-                        functools.partial(take, chunk),
-                    )
-                remaining.extendleft(reversed(left))
-                close_chunk(chunk, batch, sampler.peak_mib)
+
+                def sequential(chunk: _Chunk = chunk, batch: MaskBatch = batch) -> int | None:
+                    todo = [
+                        remaining.popleft() for _ in range(min(config.chunk_size, len(remaining)))
+                    ]
+                    with rt.vram() as sampler:
+                        left = _one_at_a_time(
+                            todo,
+                            rt,
+                            config,
+                            backend,
+                            db,
+                            batch,
+                            sql,
+                            interrupted,
+                            chunk,
+                            functools.partial(take, chunk),
+                        )
+                    remaining.extendleft(reversed(left))
+                    peak: int | None = sampler.peak_mib
+                    return peak
+
+                close_chunk(chunk, batch, chunk.item.run(sequential))
             else:
                 pipeline.roll(remaining, open_chunk, close_chunk, take)
             if tally.streak >= config.max_consecutive_failures:
@@ -1854,6 +1883,8 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return 4
     finally:
         sql.close()
+        for item in open_items.values():  # a chunk a fault left open
+            item.end(error=True)
     rt.emit({"event": "done", "counts": totals, "pending": len(remaining)})
     return 1 if totals.get("failed") or totals.get("interrupted") else 0
 
@@ -2056,12 +2087,14 @@ def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
     return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
 
 
-def _emit(event: dict[str, Any]) -> None:
-    event.setdefault("at", dt.datetime.now(dt.UTC).isoformat(timespec="seconds"))
-    print(json.dumps(event, sort_keys=True, default=str), flush=True)
+SERVICE = "mask-batch"
+#: The events whose scalars and counts job.end carries.
+_SUMMARIZED = ("plan", "start", "done", "stopped", "gave_up", "circuit_open")
 
 
-def _run(args: argparse.Namespace) -> int:
+def _run(
+    args: argparse.Namespace, emit: Callable[[dict[str, Any]], None], run: telemetry.JobRun
+) -> int:
     try:
         items, skipped = read_worklists(args.worklist)
         windows = parse_windows(args.busy_windows)
@@ -2148,11 +2181,12 @@ def _run(args: argparse.Namespace) -> int:
         vram=lambda: VramSampler(vram_command(args.gpu_index) if on_gpu else None),
         sleep=time.sleep,
         monotonic=time.monotonic,
-        emit=_emit,
+        emit=emit,
         stop_requested=stop.is_set,
+        open_item=lambda n: run.open_item(name="item.chunk", attributes={"fc.chunk": n}),
     )
     if skipped:
-        _emit({"event": "worklist", "items": len(items), "skipped_lines": skipped})
+        emit({"event": "worklist", "items": len(items), "skipped_lines": skipped})
     try:
         return run_batch(items, config, rt)
     finally:
@@ -2291,14 +2325,29 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """``sql`` prints its query (the product, plain text); ``run`` is one root
+    trace in the estate's lines (LG-U11): job.start, one ``app.<event>`` line
+    per event (chunk, plan, paused ...), job.end with the counts and ``exit``."""
     args = _parser().parse_args(argv)
-    try:
-        if args.command == "sql":
+    if args.command == "sql":
+        try:
             return _sql(args)
-        return _run(args)
-    except Refused as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return 2
+        except Refused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+    log = telemetry.configure(SERVICE)
+    telemetry.start_tracing(SERVICE)
+    lines = EventLines(log, summarize=_SUMMARIZED)
+    try:
+        return telemetry.run_job(
+            SERVICE,
+            lambda run: _run(args, lines, run),
+            logger=log,
+            counts=lambda code: {**lines.summary, "exit": code},
+            ok=lambda code: code == 0,
+        )
+    except Refused:
+        return 2  # job.end says why (err)
 
 
 if __name__ == "__main__":  # pragma: no cover

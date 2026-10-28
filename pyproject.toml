@@ -26,6 +26,10 @@ httpx = "^0.27.0"
 scipy = "^1.18.1"
 grpcio = "1.84.0"
 protobuf = "7.36.2"
+# Trace ids on every log line (app.telemetry). The SDK pins the same API
+# version, so both move together. No exporter package: nothing leaves the process.
+opentelemetry-api = "1.45.1"
+opentelemetry-sdk = "1.45.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
@@ -42,6 +46,8 @@ pytest-cov = "^7.0.0"
 grpcio-tools = "1.84.0"
 types-grpcio = "1.84.0.20260928"
 types-protobuf = "7.35.1.20260906"
+# Validates log lines against fc-shared's published log-shape schema (tests only).
+jsonschema = "^4.26.0"
 pytest-timeout = "^2.4.0"
 
 # Ruff config lives in ruff.toml, which takes precedence over any [tool.ruff]

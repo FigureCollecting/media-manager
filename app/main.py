@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,10 +9,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from . import telemetry
 from .boot_guard import enforce_boot_guard, mount_auth_routers
 from .config import Settings, get_settings
 from .db import get_db
-from .logging import setup_logging
 from .rate_limit import RateLimitMiddleware
 from .routes.album_routes import router as album_router
 from .routes.external_routes import router as external_router
@@ -22,15 +21,22 @@ from .routes.image_routes import router as image_router
 from .routes.search_routes import router as search_router
 from .routes.serve_routes import router as serve_router
 from .routes.tag_routes import router as tag_router
+from .telemetry.http import AccessLogMiddleware
+
+SERVICE = "media-api"
+# Tracing first, before any request: every line under a request carries its trace_id.
+telemetry.start_tracing(SERVICE)
+#: The http.in lines' logger; configure() routes Python's logging to the same shape.
+LOG = telemetry.Logger(service=telemetry.service_name(SERVICE))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    setup_logging(settings.log_level)
-    logging.getLogger(__name__).info("app_start", extra={"env": settings.environment})
+    log = telemetry.configure(SERVICE, level=settings.log_level)
+    log.info("media-api started", event="app.start", env=settings.environment)
     yield
-    logging.getLogger(__name__).info("app_stop")
+    log.info("media-api stopping", event="app.stop")
 
 
 app = FastAPI(title="media-manager", lifespan=lifespan)
@@ -59,6 +65,10 @@ async def add_request_id(request: Request, call_next):  # type: ignore[no-untype
     response: Response = await call_next(request)
     response.headers["x-request-id"] = request_id
     return response
+
+
+# Outermost of the app's middleware: one http.in line per request, 429s included.
+app.add_middleware(AccessLogMiddleware, logger=LOG)
 
 
 @app.exception_handler(Exception)

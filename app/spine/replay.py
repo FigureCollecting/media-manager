@@ -839,9 +839,12 @@ def run_replay(
     emit: Callable[[dict[str, Any]], None],
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     sleep: Callable[[float], None] = time.sleep,
+    item: Callable[[int, Callable[[], int | None]], int | None] = lambda _index, fn: fn(),
 ) -> int:
     """Replay the media DB into the spine. ``connect`` opens the client, and
-    is never called on a dry run. Returns the exit status."""
+    is never called on a dry run. Returns the exit status. Each batch -- its
+    lease, its calls and its line -- runs inside ``item(index, fn)``: mm-report
+    makes each one an item of its run (its own trace, linked to the run)."""
     started = now()
     plan = load_plan(db, details=False)
     ledger: SpineReportRun | None = None
@@ -894,11 +897,12 @@ def run_replay(
             "cursor": cursor,
         }
     )
-    for batch in batches:
+
+    def one(batch: Batch) -> int | None:
         plan.load(db, {plan.copy_of[o] for o in batch.origins}.union(batch.copies_due))
         if config.dry_run:
             emit(run.plan_only(batch).line(None))
-            continue
+            return None
         assert ledger is not None
         report, stop = run.batch(batch)
         ledger.counts = dict(Counter(ledger.counts) + report.flat())
@@ -911,6 +915,11 @@ def run_replay(
             ledger.cursor_sha256 = batch.origins[-1]
         ledger.resume_not_before = None
         db.commit()
+        return None
+
+    for batch in batches:
+        if item(batch.index, partial(one, batch)) is not None:
+            return EXIT_STOPPED
     code = EXIT_REFUSED if ledger is not None and _failed(ledger.counts) else EXIT_DONE
     if ledger is not None:
         ledger.status, ledger.finished_at = "done", now()

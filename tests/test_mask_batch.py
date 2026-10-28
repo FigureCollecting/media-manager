@@ -60,6 +60,24 @@ PICTURE = "https://static.myfigurecollection.net/upload/pictures/2024/01/02/{n}.
 # --------------------------------------------------------------------------
 
 
+def _stdout_events(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    """main's stdout (LG-U11): the estate's lines, each event under its own name again."""
+    out = []
+    for line in capsys.readouterr().out.splitlines():
+        event = json.loads(line)
+        event["event"] = event["event"].removeprefix("app.")
+        out.append(event)
+    return out
+
+
+def _refusal(capsys: pytest.CaptureFixture[str]) -> str:
+    """Why main refused: the run's job.end err (stderr stays empty)."""
+    captured = capsys.readouterr()
+    end = json.loads(captured.out.splitlines()[-1])
+    assert (end["event"], end["code"], captured.err) == ("job.end", "error", "")
+    return str(end["err"]["message"])
+
+
 def _photo(n: int) -> bytes:
     arr = np.full((60, 40, 3), (250, 250, 248), dtype=np.uint8)
     arr[10:50, 12:28] = (31 + 10 * n % 200, 30, 90)
@@ -1131,7 +1149,7 @@ def test_main_refuses_a_malformed_work_list(
     wl.write_text(_line("Z" * 64, 0) + "\n")
     code = mb.main(["run", "--worklist", str(wl), "--no-residential-check", "--dry-run"])
     assert code == 2
-    assert "blob_sha256" in capsys.readouterr().err
+    assert "blob_sha256" in _refusal(capsys)
 
 
 def test_main_dry_run_prints_the_plan(
@@ -1154,11 +1172,13 @@ def test_main_dry_run_prints_the_plan(
             "--dry-run",
         ]
     )
-    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    out = _stdout_events(capsys)
     plan = next(e for e in out if e["event"] == "plan")
     assert code == 0
     assert plan["pending"] == 2
-    assert plan["gate"]["ok"] is False and plan["gate"]["gate"] == "residential"
+    gate = json.loads(plan["gate"])
+    assert gate["ok"] is False and gate["gate"] == "residential"
+    assert (out[0]["event"], out[-1]["event"], out[-1]["exit"]) == ("job.start", "job.end", 0)
 
 
 def test_main_runs_a_sandbox_batch_end_to_end(
@@ -1187,12 +1207,35 @@ def test_main_runs_a_sandbox_batch_end_to_end(
         "1",
     ]
     assert mb.main(argv) == 0
-    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    out = _stdout_events(capsys)
     assert [e["count"] for e in out if e["event"] == "chunk"] == [1, 1]
     assert len(mb.Progress(progress).load()) == 2
     assert mb.main(argv) == 0  # resumed: nothing left
-    again = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    again = _stdout_events(capsys)
     assert next(e for e in again if e["event"] == "start")["pending"] == 0
+
+
+def test_main_runs_each_chunk_as_an_item_of_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """LG-U11: one root trace per run, one new trace per chunk (fc-shared's job
+    model); every line carries run_id, the run's trace id."""
+    raw = _Raw(tmp_path / "raw")
+    wl = _worklist_file(tmp_path, [raw.add(1, rank=0), raw.add(2, rank=0)])
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Model())
+    argv = ["--sandbox", str(tmp_path / "sandbox"), "run", "--worklist", str(wl)]
+    argv += ["--raw-dir", str(tmp_path / "raw"), "--progress", str(tmp_path / "p.jsonl")]
+    argv += ["--device", "cpu", "--no-residential-check", "--busy-windows", "", "--chunk-size", "1"]
+    assert mb.main(argv) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    run_id = lines[0]["trace_id"]
+    chunks = [line["trace_id"] for line in lines if line["event"] == "app.chunk"]
+    assert len(chunks) == 2 and len({run_id, *chunks}) == 3
+    assert {line["run_id"] for line in lines} == {run_id}
+    assert {
+        lines[-1]["trace_id"],
+        next(x for x in lines if x["event"] == "app.done")["trace_id"],
+    } == {run_id}
 
 
 def test_main_reads_originals_from_the_raw_bucket_named_in_the_environment(
@@ -1204,7 +1247,7 @@ def test_main_reads_originals_from_the_raw_bucket_named_in_the_environment(
     for name in ("RAW_S3_ENDPOINT_URL", "RAW_S3_BUCKET", "RAW_S3_ACCESS_KEY", "RAW_S3_SECRET_KEY"):
         monkeypatch.delenv(name, raising=False)
     assert mb.main(argv) == 2
-    assert "RAW_S3_ENDPOINT_URL" in capsys.readouterr().err
+    assert "RAW_S3_ENDPOINT_URL" in _refusal(capsys)
     monkeypatch.setenv("RAW_S3_ENDPOINT_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("RAW_S3_BUCKET", "raw")
     monkeypatch.setenv("RAW_S3_ACCESS_KEY", "k")
@@ -1239,7 +1282,7 @@ def test_main_stops_cleanly_on_sigterm(
     argv += [str(tmp_path / "raw"), "--progress", str(tmp_path / "p.jsonl"), "--device", "cpu"]
     argv += ["--no-residential-check", "--busy-windows", ""]
     assert mb.main(argv) == 130
-    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    out = _stdout_events(capsys)
     assert next(e for e in out if e["event"] == "worklist")["skipped_lines"] == 1
     assert (
         next(e for e in out if e["event"] == "chunk")["count"] == 1
@@ -1292,9 +1335,9 @@ def test_main_wires_the_gpu_less_pass_to_device_auto_only(
     wl = _worklist_file(tmp_path, [])
     argv = ["run", "--worklist", str(wl), "--device", device, "--no-residential-check"]
     assert mb.main([*argv, "--busy-windows", "", "--dry-run"]) == 0
-    out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    out = _stdout_events(capsys)
     plan = next(e for e in out if e["event"] == "plan")
-    assert plan["gate"]["ok"] is gate_ok
+    assert json.loads(plan["gate"])["ok"] is gate_ok
 
 
 def test_a_copy_just_written_is_read_back_from_memory(tmp_path: Path) -> None:

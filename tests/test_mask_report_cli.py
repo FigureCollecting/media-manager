@@ -27,6 +27,10 @@ def _lines(out: str) -> list[dict[str, object]]:
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
+def _event(lines: list[dict[str, object]], event: str) -> dict[str, object]:
+    return next(x for x in lines if x["event"] == event)
+
+
 def test_a_dry_run_needs_no_spine_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -34,9 +38,15 @@ def test_a_dry_run_needs_no_spine_and_writes_nothing(
     monkeypatch.delenv("SPINE_MEDIA_URL", raising=False)
     assert cli.main(["--sandbox", sandbox, "--dry-run"]) == 0
     lines = _lines(capsys.readouterr().out)
-    assert lines[0]["event"] == "plan" and lines[0]["dry_run"] is True
+    assert [lines[0]["event"], lines[1]["event"], lines[-1]["event"]] == [
+        "job.start",
+        "app.plan",
+        "job.end",
+    ]
+    assert lines[1]["dry_run"] is True and lines[-1]["dry_run"] is True
     lease = next(x for x in lines if x.get("rpc") == "LeasePendingImages")
-    assert lease["origin_sha256"] == [seeded["a"]["origin"]]
+    assert lease["event"] == "app.would_send"
+    assert json.loads(str(lease["origin_sha256"])) == [seeded["a"]["origin"]]
     engine = create_engine(f"sqlite:///{tmp_path / 'masks.db'}")
     with Session(engine) as db:
         assert db.execute(select(SpineReportRun)).first() is None
@@ -57,8 +67,11 @@ def test_a_run_reports_to_the_spine_named_by_the_environment(
     lease = fake.sent("LeasePendingImages")[0]
     assert (lease.max_items, lease.lease_seconds) == (200, 30)
     assert lease.lease_owner.startswith("mm-report run 1 on ")
-    done = _lines(capsys.readouterr().out)[-1]
-    assert done["event"] == "done" and done["exit"] == 0
+    lines = _lines(capsys.readouterr().out)
+    done, end = _event(lines, "app.done"), lines[-1]
+    assert done["exit"] == 0
+    assert (end["event"], end["code"], end["exit"], end["originals"]) == ("job.end", "ok", 0, 1)
+    assert end["report_derivative_stored"] == 1
 
 
 @pytest.mark.parametrize(
@@ -82,7 +95,10 @@ def test_bad_arguments_are_refused_before_anything_runs(
     sandbox, _ = _sandbox(tmp_path)
     monkeypatch.delenv("SPINE_MEDIA_URL", raising=False)
     assert cli.main(["--sandbox", sandbox, *argv]) == 2
-    assert why in capsys.readouterr().err
+    out = capsys.readouterr()
+    end = _lines(out.out)[-1]
+    assert (end["event"], end["code"], out.err) == ("job.end", "error", "")
+    assert why in str(end["err"])
     engine = create_engine(f"sqlite:///{tmp_path / 'masks.db'}")
     with Session(engine) as db:
         assert db.execute(select(SpineReportRun)).first() is None
@@ -104,5 +120,5 @@ def test_without_a_sandbox_the_configured_database_is_read(
     engine = create_engine(f"sqlite:///{Path(sandbox) / 'masks.db'}")
     monkeypatch.setattr(app.db, "SessionLocal", lambda: Session(engine, expire_on_commit=False))
     assert cli.main(["--dry-run"]) == 0
-    assert _lines(capsys.readouterr().out)[0]["originals"] == 1
+    assert _event(_lines(capsys.readouterr().out), "app.plan")["originals"] == 1
     engine.dispose()
