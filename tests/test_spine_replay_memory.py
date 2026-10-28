@@ -16,18 +16,27 @@ from __future__ import annotations
 
 import datetime as dt
 import gc
+import sys
 import tracemalloc
+from typing import Any
 
+import grpc
 from app.models import Image, ImageMask, ImageVersion, PublicObject, PublicObjectImage
 from app.spine import replay as rp
+from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
+from app.spine.media_v1 import media_pb2
 from sqlalchemy import insert
 from sqlalchemy.orm import Session
 
-from spine_fakes import AT, sha
+from spine_fakes import AT, FakeSpine, serve, sha
 
 #: Bytes of peak memory per original the replay may add. The plan before
 #: GKPH-S3-2 measured ~7,400 here; the index alone needs well under half.
 MAX_BYTES_PER_ORIGINAL = 3_000
+
+#: Live allocator blocks a REAL run may gain per original it has passed.
+#: Holding every landed copy for the whole run measured over 1 here.
+MAX_BLOCKS_PER_PASSED_ORIGINAL = 0.25
 
 
 def _bulk_copies(db: Session, start: int, count: int) -> None:
@@ -151,3 +160,62 @@ def test_the_replay_adds_a_bounded_few_kilobytes_per_original(db_session: Sessio
     high = _peak_of_a_dry_run(db_session)
     per_original = (high - low) / (large - small)
     assert per_original < MAX_BYTES_PER_ORIGINAL, f"{per_original:.0f} bytes per original"
+
+
+class _ForgetfulSpine(FakeSpine):
+    """Answers every call as a healthy spine would and keeps nothing per
+    call, so what the process gains along a run is the replay's."""
+
+    reports = 0
+    masks_sent = 0
+
+    def _enter(self, rpc: str, request: Any, context: grpc.ServicerContext) -> None:
+        pass
+
+    def ReportDerivative(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
+        self.depictions[request.product_image_id]["state"] = "derived"
+        self.held.discard(request.product_image_id)
+        self.reports += 1
+        return media_pb2.DerivativeAck(stored=True, product_image_state="derived")
+
+    def ReportMask(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
+        self.masks_sent += 1
+        return media_pb2.MaskAck(stored=1, matched=1)
+
+
+def test_a_real_run_holds_nothing_more_for_the_originals_it_has_passed(
+    db_session: Session,
+) -> None:
+    """A copy's derivative is remembered until its masks are due (a
+    FAILED_PRECONDITION is then judged unregistered, not orphan), not for the
+    rest of the run. Counted in live allocator blocks, not tracemalloc: with
+    the spine in the same process, CPython's free lists hand blocks first
+    traced to the replay over to the spine's state."""
+    count, size = 2_400, 100
+    _bulk_copies(db_session, 0, count)
+    fake = _ForgetfulSpine()
+    for i in range(count):
+        fake.depict(sha(f"orig:{i}"))
+    first, last = 2, count // size - 1
+    blocks: dict[int, int] = {}
+
+    def emit(line: dict[str, Any]) -> None:
+        if line.get("event") == "batch" and line["batch"] in (first, last):
+            gc.collect()
+            blocks[line["batch"]] = sys.getallocatedblocks()
+
+    with serve(fake) as url:
+        code = rp.run_replay(
+            db_session,
+            rp.ReplayConfig(batch_size=size),
+            connect=lambda: SpineMediaClient(
+                open_channel(url), policy=RetryPolicy(max_attempts=1), sleep=lambda s: None
+            ),
+            emit=emit,
+            now=lambda: AT + dt.timedelta(hours=1),
+            sleep=lambda s: None,
+        )
+    assert code == rp.EXIT_DONE
+    assert fake.reports == count and fake.masks_sent == count
+    per_original = (blocks[last] - blocks[first]) / ((last - first) * size)
+    assert per_original < MAX_BLOCKS_PER_PASSED_ORIGINAL, f"{per_original:.2f} blocks per original"

@@ -523,6 +523,8 @@ class _Run:
     started: dt.datetime
     ledger: SpineReportRun | None
     owner: str
+    #: copies this run reported a derivative for and whose masks are not yet
+    #: due: dropped once they are, so the run holds no more as it passes
     landed: set[str] = field(default_factory=set)
     withdrawn_now: set[str] = field(default_factory=set)
 
@@ -740,6 +742,7 @@ class _Run:
                 clean = self._lease_and_report(report)
             for copy in batch.copies_due:
                 self._report_masks(report, copy)
+                self.landed.discard(copy)  # its masks are due once per run: now
                 self._restores(report, copy)
                 self._withdrawals(report, copy)
         except _Stop as stop:

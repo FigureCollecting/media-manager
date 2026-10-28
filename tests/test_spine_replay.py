@@ -458,6 +458,23 @@ def test_a_mask_whose_derivative_landed_is_retried_on_failed_precondition(
     assert _batches(lines)[0]["ReportMask"]["stored"] == 1
 
 
+def test_a_derivative_landed_in_an_earlier_batch_still_makes_its_mask_unregistered(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    fake, url = spine
+    a = seed_copy(db_session, "a", extra_originals=("a2",))
+    first, last = sorted([a["origin"], *a["others"]])
+    fake.depict(first)  # the copy lands in batch 0; its masks are due in batch 1
+    fake.fail("ReportMask", C.FAILED_PRECONDITION, C.FAILED_PRECONDITION)
+    code, lines = _run(db_session, url, attempts=2, batch_size=1)
+    assert code == rp.EXIT_REFUSED
+    landed, due = _batches(lines)[:2]
+    assert landed["ReportDerivative"]["ok"] == 1 and landed["ReportMask"]["calls"] == 0
+    assert due["batch"] == 1 and due["ReportMask"]["unregistered"] == 1
+    assert due["ReportMask"]["orphan"] == 0 and due["orphans"] == []
+    assert len(fake.sent("ReportMask")) == 2  # retried: the derivative had landed
+
+
 def test_a_refused_report_is_counted_by_status_and_the_run_ends_1(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
