@@ -12,6 +12,8 @@
     python -m app.cli.masks [--sandbox DIR] reevaluate [--apply]
     python -m app.cli.masks [--sandbox DIR] revoke-store SOURCE [--apply]
     python -m app.cli.masks [--sandbox DIR] restore-store SOURCE [--apply] [--backend ...]
+    python -m app.cli.masks [--sandbox DIR] official-gallery --worklist FILE [--worklist FILE ...]
+                                                             [--apply]
 
 ``run`` is a DRY RUN unless ``--apply``: it computes and prints every mask's
 outcome and grounding, and writes nothing. ``--apply`` needs a mask model
@@ -23,7 +25,12 @@ required, see app.workers.matting); the default is the configured backend.
 ``revoke-store`` / ``restore-store`` (MASK-G) withdraw or bring back every
 mask of one source; dry runs unless ``--apply`` (README runbook "A store
 asks for its cut-outs to be removed"). ``restore-store --apply`` needs a mask
-model, like ``run --apply``.
+model, like ``run --apply``. ``official-gallery`` (GAL3) records the gallery
+list's source class on the links of the photos settled before it was carried
+and clears the ``ineligible`` row of each copy the full judgment now allows,
+so the next mask run mints it (app.workers.gallery_rejudge); its work lists
+come from ``mask_batch sql official-gallery-worklist``; a dry run unless
+``--apply``.
 Exit status: 0 done, 2 refused (nothing was changed by the refused step).
 
 Output (LG-U11): the estate's log lines on stdout, one run = one root span
@@ -56,6 +63,7 @@ from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
 from ..telemetry.events import report_lines
 from ..workers.basekept import BaseKeptMattingBackend
+from ..workers.gallery_rejudge import GalleryCapture, rejudge_official_gallery
 from ..workers.mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import seed_clean_image
@@ -66,6 +74,7 @@ from ..workers.matting import (
     StubMattingBackend,
     get_matting_backend,
 )
+from .mask_batch import read_worklists
 
 #: Grounding fields summarised as [min, max] over a run's measured masks.
 RANGE_FIELDS = (
@@ -238,6 +247,20 @@ def _report(db: Session, batch_id: int) -> dict[str, Any]:
     }
 
 
+def _official_gallery(db: Session, args: argparse.Namespace) -> dict[str, Any]:
+    """GAL3: every row of the work lists, one gallery link each (not each
+    original once), through app.workers.gallery_rejudge."""
+    try:
+        items, skipped = read_worklists([Path(p) for p in args.worklist], every_row=True)
+    except (OSError, ValueError) as exc:
+        raise Refused(str(exc)) from exc
+    captures = [
+        GalleryCapture(i.blob_sha256, i.product_id, i.url, i.source, i.source_class) for i in items
+    ]
+    report = rejudge_official_gallery(db, captures, dry_run=not args.apply)
+    return {**report, "skipped_lines": skipped}
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m app.cli.masks", description=__doc__.split("\n")[0])
     p.add_argument("--sandbox", help="keep the lane in this directory (SQLite + local objects)")
@@ -279,6 +302,20 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("source")
     restore.add_argument("--apply", action="store_true", help="store the change (default: dry run)")
     _backend_options(restore)
+
+    gallery = sub.add_parser(
+        "official-gallery",
+        help="re-judge refused photos of MFC's official gallery list (dry run by default)",
+    )
+    gallery.add_argument(
+        "--worklist",
+        action="append",
+        required=True,
+        help="mask_batch sql official-gallery-worklist output (repeatable)",
+    )
+    gallery.add_argument(
+        "--apply", action="store_true", help="store the changes (default: dry run)"
+    )
     return p
 
 
@@ -333,6 +370,8 @@ def _command(
             return _reevaluate(db, args, run, log)
         if args.command in ("revoke-store", "restore-store"):
             return _store_command(db, store, args)
+        if args.command == "official-gallery":
+            return _official_gallery(db, args)
         return _report(db, args.batch)
     finally:
         db.close()

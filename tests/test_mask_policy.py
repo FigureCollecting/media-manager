@@ -13,8 +13,9 @@ by default). MASK-G: every registered source is granted, and a revoked one
 (MASK_STORE_REVOKED, ``masks revoke-store``) is refused whatever its grant.
 Everything else is refused: an unregistered source or host, a host that does
 not match the recorded source, a URL carrying credentials or a backslash, an
-IP literal. media-manager records an origin as (source, url) only, so nothing
-else about the image is consulted.
+IP literal. media-manager records an origin as (source, url) and the capture
+lane's source class; the class decides only between a collector's photo and
+MFC's official gallery list (GAL3, TestOfficialGallery).
 """
 
 from __future__ import annotations
@@ -363,3 +364,134 @@ class TestStoreRevocation:
         _revoke(monkeypatch, ["amiami"])
         o = ImageOrigin(url=AMIAMI, source="amiami")
         assert classify_origin(o, revoked=frozenset()) == "store_listing"
+
+
+#: What the gallery-capture lane stamps on every photo it captures from MFC's
+#: official pictures list (scraper GALLERY_SOURCE_CLASS, desk GALSRC b): the
+#: spine's product_image.source_class, carried to media-manager by the work list.
+PRESS = "manufacturer_press"
+PICTURE_ENDPOINT = (
+    "https://myfigurecollection.net/?_tb=commit&commit=nsp&objectType=picture&objectId=77&size=1"
+)
+
+
+def _gallery(url: str = PICTURE, source: str = "mfc", source_class: str | None = PRESS):
+    return ImageOrigin(url=url, source=source, source_class=source_class)
+
+
+class TestOfficialGallery:
+    """GAL3 (Ross 2026-10-28): the official MFC gallery list gets cut-outs,
+    on by default. Decided by the photo's PROVENANCE -- the source class the
+    gallery-capture lane recorded -- never by its path: a collector's own
+    upload shares /upload/pictures/ and stays refused."""
+
+    def test_a_gallery_list_photo_is_eligible_by_default(self) -> None:
+        e = mask_eligibility([_gallery()])
+        assert (e.eligible, e.origin_class, e.reason) == (True, "official_gallery", "eligible")
+
+    def test_with_the_setting_off_it_is_refused_as_before(self) -> None:
+        assert classify_origin(_gallery(), official_gallery=False) == "user_photo"
+        e = mask_eligibility([_gallery()], official_gallery=False)
+        assert (e.eligible, e.origin_class, e.reason) == (False, "user_photo", "user_photo")
+
+    def test_the_configured_setting_is_read_when_none_is_given(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MASK_MFC_OFFICIAL_GALLERY", "false")
+        get_settings.cache_clear()
+        assert classify_origin(_gallery()) == "user_photo"
+        assert classify_origin(_gallery(), official_gallery=True) == "official_gallery"
+
+    @pytest.mark.parametrize(
+        "source_class",
+        [
+            None,
+            "unknown",
+            "retailer_studio",
+            "user_photo",
+            "Manufacturer_Press",
+            " manufacturer_press",
+        ],
+    )
+    def test_a_picture_without_gallery_list_provenance_is_still_refused(
+        self, source_class: str | None
+    ) -> None:
+        """Same path, setting on: a collector's own upload (no provenance, or
+        any other class, spelled exactly or not) stays a collector's photo."""
+        e = mask_eligibility([_gallery(source_class=source_class)])
+        assert (e.eligible, e.origin_class) == (False, "user_photo")
+
+    def test_the_picture_endpoint_is_judged_by_provenance_too(self) -> None:
+        assert classify_origin(_gallery(url=PICTURE_ENDPOINT)) == "official_gallery"
+        assert classify_origin(_gallery(url=PICTURE_ENDPOINT, source_class=None)) == "user_photo"
+
+    def test_provenance_changes_nothing_but_a_collectors_path(self) -> None:
+        """An item image stays an item image; an MFC URL no rule knows stays
+        unknown (fail closed); provenance never vouches for a host."""
+        assert classify_origin(_gallery(url=ITEM)) == "item_main"
+        bad = "https://myfigurecollection.net/x"
+        assert classify_origin(_gallery(url=bad)) == "unknown_origin"
+        assert classify_origin(_gallery(source="hpoi")) == "unknown_origin"
+        other = "https://static.example/upload/pictures/2024/01/02/1.jpeg"
+        assert classify_origin(_gallery(url=other)) == "unknown_origin"
+
+    def test_provenance_never_grants_a_store(self) -> None:
+        o = ImageOrigin(url=AMIAMI, source="amiami", source_class=PRESS)
+        assert classify_origin(o) == "not_granted"
+
+    def test_a_revoked_mfc_refuses_the_gallery_list_too(self) -> None:
+        o = _gallery()
+        assert classify_origin(o, revoked=frozenset({"mfc"})) == "store_revoked"
+        e = mask_eligibility([o], revoked=frozenset({"mfc"}))
+        assert (e.eligible, e.reason) == (False, "store_revoked")
+
+    def test_the_same_bytes_as_a_collectors_photo_somewhere_are_refused(self) -> None:
+        e = mask_eligibility(
+            [_gallery(), _gallery(url=PICTURE.replace("123456", "9"), source_class=None)]
+        )
+        assert (e.eligible, e.origin_class) == (False, "user_photo")
+
+    def test_beside_an_item_image_it_is_eligible(self) -> None:
+        e = mask_eligibility([ImageOrigin(url=ITEM, source="mfc"), _gallery()])
+        assert (e.eligible, e.origin_class) == (True, "item_main")
+
+
+class TestOfficialGallerySetting:
+    """MASK_MFC_OFFICIAL_GALLERY: a boolean, true unless set; a value that is
+    not a boolean fails to load (as MASK_STORE_REVOKED does), never guessed."""
+
+    def test_it_is_on_by_default(self) -> None:
+        assert Settings(environment="test").mask_mfc_official_gallery is True
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("true", True),
+            ("TRUE", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("t", True),
+            ("y", True),
+            ("false", False),
+            ("False", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("f", False),
+            ("n", False),
+        ],
+    )
+    def test_the_environment_sets_it(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("MASK_MFC_OFFICIAL_GALLERY", raw)
+        assert Settings(environment="test").mask_mfc_official_gallery is expected
+
+    @pytest.mark.parametrize("raw", ["junk", "", " ", " true ", "maybe", "2", "none"])
+    def test_a_junk_value_fails_to_load(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+        from pydantic import ValidationError
+
+        monkeypatch.setenv("MASK_MFC_OFFICIAL_GALLERY", raw)
+        with pytest.raises(ValidationError, match="mask_mfc_official_gallery"):
+            Settings(environment="test")

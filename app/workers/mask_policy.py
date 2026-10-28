@@ -7,6 +7,16 @@ that represents the ITEM, and only where its source permits it:
   ``/upload/items/`` (or the item image endpoint) get a mask; a collector's
   own photo (``/upload/pictures/``) never does -- it may still be shown,
   unmasked, wherever display allows it.
+- GAL3 (Ross 2026-10-28): a photo of MFC's OFFICIAL gallery list gets a mask
+  although it lives under ``/upload/pictures/`` too (``official_gallery``),
+  while ``Settings.mask_mfc_official_gallery`` (env
+  ``MASK_MFC_OFFICIAL_GALLERY``, on by default) allows it. It is told apart
+  by PROVENANCE, never by its path: the gallery-capture lane records every
+  photo it takes from that list as ``manufacturer_press`` (the scraper's
+  GALLERY_SOURCE_CLASS, desk GALSRC b; the spine's
+  ``product_image.source_class``), the work list carries that class here and
+  the seed keeps it on the gallery link (``figure_galleries.source_class``).
+  A picture with any other class, or none, is a collector's photo.
 - A store's listing photo gets a mask when its source is a REGISTERED store
   source and the bytes came from one of its domains
   (``Settings.mask_store_grants``, env ``MASK_STORE_GRANTS`` =
@@ -24,8 +34,9 @@ WHY THE ORIGIN AND NOT THE ROLE. Measured 2026-10-09 (SIZE-MEASURE): every
 captured MFC image row carries role ``gallery``, whether it came from
 ``/upload/items/`` or would come from ``/upload/pictures/``; only the URL the
 bytes were captured from separates the two lanes. media-manager records an
-origin as (source, url) only (``figure_galleries``), so that is all this
-policy reads.
+origin as (source, url) and, where the capture lane classified it, the
+source class (``figure_galleries``), so that is all this policy reads; the
+class decides only between a collector's photo and the official gallery.
 
 FAIL CLOSED. No mask for: a revoked source (``store_revoked``); an
 unregistered source or a host outside its domains (``not_granted``); an
@@ -52,6 +63,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 OriginClass = Literal[
     "item_main",
+    "official_gallery",
     "store_listing",
     "user_photo",
     "store_revoked",
@@ -61,7 +73,7 @@ OriginClass = Literal[
 ]
 
 #: The origin classes a mask may be made for.
-MASKABLE: frozenset[str] = frozenset({"item_main", "store_listing"})
+MASKABLE: frozenset[str] = frozenset({"item_main", "official_gallery", "store_listing"})
 
 #: Per registered store source, the domains its listing photos come from.
 StoreGrants = Mapping[str, Sequence[str]]
@@ -73,6 +85,10 @@ MFC_SOURCE = "mfc"
 _MFC_DOMAIN = "myfigurecollection.net"
 _MFC_ITEM_PREFIX = "/upload/items/"
 _MFC_PICTURE_PREFIX = "/upload/pictures/"
+
+#: The source class the gallery-capture lane records for MFC's official
+#: gallery list (exact spelling: the spine's CHECK vocabulary).
+OFFICIAL_GALLERY_CLASS = "manufacturer_press"
 
 #: A host as a fetcher resolves it: a DNS name, an IPv4 or an IPv6 literal
 #: (urlsplit lower-cases it and drops the brackets). Anything else -- a
@@ -86,6 +102,9 @@ class ImageOrigin:
 
     url: str | None
     source: str | None = None
+    #: Who made the image, as the capture lane classified it (the spine's
+    #: product_image.source_class); None when it did not classify.
+    source_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,11 +157,22 @@ def configured_revocations() -> Revoked:
     return frozenset(source_key(s) for s in get_settings().mask_store_revoked)
 
 
+def configured_official_gallery() -> bool:
+    """MASK_MFC_OFFICIAL_GALLERY: whether the official gallery list gets masks."""
+    from ..config import get_settings
+
+    return get_settings().mask_mfc_official_gallery
+
+
 def classify_origin(
-    origin: ImageOrigin, store_grants: StoreGrants | None = None, revoked: Revoked | None = None
+    origin: ImageOrigin,
+    store_grants: StoreGrants | None = None,
+    revoked: Revoked | None = None,
+    official_gallery: bool | None = None,
 ) -> OriginClass:
-    """``store_grants`` defaults to the configured grants and ``revoked`` to
-    the configured deny list."""
+    """``store_grants`` defaults to the configured grants, ``revoked`` to
+    the configured deny list and ``official_gallery`` to the configured
+    MASK_MFC_OFFICIAL_GALLERY."""
     if not origin.url:
         return "no_origin"
     if source_key(origin.source or "") in (
@@ -168,7 +198,11 @@ def classify_origin(
         # Judge the path where it actually lands: percent-decode, then resolve
         # any ../ so /upload/items/../pictures/ is a picture.
         path = posixpath.normpath(unquote(parts.path or "/"))
-        return _classify_mfc(path, parts.query)
+        cls = _classify_mfc(path, parts.query)
+        if cls == "user_photo" and origin.source_class == OFFICIAL_GALLERY_CLASS:
+            on = configured_official_gallery() if official_gallery is None else official_gallery
+            return "official_gallery" if on else cls
+        return cls
     grants = configured_store_grants() if store_grants is None else store_grants
     granted = grants.get(origin.source or "", ())
     if any(_within(host, _domain(d)) for d in granted):
@@ -180,10 +214,11 @@ def mask_eligibility(
     origins: Sequence[ImageOrigin],
     store_grants: StoreGrants | None = None,
     revoked: Revoked | None = None,
+    official_gallery: bool | None = None,
 ) -> MaskEligibility:
     if not origins:
         return MaskEligibility(eligible=False, origin_class="no_origin", reason="no_origin")
-    classes = [classify_origin(o, store_grants, revoked) for o in origins]
+    classes = [classify_origin(o, store_grants, revoked, official_gallery) for o in origins]
     for cls in classes:
         if cls not in MASKABLE:
             return MaskEligibility(eligible=False, origin_class=cls, reason=cls)

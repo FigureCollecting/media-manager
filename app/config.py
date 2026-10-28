@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     # persists at run time (mask_store_revocations). README runbook "A store
     # asks for its cut-outs to be removed".
     mask_store_revoked: list[str] = []
+    # GAL3 (Ross 2026-10-28): cut-outs for the photos of MFC's OFFICIAL
+    # gallery list, on by default. Decided by provenance, never by path: a
+    # photo qualifies only when the gallery-capture lane recorded it as
+    # ``manufacturer_press`` (app.workers.mask_policy); a collector's own
+    # upload under the same /upload/pictures/ path stays refused. Env
+    # MASK_MFC_OFFICIAL_GALLERY: true/false, 1/0, yes/no, on/off, t/f, y/n (any
+    # case); any other value, an empty one or one padded with spaces included,
+    # fails to load. A revoked "mfc" still refuses every MFC mask.
+    mask_mfc_official_gallery: bool = True
 
     # Rate limiting
     rate_limit_per_minute: int = 120

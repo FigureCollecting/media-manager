@@ -324,3 +324,45 @@ def test_downgrading_the_spine_report_ledger_restores_the_mask_lanes_schema(
         with admin_engine.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
         admin_engine.dispose()
+
+
+def test_downgrading_the_gallery_source_class_restores_the_ledgers_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0006's downgrade (GAL3) drops exactly figure_galleries.source_class."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    migrated = create_engine(empty_database_url)
+    try:
+        columns = {c["name"]: c for c in inspect(migrated).get_columns("figure_galleries")}
+        assert columns["source_class"]["nullable"] is True
+    finally:
+        migrated.dispose()
+    down = _run_alembic(
+        "downgrade", "0005_add_spine_report_ledger", database_url=empty_database_url
+    )
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0005_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0005_add_spine_report_ledger", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            names = {c["name"] for c in inspect(downgraded_engine).get_columns("figure_galleries")}
+            assert "source_class" not in names
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()

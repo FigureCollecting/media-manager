@@ -432,10 +432,10 @@ def seed_clean_image(
     for origin in origins:
         url = origin.url or ""
         linked = db.execute(
-            select(FigureGallery.id).where(
+            select(FigureGallery).where(
                 FigureGallery.figure_id == figure_id, FigureGallery.source_url == url
             )
-        ).first()
+        ).scalar_one_or_none()
         if linked is None:
             db.add(
                 FigureGallery(
@@ -444,7 +444,11 @@ def seed_clean_image(
                     image_id=image.id,
                     position=0,
                     source=origin.source or "unknown",
+                    source_class=origin.source_class,
                 )
             )
+        elif linked.source_class is None and origin.source_class is not None:
+            # GAL3: a class beats none and is never replaced (the spine's merge rule).
+            linked.source_class = origin.source_class
     db.commit()
     return obj

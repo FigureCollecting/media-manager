@@ -274,6 +274,46 @@ def test_read_worklists_concatenates_files_before_ordering(tmp_path: Path) -> No
     assert skipped == 0
 
 
+def test_a_row_carries_the_source_class_the_spine_recorded() -> None:
+    """GAL3: the class the capture lane gave the depiction (the spine's
+    product_image.source_class), absent or null when it gave none."""
+    a, b, c = "a" * 64, "b" * 64, "c" * 64
+    items, _ = mb.parse_worklist(
+        [
+            _line(a, 0),
+            _line(b, 0, source_class="manufacturer_press"),
+            _line(c, 0, source_class=None),
+        ]
+    )
+    assert [i.source_class for i in items] == [None, "manufacturer_press", None]
+    assert items[1].as_row()["source_class"] == "manufacturer_press"
+
+
+@pytest.mark.parametrize("bad", ["junk", "", "Manufacturer_Press", 7, True])
+def test_a_source_class_outside_the_vocabulary_is_refused(bad: object) -> None:
+    with pytest.raises(ValueError, match="line 1: source_class"):
+        mb.parse_worklist([_line("a" * 64, 0, source_class=bad)])
+
+
+def test_every_row_can_be_read_in_file_order(tmp_path: Path) -> None:
+    """``masks official-gallery`` needs every depiction, not each original once."""
+    (tmp_path / "a.jsonl").write_text(
+        _line("a" * 64, 9, product_id="p1")
+        + "\n"
+        + "(2 rows)\n"
+        + _line("a" * 64, 0, product_id="p2")
+        + "\n"
+    )
+    (tmp_path / "b.jsonl").write_text(_line("d" * 64, 0) + "\n")
+    items, skipped = mb.read_worklists([tmp_path / "a.jsonl", tmp_path / "b.jsonl"], every_row=True)
+    assert [(i.blob_sha256[0], i.product_id) for i in items] == [
+        ("a", "p1"),
+        ("a", "p2"),
+        ("d", "p"),
+    ]
+    assert skipped == 1
+
+
 # --------------------------------------------------------------------------
 # the gates
 # --------------------------------------------------------------------------
@@ -719,6 +759,27 @@ def test_a_failure_the_media_db_recorded_is_reminted_only_with_retry_failed(
     assert run("fresh-2.jsonl", True)["status"] == "ok"
 
 
+def test_the_seed_keeps_the_work_lists_source_class(db_session: Session, tmp_path: Path) -> None:
+    """GAL3: a gallery-list photo is masked on its first pass; a collector's
+    own upload under the same path, with no class, is not."""
+    from app.models import FigureGallery
+
+    raw = _Raw(tmp_path / "raw")
+    gallery = dataclasses.replace(raw.add(1, url=PICTURE), source_class="manufacturer_press")
+    collector = raw.add(2, url=PICTURE)
+    rt = _runtime(db_session, tmp_path, raw)
+    assert mb.run_batch([gallery, collector], mb.BatchConfig(chunk_size=2), rt) == 0
+    rows = db_session.execute(
+        select(ImageMask.status, ImageMask.origin_class).order_by(ImageMask.id)
+    )
+    assert sorted(rows.all()) == [("ineligible", "user_photo"), ("ok", "official_gallery")]
+    links = db_session.execute(select(FigureGallery.source_url, FigureGallery.source_class))
+    assert dict(links.all()) == {
+        PICTURE.format(n=1): "manufacturer_press",
+        PICTURE.format(n=2): None,
+    }
+
+
 def test_per_image_failures_are_counted_and_named(db_session: Session, tmp_path: Path) -> None:
     raw = _Raw(tmp_path / "raw")
     good = raw.add(1, rank=0)
@@ -1123,6 +1184,23 @@ def test_the_catalog_query_shards_by_the_first_byte_of_the_sha() -> None:
             mb.catalog_worklist_sql(bad)
 
 
+def test_every_work_list_carries_the_source_class() -> None:
+    for sql in (mb.catalog_worklist_sql(), mb.official_gallery_worklist_sql()):
+        assert "'source_class', pi.source_class" in sql
+
+
+def test_the_official_gallery_query_is_the_gallery_lists_mfc_images_only() -> None:
+    whole = mb.official_gallery_worklist_sql()
+    _read_only(whole)
+    assert "pi.source_class = 'manufacturer_press'" in whole
+    assert "s.site = 'mfc'" in whole and "get_byte" not in whole
+    shard = mb.official_gallery_worklist_sql("1/4")
+    _read_only(shard)
+    assert "get_byte(pi.blob_sha256, 0) % 4 = 1" in shard
+    with pytest.raises(ValueError, match="shard"):
+        mb.official_gallery_worklist_sql("4/4")
+
+
 # --------------------------------------------------------------------------
 # the command line
 # --------------------------------------------------------------------------
@@ -1301,6 +1379,9 @@ def test_main_prints_the_sql(tmp_path: Path, capsys: pytest.CaptureFixture[str])
     assert "'11111111-1111-4111-8111-111111111111'::uuid" in capsys.readouterr().out
     assert mb.main(["sql", "catalog-worklist", "--shard", "0/4"]) == 0
     assert "% 4 = 0" in capsys.readouterr().out
+    assert mb.main(["sql", "official-gallery-worklist", "--shard", "2/4"]) == 0
+    printed = capsys.readouterr().out
+    assert "% 4 = 2" in printed and "'manufacturer_press'" in printed
     assert mb.main(["sql", "ross-heads", "--user", "nope"]) == 2
 
 

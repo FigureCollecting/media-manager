@@ -6,8 +6,8 @@ read-only transaction (``default_transaction_read_only=on``). This runs them
 through psql in a disposable PostgreSQL 17 container (pg-spine's major)
 against a MIRROR of the tables they read: the columns, types and keys copied
 from fc-coordinator 0002/0003 (``facet_state``) and fc-aggregation
-0001/0005/0026 (``product``, ``source``, ``raw.url``, ``raw.blob``,
-``raw.capture``, ``product_image``). It proves the SQL parses and selects the
+0001/0005/0026/0027 (``product``, ``source``, ``raw.url``, ``raw.blob``,
+``raw.capture``, ``product_image`` with its ``source_class``). It proves the SQL parses and selects the
 right rows on those shapes; it is not the real migration chain. Hosts without
 docker skip.
 """
@@ -35,6 +35,7 @@ OWNED, ORDERED, WISHED, REMOVED, NOT_HIS = (
 )
 MERGED_INTO_OWNED = "b0000000-0000-4000-8000-000000000006"
 CATALOG_ONLY = "b0000000-0000-4000-8000-000000000007"
+GALLERY = "https://static.myfigurecollection.net/upload/pictures/2026/10/27/{n}.jpeg"
 
 COORDINATOR_DDL = """
 CREATE TABLE facet_state (
@@ -96,6 +97,8 @@ CREATE TABLE product_image (
   position integer,
   state text NOT NULL DEFAULT 'captured',
   suppressed_at timestamptz,
+  source_class text CHECK (source_class IS NULL OR source_class IN
+    ('manufacturer_press','retailer_studio','user_photo','unknown')),
   FOREIGN KEY (origin_capture_id, origin_captured_at) REFERENCES raw.capture(id, fetched_at)
 );
 """
@@ -134,6 +137,8 @@ def _image(n: int, product: str, *, site: str = "mfc", position: int | None = 0,
     url = kw.get("url", f"https://static.myfigurecollection.net/upload/items/1/{n}.jpg")
     state = kw.get("state", "captured")
     visibility = kw.get("visibility", "visible")
+    source_class = f"'{kw['source_class']}'" if "source_class" in kw else "NULL"
+
     return f"""
 INSERT INTO raw.url (id, url, url_sha256, host) VALUES ({n}, '{url}', '\\x{_sha(n)}', 'h');
 INSERT INTO raw.blob (sha256, bytes, codec, storage_key, visibility)
@@ -141,11 +146,11 @@ INSERT INTO raw.blob (sha256, bytes, codec, storage_key, visibility)
 INSERT INTO raw.capture (id, fetched_at, url_id, lane, blob_sha256, engine_version)
   VALUES ('c0000000-0000-4000-8000-0000000000{n:02d}', '2026-09-10', {n}, 'asset', '\\x{_sha(n)}', 'e');
 INSERT INTO product_image (product_id, source_id, blob_sha256, origin_capture_id, origin_captured_at,
-                           role, position, state, suppressed_at)
+                           role, position, state, suppressed_at, source_class)
   VALUES ('{product}', (SELECT id FROM source WHERE site = '{site}'), '\\x{_sha(n)}',
           'c0000000-0000-4000-8000-0000000000{n:02d}', '2026-09-10', 'gallery',
           {"NULL" if position is None else position}, '{state}',
-          {"now()" if state == "suppressed" else "NULL"});
+          {"now()" if state == "suppressed" else "NULL"}, {source_class});
 """
 
 
@@ -168,6 +173,21 @@ SPINE_ROWS = (
     + _image(41, REMOVED)
     + _image(51, NOT_HIS)
     + _image(71, CATALOG_ONLY)
+    # GAL3: the official gallery list, as the gallery-capture lane recorded it
+    + _image(81, OWNED, url=GALLERY.format(n=81), source_class="manufacturer_press")
+    + _image(82, CATALOG_ONLY, url=GALLERY.format(n=82), source_class="manufacturer_press")
+    + _image(
+        83, OWNED, url=GALLERY.format(n=83), source_class="manufacturer_press", state="suppressed"
+    )
+    + _image(84, OWNED, url=GALLERY.format(n=84))  # the same path, no class: not the list
+    + _image(85, OWNED, source_class="unknown")
+    + _image(
+        86,
+        OWNED,
+        site="amiami",
+        url="https://img.amiami.example/86.jpg",
+        source_class="manufacturer_press",
+    )
 )
 
 
@@ -239,6 +259,7 @@ def test_ross_worklist_is_his_heads_live_mfc_item_images(pg: str) -> None:
     assert got == [
         (_sha(12), 0, OWNED, OWNED),  # position 0 first
         (_sha(13), 0, OWNED, MERGED_INTO_OWNED),  # merged into his head
+        *((_sha(n), 0, OWNED, OWNED) for n in (81, 84, 85)),  # position 0, by sha
         (_sha(11), 0, OWNED, OWNED),
         (_sha(21), 1, ORDERED, ORDERED),  # the suppressed depiction is left out
         (_sha(31), 2, WISHED, WISHED),  # the suppressed blob is left out
@@ -252,7 +273,13 @@ def test_ross_worklist_is_his_heads_live_mfc_item_images(pg: str) -> None:
 def test_the_catalog_worklist_is_every_live_mfc_item_image(pg: str) -> None:
     items, _ = mb.parse_worklist(_psql(pg, "spine", mb.catalog_worklist_sql()))
     assert sorted(i.blob_sha256 for i in items) == sorted(
-        _sha(n) for n in (11, 12, 13, 21, 31, 41, 51, 71)
+        _sha(n) for n in (11, 12, 13, 21, 31, 41, 51, 71, 81, 82, 84, 85)
+    )
+    classes = {i.blob_sha256: i.source_class for i in items}
+    assert (classes[_sha(81)], classes[_sha(85)], classes[_sha(11)]) == (
+        "manufacturer_press",
+        "unknown",
+        None,
     )
     assert {i.rank for i in items} == {9} and {i.head_id for i in items} == {None}
     shards = [
@@ -264,3 +291,25 @@ def test_the_catalog_worklist_is_every_live_mfc_item_image(pg: str) -> None:
     ]
     assert set().union(*shards) == {i.blob_sha256 for i in items}
     assert sum(len(s) for s in shards) == len(items)  # each original in exactly one shard
+
+
+def test_the_official_gallery_worklist_is_the_gallery_lists_live_mfc_images(pg: str) -> None:
+    """GAL3: only what the gallery-capture lane recorded as manufacturer_press,
+    on MFC, live -- never a picture by its path alone."""
+    items, _ = mb.parse_worklist(_psql(pg, "spine", mb.official_gallery_worklist_sql()))
+    assert sorted(i.blob_sha256 for i in items) == sorted(_sha(n) for n in (81, 82))
+    assert {i.source_class for i in items} == {"manufacturer_press"}
+    assert {i.source for i in items} == {"mfc"} and {i.rank for i in items} == {9}
+    by_sha = {i.blob_sha256: i for i in items}
+    assert by_sha[_sha(81)].url == GALLERY.format(n=81)
+    assert by_sha[_sha(81)].product_id == OWNED
+    shards = [
+        {
+            i.blob_sha256
+            for i in mb.parse_worklist(
+                _psql(pg, "spine", mb.official_gallery_worklist_sql(f"{k}/2"))
+            )[0]
+        }
+        for k in range(2)
+    ]
+    assert set().union(*shards) == set(by_sha) and sum(map(len, shards)) == len(items)
