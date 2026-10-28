@@ -51,18 +51,21 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from . import telemetry
 from .config import Settings, get_settings
 from .db import get_db
 from .models import PublicObject
 from .object_store import ObjectStore, S3ObjectStore
 from .publication import servable, store_revocations
+from .telemetry.http import AccessLogMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +93,26 @@ def _bare(status: int) -> Response:
     return Response(status_code=status, headers={"Cache-Control": "no-store", **_HARDENING})
 
 
+SERVICE = "media-origin"
+telemetry.start_tracing(SERVICE)
+#: The http.in lines' logger: one line per request, the template as call (never the sha a client sent).
+LOG = telemetry.Logger(service=telemetry.service_name(SERVICE))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    log = telemetry.configure(SERVICE, level=get_settings().log_level)
+    log.info("media-origin started", event="app.start")
+    yield
+    log.info("media-origin stopping", event="app.stop")
+
+
 app = FastAPI(
-    title="media-manager derivative origin", openapi_url=None, docs_url=None, redoc_url=None
+    title="media-manager derivative origin",
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
 )
 
 
@@ -111,6 +132,10 @@ async def only_the_grammar(
     if method in ("GET", "HEAD") and _DERIVATIVE_PATH.fullmatch(raw) and not request.url.query:
         return await call_next(request)
     return _bare(404)
+
+
+# Outermost: the grammar's own 404s get their line too (call 'GET <unmatched>').
+app.add_middleware(AccessLogMiddleware, logger=LOG)
 
 
 @app.get("/healthz")

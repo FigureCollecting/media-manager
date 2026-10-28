@@ -25,6 +25,13 @@ mask of one source; dry runs unless ``--apply`` (README runbook "A store
 asks for its cut-outs to be removed"). ``restore-store --apply`` needs a mask
 model, like ``run --apply``.
 Exit status: 0 done, 2 refused (nothing was changed by the refused step).
+
+Output (LG-U11): the estate's log lines on stdout, one run = one root trace
+(app.telemetry): job.start; one line per record of the report (``app.items``
+per masked image, ``app.withdrawn`` / ``app.restored`` per mask ...); then
+job.end carrying the rest of the report (counts, grounding ranges as one-line
+JSON) and ``exit``. A refusal is job.end's err. ``run --report FILE`` still
+writes the whole report as one JSON document.
 """
 
 from __future__ import annotations
@@ -32,7 +39,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -42,8 +48,10 @@ from sqlalchemy.dialects.postgresql import CITEXT, UUID
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
+from .. import telemetry
 from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
+from ..telemetry.events import report_lines
 from ..workers.basekept import BaseKeptMattingBackend
 from ..workers.mask_job import reevaluate_masks, restore_store, revoke_store, run_mask_batch
 from ..workers.mask_policy import ImageOrigin
@@ -142,10 +150,6 @@ def open_stores(sandbox: str | None) -> tuple[Session, ObjectStore]:
     engine = create_engine(f"sqlite:///{root / 'masks.db'}")
     Base.metadata.create_all(engine)
     return Session(engine, expire_on_commit=False), LocalObjectStore(root / "objects")
-
-
-def _print(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, indent=1, sort_keys=True, default=str))
 
 
 def _seed(db: Session, store: ObjectStore, sample: Path) -> dict[str, Any]:
@@ -284,33 +288,47 @@ def _backend_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--isnet-anime", help="IS-Net anime ONNX weights (birefnet-basekept)")
 
 
+SERVICE = "media-masks"
+
+
+def _command(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command in ("run", "restore-store"):
+        # refuse before touching any store
+        chosen = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
+        active = chosen or get_matting_backend()
+        if args.apply and not active.publishes_masks:
+            raise Refused(f"backend {active.name!r} is not a mask model: dry run only")
+    db, store = open_stores(args.sandbox)
+    try:
+        if args.command == "seed":
+            return _seed(db, store, args.sample)
+        if args.command == "run":
+            return _run(db, store, args)
+        if args.command == "reevaluate":
+            return reevaluate_masks(db, dry_run=not args.apply)
+        if args.command in ("revoke-store", "restore-store"):
+            return _store_command(db, store, args)
+        return _report(db, args.batch)
+    finally:
+        db.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    log = telemetry.configure(SERVICE)
+    telemetry.start_tracing(SERVICE)
+    summary: dict[str, Any] = {}
+
+    def body() -> int:
+        summary.update(report_lines(log, _command(args)))
+        return 0
+
     try:
-        if args.command in ("run", "restore-store"):
-            # refuse before touching any store
-            chosen = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
-            active = chosen or get_matting_backend()
-            if args.apply and not active.publishes_masks:
-                raise Refused(f"backend {active.name!r} is not a mask model: dry run only")
-        db, store = open_stores(args.sandbox)
-        try:
-            if args.command == "seed":
-                _print(_seed(db, store, args.sample))
-            elif args.command == "run":
-                _print(_run(db, store, args))
-            elif args.command == "reevaluate":
-                _print(reevaluate_masks(db, dry_run=not args.apply))
-            elif args.command in ("revoke-store", "restore-store"):
-                _print(_store_command(db, store, args))
-            else:
-                _print(_report(db, args.batch))
-        finally:
-            db.close()
-    except Refused as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return 2
-    return 0
+        return telemetry.run_job(
+            f"masks-{args.command}", body, logger=log, counts=lambda code: {**summary, "exit": code}
+        )
+    except Refused:
+        return 2  # job.end says why (err)
 
 
 if __name__ == "__main__":  # pragma: no cover

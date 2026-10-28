@@ -3,6 +3,7 @@ from __future__ import annotations
 from celery import Celery
 
 from ..config import get_settings
+from ..telemetry import celery as telemetry_celery
 
 
 def make_celery() -> Celery:
@@ -20,3 +21,5 @@ def make_celery() -> Celery:
 
 
 celery_app = make_celery()
+# LG-U11: the worker's logging, a trace per task continuing its enqueuer's, an item.process line per task.
+telemetry_celery.install()

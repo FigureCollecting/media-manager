@@ -15,9 +15,16 @@ sends, in what order, and how it resumes: app.spine.replay.
 opens no gRPC channel and writes nothing. ``--restart`` abandons an
 unfinished run and starts over (by default an unfinished run is resumed
 after its cursor). ``--sandbox DIR`` reads ``DIR/masks.db`` (SQLite) instead
-of DATABASE_URL. One JSON line per event on stdout: ``plan``, ``resume``,
-``would_send`` (dry run), ``batch`` (counts per RPC, stored/matched,
-warnings, refusals by status), ``stopped``, ``done``.
+of DATABASE_URL.
+
+Output (LG-U11): the estate's log line on stdout (app.telemetry), one run =
+one root trace. ``job.start``; one line per replay event, ``event`` being
+``app.plan``, ``app.resume``, ``app.would_send`` (dry run), ``app.batch``
+(counts per RPC, stored/matched, warnings, refusals by status),
+``app.stopped``, ``app.done``, the event's fields snake_case and a nested
+one as one-line JSON; then ``job.end`` with the plan's sizes, the ledger's
+counts and ``exit``. Every SpineMedia call carries the run's traceparent,
+so the spine's rpc.in lines are in the same trace.
 
 Exit status: 0 done; 1 done, but something did not land in this run or an
 earlier attempt of it (a refusal, a value not sent, a mask with no public
@@ -31,17 +38,15 @@ the batch line), not a failure.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 import grpc
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from .. import telemetry
 from ..spine.media_client import (
     DEFAULT_DEADLINE_SECONDS,
     DEFAULT_LEASE_SECONDS,
@@ -51,12 +56,14 @@ from ..spine.media_client import (
     target_from_url,
 )
 from ..spine.replay import ReplayConfig, run_replay
+from ..telemetry.events import EventLines
 
 EXIT_USAGE = 2
+SERVICE = "mm-report"
 
 
-def _emit(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, sort_keys=True, default=str), flush=True)
+class Refused(ValueError):
+    """Bad arguments: nothing ran (exit 2)."""
 
 
 def _open_db(sandbox: str | None) -> Session:
@@ -85,8 +92,7 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+def _run(args: argparse.Namespace, emit: EventLines) -> int:
     url = args.spine_url or os.environ.get("SPINE_MEDIA_URL", "")
     try:
         config = ReplayConfig(
@@ -101,8 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.dry_run:
             target_from_url(url)
     except ValueError as exc:
-        print(f"mask_report: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+        raise Refused(f"mask_report: {exc}") from exc
 
     channels: list[grpc.Channel] = []
 
@@ -112,11 +117,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     db = _open_db(args.sandbox)
     try:
-        return run_replay(db, config, connect=connect, emit=_emit)
+        return run_replay(db, config, connect=connect, emit=emit)
     finally:
         db.close()
         for channel in channels:
             channel.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    log = telemetry.configure(SERVICE)
+    telemetry.start_tracing(SERVICE)
+    lines = EventLines(log, summarize=("plan", "stopped", "done"))
+    try:
+        return telemetry.run_job(
+            SERVICE,
+            lambda: _run(args, lines),
+            logger=log,
+            counts=lambda code: {**lines.summary, "exit": code},
+            ok=lambda code: code == 0,
+        )
+    except Refused:
+        return EXIT_USAGE  # job.end says why (err)
 
 
 if __name__ == "__main__":  # pragma: no cover - the module's entry point

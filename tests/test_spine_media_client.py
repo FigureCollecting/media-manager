@@ -310,7 +310,13 @@ def test_the_channel_leaves_retrying_to_the_client(monkeypatch: pytest.MonkeyPat
         return "channel"
 
     monkeypatch.setattr(mc.grpc, "insecure_channel", capture)
-    assert mc.open_channel("http://ingest-server.fc.svc.cluster.local:50063") == "channel"
+    # LG-U11: the channel is wrapped in the trace interceptor (app.telemetry.grpc_client).
+    monkeypatch.setattr(mc, "intercept", lambda channel, target: ("traced", channel, target))
+    assert mc.open_channel("http://ingest-server.fc.svc.cluster.local:50063") == (
+        "traced",
+        "channel",
+        "ingest-server.fc.svc.cluster.local:50063",
+    )
     assert seen == {
         "target": "ingest-server.fc.svc.cluster.local:50063",
         "options": [("grpc.enable_retries", 0)],

@@ -53,8 +53,10 @@ loaded again, ~4 s, when the gate passes).
 THE RECORD. Every image's result is appended to ``--progress`` (JSON lines,
 flushed per line: a power cut loses at most the images in flight, one or,
 pipelined, up to ``--writers``; each reruns idempotently), and a run
-skips what it lists (``--retry-failed`` re-drives its failures). Per chunk one
-JSON line on stdout: count, statuses, seconds per image (and the model's
+skips what it lists (``--retry-failed`` re-drives its failures). A run is one
+root trace in the estate's log lines on stdout (LG-U11, app.telemetry):
+job.start, one ``app.<event>`` line per event, job.end with the counts and
+``exit``. Per chunk one ``app.chunk`` line: count, statuses, seconds per image (and the model's
 share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures,
 and where the seconds went: each stage's mean and median per image over the
 images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
@@ -146,9 +148,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 
+from .. import telemetry
 from ..config import get_settings
 from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
+from ..telemetry.events import EventLines
 from ..workers.image_limits import ImageLimitError, current_limits, gunzip_capped
 from ..workers.mask_job import (
     finish_mask_batch,
@@ -2056,12 +2060,12 @@ def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
     return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
 
 
-def _emit(event: dict[str, Any]) -> None:
-    event.setdefault("at", dt.datetime.now(dt.UTC).isoformat(timespec="seconds"))
-    print(json.dumps(event, sort_keys=True, default=str), flush=True)
+SERVICE = "mask-batch"
+#: The events whose scalars and counts job.end carries.
+_SUMMARIZED = ("plan", "start", "done", "stopped", "gave_up", "circuit_open")
 
 
-def _run(args: argparse.Namespace) -> int:
+def _run(args: argparse.Namespace, emit: Callable[[dict[str, Any]], None]) -> int:
     try:
         items, skipped = read_worklists(args.worklist)
         windows = parse_windows(args.busy_windows)
@@ -2148,11 +2152,11 @@ def _run(args: argparse.Namespace) -> int:
         vram=lambda: VramSampler(vram_command(args.gpu_index) if on_gpu else None),
         sleep=time.sleep,
         monotonic=time.monotonic,
-        emit=_emit,
+        emit=emit,
         stop_requested=stop.is_set,
     )
     if skipped:
-        _emit({"event": "worklist", "items": len(items), "skipped_lines": skipped})
+        emit({"event": "worklist", "items": len(items), "skipped_lines": skipped})
     try:
         return run_batch(items, config, rt)
     finally:
@@ -2291,14 +2295,29 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """``sql`` prints its query (the product, plain text); ``run`` is one root
+    trace in the estate's lines (LG-U11): job.start, one ``app.<event>`` line
+    per event (chunk, plan, paused ...), job.end with the counts and ``exit``."""
     args = _parser().parse_args(argv)
-    try:
-        if args.command == "sql":
+    if args.command == "sql":
+        try:
             return _sql(args)
-        return _run(args)
-    except Refused as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return 2
+        except Refused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+    log = telemetry.configure(SERVICE)
+    telemetry.start_tracing(SERVICE)
+    lines = EventLines(log, summarize=_SUMMARIZED)
+    try:
+        return telemetry.run_job(
+            SERVICE,
+            lambda: _run(args, lines),
+            logger=log,
+            counts=lambda code: {**lines.summary, "exit": code},
+            ok=lambda code: code == 0,
+        )
+    except Refused:
+        return 2  # job.end says why (err)
 
 
 if __name__ == "__main__":  # pragma: no cover

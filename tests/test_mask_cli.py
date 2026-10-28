@@ -18,10 +18,62 @@ from sqlalchemy.orm import Session
 SAMPLE = Path(__file__).resolve().parent / "fixtures" / "mask_sample"
 
 
+#: What every line carries beside the report (LG-U11: the estate's line).
+_LINE_KEYS = {"time", "level", "service", "version", "event", "msg", "code", "duration_ms",
+              "trace_id", "span_id", "job", "exit", "err"}  # fmt: skip
+#: The report's lists of records: one line each, their count on job.end.
+_RECORD_LISTS = {"items", "withdrawn", "restored"}
+
+
+def _decode(value: object) -> object:
+    if isinstance(value, str) and value[:1] in ("{", "["):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _nest(report: dict, prefix: str) -> None:  # type: ignore[type-arg]
+    keys = [k for k in report if k.startswith(f"{prefix}_")]
+    if f"{prefix}_dry_run" in report:  # a nested report (revoke-store, restore-store)
+        report[prefix] = {k[len(prefix) + 1 :]: report.pop(k) for k in keys}
+        for name in _RECORD_LISTS:
+            if isinstance(report[prefix].get(name), int):
+                report[prefix][name] = []
+
+
+def _report(out: str) -> dict:  # type: ignore[type-arg]
+    """The masks CLI's report, read back from its lines: job.end carries the
+    report's fields, each record list is one app.<name> line per record."""
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert (lines[0]["event"], lines[-1]["event"]) == ("job.start", "job.end")
+    assert len({line["trace_id"] for line in lines}) == 1  # one run, one trace
+    report = {k: _decode(v) for k, v in lines[-1].items() if k not in _LINE_KEYS}
+    records: dict[str, list] = {}  # type: ignore[type-arg]
+    for line in lines[1:-1]:
+        fields = {k: _decode(v) for k, v in line.items() if k not in _LINE_KEYS}
+        record = fields["value"] if set(fields) == {"value"} else fields
+        records.setdefault(line["event"].removeprefix("app."), []).append(record)
+    for name in [k for k in report if any(k == n or k.endswith(f"_{n}") for n in _RECORD_LISTS)]:
+        if isinstance(report[name], int):
+            report[name] = records.get(name, [])
+    _nest(report, "reevaluate")
+    _nest(report, "batch")
+    return report
+
+
 def _run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, dict]:  # type: ignore[type-arg]
     code = cli.main(list(argv))
-    out = capsys.readouterr().out
-    return code, (json.loads(out) if out.strip() else {})
+    return code, _report(capsys.readouterr().out)
+
+
+def _refusal(capsys: pytest.CaptureFixture[str]) -> str:
+    """Why the CLI refused: the run's job.end err (stderr stays empty)."""
+    captured = capsys.readouterr()
+    end = json.loads(captured.out.splitlines()[-1])
+    assert (end["event"], end["code"], captured.err) == ("job.end", "error", "")
+    return str(end["err"]["message"])
 
 
 @pytest.fixture()
@@ -236,7 +288,7 @@ class TestStoreRevocation:
             ["--sandbox", sandbox, "restore-store", "example-store", "--apply", *backend]
         )
         assert code == 2
-        assert "dry run only" in capsys.readouterr().err
+        assert "dry run only" in _refusal(capsys)
         assert not Path(sandbox).exists()
 
     def test_a_configured_revocation_is_refused_with_its_reason(
@@ -250,13 +302,13 @@ class TestStoreRevocation:
         get_settings.cache_clear()
         code = cli.main(["--sandbox", sandbox, "restore-store", "example-store", "--apply"])
         assert code == 2
-        assert "MASK_STORE_REVOKED" in capsys.readouterr().err
+        assert "MASK_STORE_REVOKED" in _refusal(capsys)
 
     def test_a_blank_source_is_refused(
         self, sandbox: str, capsys: pytest.CaptureFixture[str]
     ) -> None:
         assert cli.main(["--sandbox", sandbox, "revoke-store", " ", "--apply"]) == 2
-        assert "source" in capsys.readouterr().err
+        assert "source" in _refusal(capsys)
 
 
 class TestRefusals:
@@ -265,7 +317,7 @@ class TestRefusals:
     ) -> None:
         code = cli.main(["--sandbox", sandbox, "run", "--apply", "--resume", "999"])
         assert code == 2
-        assert "not resumable" in capsys.readouterr().err
+        assert "not resumable" in _refusal(capsys)
 
     def test_birefnet_without_weights_is_refused_before_any_work(
         self, sandbox: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -273,7 +325,7 @@ class TestRefusals:
         monkeypatch.delenv("MATTING_MODEL_PATH", raising=False)
         code = cli.main(["--sandbox", sandbox, "run", "--backend", "birefnet"])
         assert code == 2
-        assert "--model" in capsys.readouterr().err
+        assert "--model" in _refusal(capsys)
         assert not Path(sandbox).exists()
 
     @pytest.mark.parametrize("backend", [[], ["--backend", "stub"]])
@@ -282,14 +334,14 @@ class TestRefusals:
     ) -> None:
         code = cli.main(["--sandbox", sandbox, "run", "--apply", *backend])
         assert code == 2
-        assert "dry run only" in capsys.readouterr().err
+        assert "dry run only" in _refusal(capsys)
         assert not Path(sandbox).exists()
 
     def test_report_of_an_unknown_batch(
         self, sandbox: str, capsys: pytest.CaptureFixture[str]
     ) -> None:
         assert cli.main(["--sandbox", sandbox, "report", "--batch", "7"]) == 2
-        assert "no mask batch 7" in capsys.readouterr().err
+        assert "no mask batch 7" in _refusal(capsys)
 
     def test_a_subcommand_is_required(self, capsys: pytest.CaptureFixture[str]) -> None:
         with pytest.raises(SystemExit):

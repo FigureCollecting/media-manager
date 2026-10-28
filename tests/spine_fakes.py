@@ -42,6 +42,8 @@ class FakeSpine(media_pb2_grpc.SpineMediaServicer):
     #: Per RPC, what its next calls do: a status to abort with, or None to answer.
     failures: dict[str, deque[grpc.StatusCode | None]] = field(default_factory=dict)
     calls: list[tuple[str, Any]] = field(default_factory=list)
+    #: Per call, the metadata it arrived with (LG-U11: the caller's traceparent).
+    metadata: list[tuple[str, dict[str, str]]] = field(default_factory=list)
     ignore_filter: bool = False
 
     def depict(self, origin_hex: str) -> str:
@@ -57,6 +59,7 @@ class FakeSpine(media_pb2_grpc.SpineMediaServicer):
 
     def _enter(self, rpc: str, request: Any, context: grpc.ServicerContext) -> None:
         self.calls.append((rpc, request))
+        self.metadata.append((rpc, {k: str(v) for k, v in context.invocation_metadata()}))
         queue = self.failures.get(rpc)
         code = queue.popleft() if queue else None
         if code is not None:
