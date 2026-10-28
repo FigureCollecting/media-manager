@@ -469,9 +469,17 @@ class TestOfficialGallerySetting:
             ("true", True),
             ("TRUE", True),
             ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("t", True),
+            ("y", True),
             ("false", False),
             ("False", False),
             ("0", False),
+            ("no", False),
+            ("off", False),
+            ("f", False),
+            ("n", False),
         ],
     )
     def test_the_environment_sets_it(
@@ -480,7 +488,7 @@ class TestOfficialGallerySetting:
         monkeypatch.setenv("MASK_MFC_OFFICIAL_GALLERY", raw)
         assert Settings(environment="test").mask_mfc_official_gallery is expected
 
-    @pytest.mark.parametrize("raw", ["junk", "", "maybe", "2"])
+    @pytest.mark.parametrize("raw", ["junk", "", " ", " true ", "maybe", "2", "none"])
     def test_a_junk_value_fails_to_load(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
         from pydantic import ValidationError
 

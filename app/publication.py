@@ -53,7 +53,7 @@ follow-up, not done here.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -87,15 +87,23 @@ def store_revocations(db: Session, configured: Iterable[str] | None = None) -> R
     return frozenset(source_key(s) for s in (*names, *persisted))
 
 
-def gallery_origins(db: Session, image_id: int) -> list[ImageOrigin]:
-    """The image's current origins: its gallery links that are not deleted."""
+def gallery_origins(
+    db: Session, image_id: int, link_classes: Mapping[int, str] | None = None
+) -> list[ImageOrigin]:
+    """The image's current origins: its gallery links that are not deleted.
+    ``link_classes`` holds a source class by link id in place of the stored
+    one, unwritten (a dry run's records, app.workers.gallery_rejudge)."""
+    classes = link_classes or {}
     rows = db.execute(
         select(FigureGallery)
         .where(FigureGallery.image_id == image_id, FigureGallery.deleted_at.is_(None))
         .order_by(FigureGallery.id)
     ).scalars()
     return [
-        ImageOrigin(url=g.source_url, source=g.source, source_class=g.source_class) for g in rows
+        ImageOrigin(
+            url=g.source_url, source=g.source, source_class=classes.get(g.id, g.source_class)
+        )
+        for g in rows
     ]
 
 
@@ -121,7 +129,9 @@ def images_behind(db: Session, sha256: str) -> list[int] | None:
     return ids if len(list(live)) == len(ids) else None
 
 
-def judged_origins(db: Session, sha256: str) -> list[ImageOrigin] | None:
+def judged_origins(
+    db: Session, sha256: str, link_classes: Mapping[int, str] | None = None
+) -> list[ImageOrigin] | None:
     """The current origins of every image behind ``sha256``, in image order;
     None while it is not live (images_behind).
 
@@ -134,7 +144,7 @@ def judged_origins(db: Session, sha256: str) -> list[ImageOrigin] | None:
         return None
     judged: list[ImageOrigin] = []
     for image_id in ids:
-        judged.extend(gallery_origins(db, image_id) or [ImageOrigin(url=None)])
+        judged.extend(gallery_origins(db, image_id, link_classes) or [ImageOrigin(url=None)])
     return judged
 
 
@@ -143,11 +153,14 @@ def mask_refusal(
     source_sha256: str,
     store_grants: StoreGrants | None = None,
     revoked: Revoked | None = None,
+    *,
+    link_classes: Mapping[int, str] | None = None,
 ) -> str | None:
     """None while the clean copy ``source_sha256`` may carry a published
     mask; otherwise why not: ``deleted`` or the eligibility refusal.
-    ``revoked`` defaults to ``store_revocations(db)``."""
-    origins = judged_origins(db, source_sha256)
+    ``revoked`` defaults to ``store_revocations(db)``; ``link_classes`` as
+    in gallery_origins."""
+    origins = judged_origins(db, source_sha256, link_classes)
     if origins is None:
         return "deleted"
     if revoked is None:

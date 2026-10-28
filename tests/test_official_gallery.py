@@ -14,15 +14,25 @@ next mask run mints it. Dry run unless applied; nothing else is touched.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import io
+import json
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
+from app.cli import masks as masks_cli
 from app.config import get_settings
-from app.models import FigureGallery, ImageMask, MaskStoreRevocation, PublicObject
+from app.models import (
+    FigureGallery,
+    ImageMask,
+    MaskStoreRevocation,
+    PublicObject,
+    PublicObjectImage,
+)
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
 from app.publication import mask_refusal, servable
@@ -34,7 +44,7 @@ from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import seed_clean_image
 from app.workers.matting import StubMattingBackend
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 
 PICTURE = "https://static.myfigurecollection.net/upload/pictures/2026/10/27/{n}.jpeg"
@@ -448,10 +458,10 @@ class TestRejudge:
         second = _settled_refused(db_session, store, 2)
         real = gallery_rejudge.mask_refusal
 
-        def flaky(db: Session, sha: str) -> str | None:
+        def flaky(db: Session, sha: str, **kw: Any) -> str | None:
             if sha == first.sha256:
                 raise RuntimeError("s3://bucket/secret-key")
-            return real(db, sha)
+            return real(db, sha, **kw)
 
         monkeypatch.setattr(gallery_rejudge, "mask_refusal", flaky)
         report = rejudge_official_gallery(db_session, [_capture(1), _capture(2)], dry_run=dry_run)
@@ -462,8 +472,13 @@ class TestRejudge:
         assert _link(db_session, 1).source_class == expected
         assert (_row(db_session, second.sha256) is None) is not dry_run
 
-    def test_a_capture_that_raises_is_its_own_failure(
-        self, db_session: Session, store: LocalObjectStore, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_a_capture_that_raises_before_its_write_is_its_own_failure(
+        self,
+        db_session: Session,
+        store: LocalObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+        dry_run: bool,
     ) -> None:
         _settled_refused(db_session, store, 1)
         second = _settled_refused(db_session, store, 2)
@@ -478,8 +493,164 @@ class TestRejudge:
             return real(db, image_id)
 
         monkeypatch.setattr(gallery_rejudge, "_copies_behind", flaky)
-        report = rejudge_official_gallery(db_session, [_capture(1), _capture(2)], dry_run=False)
+        report = rejudge_official_gallery(db_session, [_capture(1), _capture(2)], dry_run=dry_run)
         assert report["failed"] == [{"original_sha256": _original(1), "reason": "RuntimeError"}]
         assert report["requeued"] == [second.sha256]
-        assert _link(db_session, 1).source_class is None  # its change rolled back
+        assert _link(db_session, 1).source_class is None  # it raised before the class was set
+        assert _link(db_session, 2).source_class == (None if dry_run else PRESS)
+
+    def test_a_capture_whose_write_fails_is_rolled_back_alone(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """The class is set, then its commit's flush fails: that capture is
+        rolled back and named, and the next capture is still recorded."""
+        first = _settled_refused(db_session, store, 1)
+        second = _settled_refused(db_session, store, 2)
+        broken = _link(db_session, 1).id
+        fired: list[int] = []
+
+        def refuse(_mapper: object, _connection: object, target: FigureGallery) -> None:
+            if target.id == broken:
+                fired.append(target.id)
+                raise RuntimeError("s3://bucket/secret-key")
+
+        event.listen(FigureGallery, "before_update", refuse)
+        try:
+            report = rejudge_official_gallery(db_session, [_capture(1), _capture(2)], dry_run=False)
+        finally:
+            event.remove(FigureGallery, "before_update", refuse)
+        assert fired == [broken]
+        assert report["failed"] == [{"original_sha256": _original(1), "reason": "RuntimeError"}]
+        assert report["requeued"] == [second.sha256]
+        assert _link(db_session, 1).source_class is None  # rolled back
         assert _link(db_session, 2).source_class == PRESS
+        assert _row(db_session, first.sha256).status == "ineligible"  # type: ignore[union-attr]
+
+    def test_a_link_at_that_url_to_other_bytes_is_not_recorded(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """The URL's link names other bytes (the picture there changed): the
+        class is not stamped on bytes the lane never reported there."""
+        _settled_refused(db_session, store, 1)
+        other = _settled_refused(db_session, store, 2)
+        report = rejudge_official_gallery(
+            db_session, [_capture(1, original=_original(2))], dry_run=False
+        )
+        assert report["counts"]["no_link"] == 1 and report["requeued"] == []
+        assert {_link(db_session, n).source_class for n in (1, 2)} == {None}
+        assert _row(db_session, other.sha256).status == "ineligible"  # type: ignore[union-attr]
+
+    def test_a_link_at_that_url_from_another_source_is_not_recorded(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        url = PICTURE.format(n=1)
+        seed_clean_image(
+            db_session, store, _photo(1), origins=[ImageOrigin(url=url, source="hpoi")],
+            figure_id="p1",
+        )  # fmt: skip
+        report = rejudge_official_gallery(db_session, [_capture(1)], dry_run=False)
+        assert report["counts"]["no_link"] == 1
+        assert _link(db_session, 1).source_class is None
+
+    def test_only_the_clean_copies_behind_the_image_are_judged(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """A mask object whose very bytes were captured sits behind that
+        capture too; it is no clean copy and has no result to clear."""
+        obj = _settled_refused(db_session, store, 1)
+        image_id = db_session.execute(
+            select(ImageModel.id).where(ImageModel.sha256 == _original(1))
+        ).scalar_one()
+        mask = "f" * 64
+        db_session.add(
+            PublicObject(
+                sha256=mask, kind="mask", mime="image/png", bytes=1, width=1, height=1,
+                storage_key=f"masks/{mask}.png",
+            )
+        )  # fmt: skip
+        db_session.flush()
+        db_session.add(PublicObjectImage(sha256=mask, image_id=image_id))
+        db_session.commit()
+        report = rejudge_official_gallery(db_session, [_capture(1)], dry_run=False)
+        assert report["requeued"] == [obj.sha256]
+        assert (report["counts"]["unsettled"], report["counts"]["settled"]) == (0, 0)
+
+    def test_a_result_from_another_pipeline_version_is_left_alone(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        obj = _settled_refused(db_session, store, 1)
+        db_session.add(
+            ImageMask(
+                source_sha256=obj.sha256, pipeline_version="older", status="ineligible",
+                reason="user_photo", origin_class="user_photo",
+            )
+        )  # fmt: skip
+        db_session.commit()
+        report = rejudge_official_gallery(db_session, [_capture(1)], dry_run=False)
+        assert (report["requeued"], report["failed"]) == ([obj.sha256], [])
+        older = db_session.execute(
+            select(ImageMask.status).where(ImageMask.pipeline_version == "older")
+        ).scalar_one()
+        assert older == "ineligible"
+
+    def test_a_dry_run_writes_nothing_so_it_holds_no_row_locks(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """A mask batch or a seed running beside a dry run never waits on it:
+        the classes it would record are held in memory, not written."""
+        first = _settled_refused(db_session, store, 1)
+        second = _settled_refused(db_session, store, 2)
+        other = PICTURE.replace("{n}", "{n}-second")
+        _seed(db_session, store, 1, source_class=None, url=other, figure="second", photo=1)
+        writes: list[str] = []
+
+        def watch(_c: object, _cur: object, statement: str, *_rest: object) -> None:
+            if statement.lstrip().split(None, 1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+                writes.append(statement)
+
+        captures = [_capture(1), _capture(1, figure="second", url=other.format(n=1)), _capture(2)]
+        engine = db_session.get_bind()
+        event.listen(engine, "before_cursor_execute", watch)
+        try:
+            report = rejudge_official_gallery(db_session, captures)
+        finally:
+            event.remove(engine, "before_cursor_execute", watch)
+        assert writes == []
+        assert sorted(report["requeued"]) == sorted([first.sha256, second.sha256])
+        assert report["counts"]["provenance_recorded"] == 3
+
+
+# --------------------------------------------------------------------------
+# the command: every work-list row is one gallery link
+# --------------------------------------------------------------------------
+
+
+class TestTheCommand:
+    @staticmethod
+    def _line(n: int, figure: str, url: str) -> str:
+        sha = _original(n)
+        return json.dumps(
+            {
+                "blob_sha256": sha, "storage_key": f"raw-img/sha256/{sha[:2]}/{sha}.png",
+                "url": url, "source": "mfc", "product_id": figure, "rank": 9,
+                "source_class": PRESS,
+            }
+        )  # fmt: skip
+
+    @pytest.mark.parametrize("apply", [False, True])
+    def test_every_listed_link_of_one_picture_gains_the_class(
+        self, db_session: Session, store: LocalObjectStore, tmp_path: Path, apply: bool
+    ) -> None:
+        """One official picture listed on two products: both rows reach the
+        re-judge, else the second link (no class) keeps the copy refused."""
+        obj = _settled_refused(db_session, store, 1)
+        other = PICTURE.replace("{n}", "{n}-second").format(n=1)
+        _seed(db_session, store, 1, source_class=None, url=other, figure="second", photo=1)
+        worklist = tmp_path / "gallery.jsonl"
+        lines = [self._line(1, "p1", PICTURE.format(n=1)), self._line(1, "second", other)]
+        worklist.write_text("\n".join(lines) + "\n")
+        args = argparse.Namespace(worklist=[str(worklist)], apply=apply)
+        report = masks_cli._official_gallery(db_session, args)
+        assert (report["requeued"], report["still_refused"]) == ([obj.sha256], [])
+        assert report["counts"]["provenance_recorded"] == 2
+        assert (_row(db_session, obj.sha256) is None) is apply

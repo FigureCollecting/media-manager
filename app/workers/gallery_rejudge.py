@@ -28,11 +28,13 @@ official-gallery-worklist`` prints), in two phases:
    named with the reason. A copy with another result -- ``ok``, ``held``,
    ``empty``, ``failed`` or a ``withdrawn`` mask -- is never touched here.
 
-DRY RUN BY DEFAULT: the same judgment over the classes this run would record,
-then rolled back; nothing is committed. Applied, each capture and each copy
-is committed on its own, and one that raises is named (its exception's class
-only) and rolled back alone. Idempotent: a rerun records nothing new and
-re-judges what is still ineligible.
+DRY RUN BY DEFAULT: the same judgment, with the classes this run would record
+held in memory (app.publication's ``link_classes``); it writes nothing, so it
+holds no row lock a mask batch or a seed could wait on. Applied, each capture
+and each copy is committed on its own. A capture or a copy that raises is
+named (its exception's class only) and rolled back alone, in either mode.
+Idempotent: a rerun records nothing new and re-judges what is still
+ineligible.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import FigureGallery, ImageMask, PublicObject, PublicObjectImage
@@ -126,15 +128,6 @@ def _record(
     return "provenance_recorded", copies
 
 
-def _overlay(db: Session, pending: set[int]) -> None:
-    """A dry run's recorded classes, in its transaction only (rolled back at the end)."""
-    db.execute(
-        update(FigureGallery)
-        .where(FigureGallery.id.in_(pending))
-        .values(source_class=OFFICIAL_GALLERY_CLASS)
-    )
-
-
 def rejudge_official_gallery(
     db: Session, captures: Iterable[GalleryCapture], *, dry_run: bool = True
 ) -> dict[str, Any]:
@@ -164,8 +157,7 @@ def rejudge_official_gallery(
         counts[outcome] += 1
         touched.update(dict.fromkeys(copies))
 
-    if dry_run:
-        _overlay(db, pending)
+    classes = dict.fromkeys(pending, OFFICIAL_GALLERY_CLASS)
     requeued: list[str] = []
     refused: list[dict[str, str]] = []
     for sha in touched:
@@ -182,25 +174,21 @@ def rejudge_official_gallery(
             if row.status != "ineligible":
                 counts["settled"] += 1
                 continue
-            refusal = mask_refusal(db, sha)
+            refusal = mask_refusal(db, sha, link_classes=classes)
             if refusal is not None:
                 refused.append({"clean_sha256": sha, "reason": refusal})
                 continue
-            db.delete(row)
-            if dry_run:
-                db.flush()
-            else:
+            if not dry_run:
+                db.delete(row)
                 db.commit()
             requeued.append(sha)
         except Exception as exc:
             db.rollback()
-            if dry_run:
-                _overlay(db, pending)
             reason = type(exc).__name__
             logger.warning("gallery_rejudge_failed", extra={"source_sha256": sha, "reason": reason})
             failed.append({"clean_sha256": sha, "reason": reason})
     if dry_run:
-        db.rollback()
+        db.rollback()  # ends its read transaction; it wrote nothing
     keys = (
         "captures", "not_gallery", "not_seeded", "no_link", "link_deleted",
         "provenance_conflict", "provenance_present", "provenance_recorded",

@@ -72,8 +72,9 @@ class Settings(BaseSettings):
     # photo qualifies only when the gallery-capture lane recorded it as
     # ``manufacturer_press`` (app.workers.mask_policy); a collector's own
     # upload under the same /upload/pictures/ path stays refused. Env
-    # MASK_MFC_OFFICIAL_GALLERY: true/false (1/0, yes/no, on/off); any other
-    # value fails to load. A revoked "mfc" still refuses every MFC mask.
+    # MASK_MFC_OFFICIAL_GALLERY: true/false, 1/0, yes/no, on/off, t/f, y/n (any
+    # case); any other value, an empty one or one padded with spaces included,
+    # fails to load. A revoked "mfc" still refuses every MFC mask.
     mask_mfc_official_gallery: bool = True
 
     # Rate limiting
