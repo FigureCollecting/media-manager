@@ -206,3 +206,31 @@ def link_image_to_user(db_session: Session):
         db_session.flush()
 
     return _link
+
+
+# ---------------------------------------------------------------------------
+# LG-U11: a test that runs an entrypoint (a CLI main, an app's lifespan, the
+# worker's setup_logging) routes Python's logging into the estate's line on
+# stdout. Put the process's logging back after each test, so no later test
+# finds those lines in its own captured output.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_logging() -> Generator[None, None, None]:
+    import logging
+
+    from app.telemetry import log as telemetry_log
+
+    root = logging.getLogger()
+    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = [(lg, list(lg.handlers), lg.level, lg.propagate, lg.disabled) for lg in
+             (root, *(logging.getLogger(n) for n in names))]  # fmt: skip
+    process = telemetry_log.use_logger(None)
+    telemetry_log.use_logger(process)
+    yield
+    for lg, handlers, level, propagate, disabled in saved:
+        lg.handlers[:] = handlers
+        lg.setLevel(level)
+        lg.propagate, lg.disabled = propagate, disabled
+    telemetry_log.use_logger(process)

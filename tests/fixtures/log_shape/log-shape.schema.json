@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FigureCollecting/fc-shared/schema/log-shape.schema.json",
+  "title": "FigureCollecting log line",
+  "description": "One JSON object per stdout line (lg-logging plan, log_shape). Reserved keys are typed; any other key is lowercase snake_case with a scalar value. trace_id/span_id are present only under an active span and are never zeroed.",
+  "type": "object",
+  "required": ["time", "level", "service", "version", "event", "msg"],
+  "properties": {
+    "time": {
+      "description": "RFC3339 UTC with milliseconds.",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "level": { "enum": ["trace", "debug", "info", "warn", "error", "fatal"] },
+    "service": { "description": "OTEL_SERVICE_NAME.", "type": "string", "minLength": 1 },
+    "version": { "description": "Image or package version.", "type": "string", "minLength": 1 },
+    "event": {
+      "type": "string",
+      "pattern": "^(?:rpc\\.in|rpc\\.out|http\\.in|http\\.out|job\\.start|job\\.end|item\\.enqueue|item\\.process|item\\.coalesced|ingest\\.reject|decision|app\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*)$"
+    },
+    "msg": { "description": "Human text; may be empty.", "type": "string" },
+    "call": {
+      "description": "rpc.*: full method 'pkg.Service/Method'. http.*: 'METHOD /route/template'. Never a query string.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^?#]*$"
+    },
+    "code": { "description": "Connect code name ('ok', 'invalid_argument', ...) or HTTP status as a string.", "type": "string", "minLength": 1 },
+    "duration_ms": { "description": "Handler or call time, not queue wait.", "type": "number", "minimum": 0 },
+    "peer": { "description": "In: l5d-client-id, 'unmeshed' or 'invalid'. Out: target authority.", "type": "string", "minLength": 1 },
+    "trace_id": { "type": "string", "pattern": "^(?!0{32}$)[0-9a-f]{32}$" },
+    "span_id": { "type": "string", "pattern": "^(?!0{16}$)[0-9a-f]{16}$" },
+    "winner_trace_id": {
+      "description": "item.coalesced: the trace id of the enqueue that won (first wins), so a query by either trace id finds the item.",
+      "type": "string",
+      "pattern": "^(?!0{32}$)[0-9a-f]{32}$"
+    },
+    "job": { "description": "Kubernetes Job name (downward API).", "type": "string", "minLength": 1 },
+    "err": {
+      "type": "object",
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "queue_ms": { "description": "Time waiting in a queue, kept apart from duration_ms.", "type": "number", "minimum": 0 }
+  },
+  "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+  "additionalProperties": { "type": ["string", "number", "boolean", "null"] },
+  "dependentRequired": {
+    "trace_id": ["span_id"],
+    "span_id": ["trace_id"]
+  },
+  "allOf": [
+    {
+      "if": { "required": ["event"], "properties": { "event": { "type": "string", "pattern": "^(?:rpc|http)\\." } } },
+      "then": { "required": ["call", "code", "duration_ms", "peer"] }
+    },
+    {
+      "if": { "required": ["event"], "properties": { "event": { "type": "string", "const": "job.end" } } },
+      "then": { "required": ["code", "duration_ms"] }
+    },
+    {
+      "if": { "required": ["event"], "properties": { "event": { "type": "string", "const": "item.process" } } },
+      "then": { "required": ["duration_ms"] }
+    }
+  ]
+}
