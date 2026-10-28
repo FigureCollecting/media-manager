@@ -8,7 +8,9 @@ fc-aggregation's src/telemetry.ts uses them (LG-ADOPT-1):
   tracing     a real TracerProvider with NO exporter: spans record with real
               ids, so every line carries trace_id, and nothing leaves the
               process; W3C traceparent helpers; the propagation allowlist;
-              run_job, one root trace per CLI run with job.start/job.end.
+              run_job, the job model: a run is a root span with
+              job.start/job.end, each item of it a new root trace linked
+              to the run (fc-shared server/job), every line with run_id.
   http        one http.in line per request (ASGI), continuing the caller's
               traceparent.
   grpc_client a CLIENT span per call and its traceparent on the wire, for
@@ -18,9 +20,12 @@ fc-aggregation's src/telemetry.ts uses them (LG-ADOPT-1):
 """
 
 from .log import Logger, configure, process_logger, service_name, use_logger
-from .tracing import current_traceparent, run_job, start_tracing
+from .tracing import NULL_ITEM, ItemScope, JobRun, current_traceparent, run_job, start_tracing
 
 __all__ = [
+    "NULL_ITEM",
+    "ItemScope",
+    "JobRun",
     "Logger",
     "configure",
     "current_traceparent",

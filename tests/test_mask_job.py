@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -1826,6 +1826,34 @@ class TestStoreRevocation:
         db_session.commit()
         report = reevaluate_masks(db_session, dry_run=False)
         assert sorted(report["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
+
+    def test_a_reevaluation_judges_its_rows_batch_by_batch_inside_the_callers_scope(
+        self, db_session: Session, store: LocalObjectStore
+    ) -> None:
+        """LG-U11: each batch of rows is judged inside ``batch_scope`` (the masks
+        CLI makes each one an item: its own trace, linked to the run); the
+        report is the same as an unbatched one."""
+        from app.models import MaskStoreRevocation
+        from app.workers.mask_job import reevaluate_masks
+
+        shas = self._settle_all(db_session, store)
+        db_session.add(MaskStoreRevocation(source="shop"))
+        db_session.commit()
+        expected = reevaluate_masks(db_session, dry_run=True)
+        scoped: list[tuple[int, dict[str, Any]]] = []
+
+        def scope(index: int, judge: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+            part = judge()
+            scoped.append((index, part))
+            return part
+
+        report = reevaluate_masks(db_session, dry_run=True, batch_size=2, batch_scope=scope)
+        assert report == expected
+        rows = len(expected["withdrawn"]) + len(expected["restored"]) + expected["unchanged"]
+        assert [index for index, _ in scoped] == list(range(1, (rows + 1) // 2 + 1))
+        assert sum(part["unchanged"] for _, part in scoped) == expected["unchanged"]
+        assert [s for _, part in scoped for s in part["withdrawn"]] == expected["withdrawn"]
+        assert sorted(expected["withdrawn"]) == sorted([shas["shop1"], shas["shop2"]])
 
     def test_a_reevaluation_limited_to_a_source_names_it_as_the_policy_does(
         self, db_session: Session, store: LocalObjectStore

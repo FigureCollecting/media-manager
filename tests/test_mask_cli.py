@@ -20,7 +20,7 @@ SAMPLE = Path(__file__).resolve().parent / "fixtures" / "mask_sample"
 
 #: What every line carries beside the report (LG-U11: the estate's line).
 _LINE_KEYS = {"time", "level", "service", "version", "event", "msg", "code", "duration_ms",
-              "trace_id", "span_id", "job", "exit", "err"}  # fmt: skip
+              "trace_id", "span_id", "job", "run_id", "exit", "err"}  # fmt: skip
 #: The report's lists of records: one line each, their count on job.end.
 _RECORD_LISTS = {"items", "withdrawn", "restored"}
 
@@ -48,7 +48,8 @@ def _report(out: str) -> dict:  # type: ignore[type-arg]
     report's fields, each record list is one app.<name> line per record."""
     lines = [json.loads(line) for line in out.splitlines()]
     assert (lines[0]["event"], lines[-1]["event"]) == ("job.start", "job.end")
-    assert len({line["trace_id"] for line in lines}) == 1  # one run, one trace
+    assert len({line["run_id"] for line in lines}) == 1  # one run
+    assert lines[0]["trace_id"] == lines[-1]["trace_id"] == lines[0]["run_id"]
     report = {k: _decode(v) for k, v in lines[-1].items() if k not in _LINE_KEYS}
     records: dict[str, list] = {}  # type: ignore[type-arg]
     for line in lines[1:-1]:
@@ -184,6 +185,48 @@ class TestSampleRun:
         assert dry["unchanged"] == len(ok) > 0
         code, applied = _run(capsys, "--sandbox", sandbox, "reevaluate", "--apply")
         assert (code, applied["dry_run"]) == (0, False)
+
+    def test_reevaluate_judges_batch_by_batch_each_batch_its_own_trace(
+        self,
+        sandbox: str,
+        capsys: pytest.CaptureFixture[str],
+        model: None,
+        store_granted: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """LG-U11, fc-shared's job model: the run is one root trace; each batch
+        of rows is an ITEM, a new root trace linked to the run, holding the
+        batch's own lines (its app.reevaluate_batch line and a line per mask it
+        withdrew or restored); every line carries run_id, the run's trace id."""
+        from app.models import ImageMask
+        from app.workers import mask_job
+
+        _run(capsys, "--sandbox", sandbox, "seed", "--sample", str(SAMPLE))
+        _, applied = _run(capsys, "--sandbox", sandbox, "run", "--apply")
+        store_sha = next(
+            i["source_sha256"] for i in applied["items"] if i["figure_ids"] == ["sample:4"]
+        )
+        monkeypatch.delenv("MASK_STORE_GRANTS")  # the grant is gone: its mask is withdrawn
+        get_settings.cache_clear()
+        monkeypatch.setattr(mask_job, "REEVALUATE_BATCH", 2)
+        judged = len([r for r in _rows(sandbox, ImageMask) if r.status in ("ok", "withdrawn")])
+        assert cli.main(["--sandbox", sandbox, "reevaluate", "--apply"]) == 0
+        lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+        run_id = lines[0]["trace_id"]
+        batches = [x for x in lines if x["event"] == "app.reevaluate_batch"]
+        assert [x["batch"] for x in batches] == list(range(1, (judged + 1) // 2 + 1))
+        traces = [x["trace_id"] for x in batches]
+        assert len({run_id, *traces}) == len(batches) + 1  # a new trace per batch
+        (withdrawn,) = (x for x in lines if x["event"] == "app.withdrawn")
+        assert withdrawn["value"] == store_sha and withdrawn["trace_id"] in traces
+        assert {x["run_id"] for x in lines} == {run_id}
+        end = lines[-1]
+        assert (end["event"], end["trace_id"], end["withdrawn"], end["restored"]) == (
+            "job.end",
+            run_id,
+            1,
+            0,
+        )
 
     def test_recheck_ineligible_reselects_refused_images(
         self, sandbox: str, capsys: pytest.CaptureFixture[str], model: None

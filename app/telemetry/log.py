@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping
 from importlib import metadata
 from typing import Any
 
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 
 from . import redact as r
@@ -154,6 +155,18 @@ def _flat_value(key: str, value: Any) -> Any:
     return r.sanitize_log_value(r.print_value(value, 0, r.is_url_key(key)))
 
 
+#: The run a line belongs to: its job run's trace id, set by tracing.run_job for
+#: the run and every item of it, so ``run_id`` finds a whole run and
+#: ``trace_id`` one item. Printed after the reserved keys; a caller's own
+#: run_id field wins.
+RUN_ID_KEY = otel_context.create_key("fc.run_id")
+
+
+def _active_run_id() -> str | None:
+    value = otel_context.get_value(RUN_ID_KEY)
+    return value if isinstance(value, str) else None
+
+
 def _active_ids() -> dict[str, str] | None:
     ctx = trace.get_current_span().get_span_context()
     if not ctx.is_valid:
@@ -219,6 +232,9 @@ def _build_entry(
     queued = _non_negative_ms(reserved.get("queue_ms"))
     if queued is not None:
         entry["queue_ms"] = queued
+    run_id = _active_run_id()
+    if run_id is not None and "run_id" not in extras:
+        entry["run_id"] = run_id
     entry.update(extras)
     return entry
 

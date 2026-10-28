@@ -1,11 +1,14 @@
-"""LG-U11 / U12: the trace a media-manager run starts is the trace the spine sees.
+"""LG-U11 / U12: the trace an mm-report ITEM starts is the trace the spine sees.
 
 Every SpineMedia call carries a W3C traceparent for a CLIENT span of the
 active trace (fc-shared server/connect rpcClientInterceptor, in Python), to
-cluster-internal targets only (OTEL_PROPAGATION_ALLOWLIST). The spine side,
-fc-aggregation's withRequestLog (rpcServerInterceptor), reads exactly that
-header to continue the trace; FakeSpine reads it the same way here.
-tests/test_spine_media_live.py proves the same hop against the real
+cluster-internal targets only (OTEL_PROPAGATION_ALLOWLIST), and writes an
+rpc.out line (info when ok, as fc-shared's levelFor). A run is one root
+trace; each leased batch is an item, a new root trace linked to the run
+(fc-shared server/job), so a batch's calls carry the batch's trace. The
+spine side, fc-aggregation's withRequestLog (rpcServerInterceptor), reads
+exactly that header to continue the trace; FakeSpine reads it the same way
+here. tests/test_spine_media_live.py proves the same hop against the real
 ingest server when one is configured.
 """
 
@@ -76,7 +79,7 @@ def test_each_call_carries_a_client_span_of_the_active_trace(
     assert parent != f"{ctx.span_id:016x}"  # the CLIENT span of this call, as fc-shared injects it
     (out,) = (x for x in captured if x["event"] == "rpc.out")
     assert (out["level"], out["call"], out["code"], out["peer"]) == (
-        "debug",
+        "info",
         "media.v1.SpineMedia/LeasePendingImages",
         "ok",
         url.removeprefix("http://"),
@@ -159,7 +162,38 @@ def _sandbox(tmp_path: Path, *tags: str) -> tuple[str, dict[str, dict[str, objec
     return str(tmp_path), seeded
 
 
-def test_u12_the_mm_report_runs_trace_reaches_every_spine_call(
+def test_a_call_inside_an_item_carries_the_items_trace_not_the_runs(
+    monkeypatch: pytest.MonkeyPatch, captured: list[dict[str, Any]]
+) -> None:
+    monkeypatch.setenv("OTEL_PROPAGATION_ALLOWLIST", "127.0.0.1")
+    tr.start_tracing("mm-report", env={})
+    fake = FakeSpine()
+    log = tlog.process_logger()
+    items: list[str] = []
+
+    def body(run: tr.JobRun) -> None:
+        channel = open_channel(url)
+        client = SpineMediaClient(channel, deadline_seconds=5, policy=RetryPolicy(max_attempts=1))
+        for n in (1, 2):
+
+            def one(n: int = n) -> None:
+                items.append(f"{trace.get_current_span().get_span_context().trace_id:032x}")
+                client.lease([bytes([n]) * 32], max_items=1, lease_owner="x")
+
+            run.item(one, name="item.batch", attributes={"fc.batch": n})
+        channel.close()
+
+    with serve(fake) as url:
+        tr.run_job("mm-report", body, logger=log)
+    run_id = captured[0]["trace_id"]
+    sent = [tp.split("-")[1] for tp in _traceparents(fake) if tp]
+    assert sent == items and len({run_id, *items}) == 3
+    outs = [x for x in captured if x["event"] == "rpc.out"]
+    assert [x["trace_id"] for x in outs] == items
+    assert {x["run_id"] for x in captured} == {run_id}
+
+
+def test_u12_each_mm_report_batch_is_an_item_whose_trace_reaches_its_spine_calls(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sandbox, seeded = _sandbox(tmp_path, "a", "b")
@@ -170,7 +204,7 @@ def test_u12_the_mm_report_runs_trace_reaches_every_spine_call(
     monkeypatch.setenv("JOB_NAME", "mm-report-29312345")
     with serve(fake) as url:
         monkeypatch.setenv("SPINE_MEDIA_URL", url)
-        assert cli.main(["--sandbox", sandbox, "--batch-size", "10"]) == 0
+        assert cli.main(["--sandbox", sandbox, "--batch-size", "1"]) == 0
     lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
     start, end = lines[0], lines[-1]
     assert (start["event"], start["service"], start["job"]) == (
@@ -178,13 +212,21 @@ def test_u12_the_mm_report_runs_trace_reaches_every_spine_call(
         "mm-report",
         "mm-report-29312345",
     )
-    run_trace = start["trace_id"]
+    run_id = start["trace_id"]
+    batches = [line for line in lines if line["event"] == "app.batch"]
+    item_traces = [line["trace_id"] for line in batches]
+    assert len(batches) >= 2 and len({run_id, *item_traces}) == len(batches) + 1  # one per batch
     sent = _traceparents(fake)
-    assert len(sent) >= 3 and {"LeasePendingImages", "ReportDerivative"} <= {
-        rpc for rpc, _ in fake.metadata
-    }
-    assert all(tp is not None and tp.split("-")[1] == run_trace for tp in sent), sent
-    assert {line["trace_id"] for line in lines} == {run_trace}
-    assert (end["event"], end["code"], end["exit"]) == ("job.end", "ok", 0)
+    assert len(sent) >= 4 and all(tp is not None for tp in sent), sent
+    by_trace: dict[str, set[str]] = {}
+    for (rpc, _md), tp in zip(fake.metadata, sent, strict=True):
+        by_trace.setdefault(str(tp).split("-")[1], set()).add(rpc)
+    assert set(by_trace) <= set(item_traces)  # the spine sees the ITEM's trace, never the run's
+    leased = [trace_id for trace_id, rpcs in by_trace.items() if "LeasePendingImages" in rpcs]
+    assert len(leased) == 2  # one lease per batch that had originals, each in its own trace
+    outs = [line for line in lines if line["event"] == "rpc.out"]
+    assert {line["trace_id"] for line in outs} == set(by_trace)  # each call's line, in its item
+    assert {line["run_id"] for line in lines} == {run_id}  # run_id finds the whole run
+    assert (end["event"], end["code"], end["exit"], end["trace_id"]) == ("job.end", "ok", 0, run_id)
     for line in lines:
         _valid(line)

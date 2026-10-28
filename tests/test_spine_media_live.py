@@ -448,14 +448,16 @@ def test_a_caller_without_a_mesh_identity_is_refused_and_the_run_stops(
 
 
 @pytest.mark.parametrize("allowed", [True, False], ids=["allowlisted", "off-the-allowlist"])
-def test_u12_the_spine_continues_the_trace_the_run_started(
+def test_u12_the_spine_continues_each_items_trace(
     spine: dict[str, Any], world: dict[str, Any], monkeypatch: pytest.MonkeyPatch, allowed: bool
 ) -> None:
-    """LG-U12: every SpineMedia call's rpc.in line, written by the spine's own
-    withRequestLog (fc-aggregation LG-ADOPT-1), carries the trace id the
-    mm-report run started. Here the listener is an IP, so the test puts it on
-    the propagation allowlist; in the cluster it is a *.svc.cluster.local name.
-    Off the allowlist no header leaves, and the spine starts its own traces."""
+    """LG-U12, fc-shared's job model: the run is one root trace and each leased
+    batch an ITEM, a new root trace linked to the run. Every SpineMedia call's
+    rpc.in line, written by the spine's own withRequestLog (fc-aggregation
+    LG-ADOPT-1), carries its ITEM's trace id: never the run's, and one per
+    batch. Here the listener is an IP, so the test puts it on the propagation
+    allowlist; in the cluster it is a *.svc.cluster.local name. Off the
+    allowlist no header leaves, and the spine starts its own traces."""
     from app.telemetry import tracing as tr
     from app.telemetry.log import Logger
 
@@ -463,10 +465,28 @@ def test_u12_the_spine_continues_the_trace_the_run_started(
     tr.start_tracing("mm-report")
     ours: list[dict[str, Any]] = []
     log = Logger(service="mm-report", env={}, sink=lambda line: ours.append(json.loads(line)))
+    items: list[str] = []
+
+    def connect() -> SpineMediaClient:
+        channel = grpc.intercept_channel(open_channel(spine["url"]), _AsLinkerdWould())
+        return SpineMediaClient(channel, policy=RetryPolicy(max_attempts=2, initial_backoff=0.05))
+
+    def body(run: tr.JobRun) -> int:
+        def item(index: int, fn: Callable[[], Any]) -> Any:
+            def one() -> Any:
+                items.append(tr.current_traceparent() or "")
+                return fn()
+
+            return run.item(one, name="item.batch", attributes={"fc.batch": index})
+
+        config = rp.ReplayConfig(lease_seconds=60, batch_size=1)
+        return rp.run_replay(world["db"], config, connect=connect, emit=lambda _: None, item=item)
+
     seen = len(spine["log"])
-    code = tr.run_job("mm-report", lambda: _replay(world["db"], spine["url"])[0], logger=log)
-    assert code == rp.EXIT_DONE
+    assert tr.run_job("mm-report", body, logger=log) == rp.EXIT_DONE
     run_trace = ours[0]["trace_id"]
+    item_traces = {tp.split("-")[1] for tp in items}
+    assert len(item_traces) == len(items) >= 2 and run_trace not in item_traces
 
     def media_lines() -> list[dict[str, Any]]:
         out = []
@@ -492,13 +512,17 @@ def test_u12_the_spine_continues_the_trace_the_run_started(
     assert all(x["code"] == "ok" for x in lines), lines
     traces = {x["trace_id"] for x in lines}
     if allowed:
-        assert traces == {run_trace}, lines
+        # The spine sees each ITEM's trace, never the run's (the last batch, withdrawals
+        # only when there are none, makes no call); each batch's lease is in its own trace.
+        assert traces <= item_traces and len(traces) >= 2, (lines, items)
+        leases = [x["trace_id"] for x in lines if x["call"].endswith("/LeasePendingImages")]
+        assert len(leases) == len(set(leases)) >= 2
     else:
-        assert run_trace not in traces and len(traces) == len(lines), lines
+        assert not traces & (item_traces | {run_trace}) and len(traces) == len(lines), lines
     evidence = os.environ.get("SPINE_LIVE_U12_EVIDENCE")
     if evidence:
         Path(f"{evidence}-{'allowlisted' if allowed else 'off-the-allowlist'}.json").write_text(
-            json.dumps({"run": ours, "spine_rpc_in": lines}, indent=1)
+            json.dumps({"run": ours, "items": items, "spine_rpc_in": lines}, indent=1)
         )
 
 

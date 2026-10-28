@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import functools
 import hashlib
 import logging
 from collections.abc import Callable, Sequence
@@ -567,6 +568,10 @@ def run_mask_batch(
     return report
 
 
+#: Rows judged per batch by reevaluate_masks (the masks CLI makes each batch an item of its run).
+REEVALUATE_BATCH = 500
+
+
 def reevaluate_masks(
     db: Session,
     *,
@@ -574,6 +579,8 @@ def reevaluate_masks(
     store_grants: StoreGrants | None = None,
     source: str | None = None,
     revoked: Revoked | None = None,
+    batch_size: int | None = None,
+    batch_scope: Callable[[int, Callable[[], dict[str, Any]]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Withdraw every ``ok`` row whose clean image is deleted or no longer
     mask-eligible (reason: the refusal) and restore every ``withdrawn`` row
@@ -584,37 +591,56 @@ def reevaluate_masks(
     raises is judged refused (reason: the exception's class) -- one bad row
     never stops the rest. ``source`` judges only the rows of clean copies
     with a live origin of that source -- nothing else is touched -- and
-    ``revoked`` overrides the revocations, as in ``run_mask_batch``."""
+    ``revoked`` overrides the revocations, as in ``run_mask_batch``. The
+    rows are judged ``batch_size`` (REEVALUATE_BATCH) at a time, each batch
+    inside ``batch_scope(index, judge)`` (1-based), which returns judge's
+    part of the report."""
     query = select(ImageMask).where(ImageMask.status.in_(("ok", "withdrawn")))
     if source is not None:
         query = query.where(ImageMask.source_sha256.in_(_of_source(source_key(source))))
-    rows = db.execute(query.order_by(ImageMask.id)).scalars()
+    rows = list(db.execute(query.order_by(ImageMask.id)).scalars())
+    size = batch_size or REEVALUATE_BATCH
+    now = dt.datetime.now(dt.UTC)
+
+    def judge(batch: list[ImageMask]) -> dict[str, Any]:
+        part: dict[str, Any] = {"withdrawn": [], "restored": [], "unchanged": 0}
+        for row in batch:
+            sha = row.source_sha256
+            try:
+                refusal = mask_refusal(db, sha, store_grants, revoked)
+            except Exception as exc:
+                db.rollback()
+                refusal = type(exc).__name__
+                logger.warning(
+                    "mask_reevaluate_failed", extra={"source_sha256": sha, "reason": refusal}
+                )
+            if row.status == "ok" and refusal is not None:
+                part["withdrawn"].append(sha)
+                status, reason = "withdrawn", refusal
+            elif row.status == "withdrawn" and refusal is None:
+                part["restored"].append(sha)
+                status, reason = "ok", None
+            else:
+                part["unchanged"] += 1
+                continue
+            if not dry_run:
+                row.status, row.reason, row.updated_at = status, reason, now
+                db.commit()
+        return part
+
     withdrawn: list[str] = []
     restored: list[str] = []
     unchanged = 0
-    now = dt.datetime.now(dt.UTC)
-    for row in list(rows):
-        sha = row.source_sha256
-        try:
-            refusal = mask_refusal(db, sha, store_grants, revoked)
-        except Exception as exc:
-            db.rollback()
-            refusal = type(exc).__name__
-            logger.warning(
-                "mask_reevaluate_failed", extra={"source_sha256": sha, "reason": refusal}
-            )
-        if row.status == "ok" and refusal is not None:
-            withdrawn.append(sha)
-            status, reason = "withdrawn", refusal
-        elif row.status == "withdrawn" and refusal is None:
-            restored.append(sha)
-            status, reason = "ok", None
-        else:
-            unchanged += 1
-            continue
-        if not dry_run:
-            row.status, row.reason, row.updated_at = status, reason, now
-            db.commit()
+    for index, start in enumerate(range(0, len(rows), size), start=1):
+        batch = rows[start : start + size]
+        part = (
+            judge(batch)
+            if batch_scope is None
+            else batch_scope(index, functools.partial(judge, batch))
+        )
+        withdrawn += part["withdrawn"]
+        restored += part["restored"]
+        unchanged += part["unchanged"]
     return {
         "dry_run": dry_run,
         "withdrawn": withdrawn,

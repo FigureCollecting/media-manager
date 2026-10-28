@@ -18,13 +18,15 @@ after its cursor). ``--sandbox DIR`` reads ``DIR/masks.db`` (SQLite) instead
 of DATABASE_URL.
 
 Output (LG-U11): the estate's log line on stdout (app.telemetry), one run =
-one root trace. ``job.start``; one line per replay event, ``event`` being
+one root span. ``job.start``; one line per replay event, ``event`` being
 ``app.plan``, ``app.resume``, ``app.would_send`` (dry run), ``app.batch``
 (counts per RPC, stored/matched, warnings, refusals by status),
 ``app.stopped``, ``app.done``, the event's fields snake_case and a nested
 one as one-line JSON; then ``job.end`` with the plan's sizes, the ledger's
-counts and ``exit``. Every SpineMedia call carries the run's traceparent,
-so the spine's rpc.in lines are in the same trace.
+counts and ``exit``. Each batch is an ITEM (fc-shared's job model): a new
+root trace linked to the run, holding its app.batch line and an rpc.out line
+per call; every SpineMedia call carries its batch's traceparent, so the
+spine's rpc.in lines are in that batch's trace. Every line carries run_id.
 
 Exit status: 0 done; 1 done, but something did not land in this run or an
 earlier attempt of it (a refusal, a value not sent, a mask with no public
@@ -92,7 +94,7 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run(args: argparse.Namespace, emit: EventLines) -> int:
+def _run(args: argparse.Namespace, emit: EventLines, run: telemetry.JobRun) -> int:
     url = args.spine_url or os.environ.get("SPINE_MEDIA_URL", "")
     try:
         config = ReplayConfig(
@@ -117,7 +119,14 @@ def _run(args: argparse.Namespace, emit: EventLines) -> int:
 
     db = _open_db(args.sandbox)
     try:
-        return run_replay(db, config, connect=connect, emit=emit)
+        return run_replay(
+            db,
+            config,
+            connect=connect,
+            emit=emit,
+            # each leased batch is an item: its own trace, linked to the run (fc-shared's job model)
+            item=lambda index, fn: run.item(fn, name="item.batch", attributes={"fc.batch": index}),
+        )
     finally:
         db.close()
         for channel in channels:
@@ -132,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return telemetry.run_job(
             SERVICE,
-            lambda: _run(args, lines),
+            lambda run: _run(args, lines, run),
             logger=log,
             counts=lambda code: {**lines.summary, "exit": code},
             ok=lambda code: code == 0,

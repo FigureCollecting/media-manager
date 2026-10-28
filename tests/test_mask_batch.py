@@ -1215,6 +1215,29 @@ def test_main_runs_a_sandbox_batch_end_to_end(
     assert next(e for e in again if e["event"] == "start")["pending"] == 0
 
 
+def test_main_runs_each_chunk_as_an_item_of_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """LG-U11: one root trace per run, one new trace per chunk (fc-shared's job
+    model); every line carries run_id, the run's trace id."""
+    raw = _Raw(tmp_path / "raw")
+    wl = _worklist_file(tmp_path, [raw.add(1, rank=0), raw.add(2, rank=0)])
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Model())
+    argv = ["--sandbox", str(tmp_path / "sandbox"), "run", "--worklist", str(wl)]
+    argv += ["--raw-dir", str(tmp_path / "raw"), "--progress", str(tmp_path / "p.jsonl")]
+    argv += ["--device", "cpu", "--no-residential-check", "--busy-windows", "", "--chunk-size", "1"]
+    assert mb.main(argv) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    run_id = lines[0]["trace_id"]
+    chunks = [line["trace_id"] for line in lines if line["event"] == "app.chunk"]
+    assert len(chunks) == 2 and len({run_id, *chunks}) == 3
+    assert {line["run_id"] for line in lines} == {run_id}
+    assert {
+        lines[-1]["trace_id"],
+        next(x for x in lines if x["event"] == "app.done")["trace_id"],
+    } == {run_id}
+
+
 def test_main_reads_originals_from_the_raw_bucket_named_in_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -1853,3 +1853,87 @@ def test_the_gpu_proxy_is_the_model_by_name_and_waits_as_gpu_wait() -> None:
     assert stub.matte(rgba).size == (100, H)
     assert stub.name == StubMattingBackend.name and not stub.publishes_masks
     assert len(served) == 3
+
+
+# --- LG-U11: each chunk is an item (fc-shared server/job: one trace per item) ---------------
+
+
+@pytest.mark.parametrize("writers", [0, 2])
+def test_each_chunk_is_an_item_its_images_and_its_line_in_its_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writers: int
+) -> None:
+    """A run is one root trace; each chunk is an ITEM, a new root trace linked
+    to the run: its images are minted in it (on the driver, or on the
+    pipeline's worker threads) and its chunk line is written in it. The lines
+    around the chunks (start, done) stay in the run's trace."""
+    from app.telemetry import tracing as tr
+    from app.telemetry.log import Logger
+    from opentelemetry import trace
+
+    def current() -> str:
+        return f"{trace.get_current_span().get_span_context().trace_id:032x}"
+
+    root, raw = tmp_path / "root", _Raw(tmp_path / "raw")
+    items = [raw.add(120 + n, n) for n in range(4)]
+    minted: list[str] = []
+    real_mint = mb._mint
+
+    def mint(*args: Any, **kwargs: Any) -> Any:
+        minted.append(current())
+        return real_mint(*args, **kwargs)
+
+    monkeypatch.setattr(mb, "_mint", mint)
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[tuple[str, str]] = []
+    lines: list[dict[str, Any]] = []
+    log = Logger(service="mask-batch", env={}, sink=lambda s: lines.append(json.loads(s)))
+    tr.start_tracing("mask-batch", env={})
+
+    def body(run: tr.JobRun) -> int:
+        rt = _runtime(main, root, raw, _Shapes(), [])
+        rt.emit = lambda e: events.append((e["event"], current()))
+        rt.open_item = lambda n: run.open_item(name="item.chunk", attributes={"fc.chunk": n})
+        return mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=writers), rt)
+
+    try:
+        assert tr.run_job("mask-batch", body, logger=log) == 0
+    finally:
+        main.close()
+        engine.dispose()
+    run_id = lines[0]["trace_id"]
+    chunks = [t for e, t in events if e == "chunk"]
+    assert len(chunks) == 2 and len({run_id, *chunks}) == 3
+    assert sorted(minted) == sorted([chunks[0]] * 2 + [chunks[1]] * 2)
+    assert {t for e, t in events if e in ("start", "done")} == {run_id}
+
+
+def test_a_chunk_left_open_by_a_failure_still_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An item the run opened is ended (failed) when the batch stops on a fault."""
+    ended: list[bool] = []
+
+    class Item:
+        def run(self, fn: Callable[[], Any]) -> Any:
+            return fn()
+
+        def end(self, error: bool = False) -> None:
+            ended.append(error)
+
+    def broken(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("the bucket is gone")
+
+    monkeypatch.setattr(mb, "_mint", broken)
+    root, raw = tmp_path / "root", _Raw(tmp_path / "raw")
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    rt = _runtime(main, root, raw, _Shapes(), [])
+    rt.open_item = lambda n: Item()
+    try:
+        with pytest.raises(RuntimeError):
+            mb.run_batch([raw.add(130, 1)], mb.BatchConfig(chunk_size=1), rt)
+    finally:
+        main.close()
+        engine.dispose()
+    assert ended == [True]

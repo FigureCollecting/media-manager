@@ -4,10 +4,10 @@ makes (fc-shared server/connect rpcClientInterceptor, in Python).
 The traceparent names THIS call's span, so the spine's rpc.in line (fc-
 aggregation withRequestLog, which extracts it) is a child of it, in the
 trace the run started. It goes only to a target on the propagation allowlist
-(cluster-internal names by default). Each call also writes an rpc.out line:
-at DEBUG when it succeeds (mm-report makes one call per clean copy and per
-mask, hundreds of thousands in a full replay; the batch lines count them),
-at warn or error when it fails.
+(cluster-internal names by default). Each call also writes an rpc.out line
+at fc-shared's level (connect.ts levelFor): info when it succeeds, error when
+the server failed (unknown, deadline_exceeded, unimplemented, internal,
+unavailable, data_loss), warn otherwise.
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ class TraceClientInterceptor(grpc.UnaryUnaryClientInterceptor):
             }
             if code == "ok":
                 span.set_status(Status(StatusCode.OK))
-                level = "debug"
+                level = "info"
             else:
                 span.set_status(Status(StatusCode.ERROR))
                 span.set_attribute("rpc.grpc.status_code", code)

@@ -26,12 +26,15 @@ asks for its cut-outs to be removed"). ``restore-store --apply`` needs a mask
 model, like ``run --apply``.
 Exit status: 0 done, 2 refused (nothing was changed by the refused step).
 
-Output (LG-U11): the estate's log lines on stdout, one run = one root trace
+Output (LG-U11): the estate's log lines on stdout, one run = one root span
 (app.telemetry): job.start; one line per record of the report (``app.items``
 per masked image, ``app.withdrawn`` / ``app.restored`` per mask ...); then
 job.end carrying the rest of the report (counts, grounding ranges as one-line
-JSON) and ``exit``. A refusal is job.end's err. ``run --report FILE`` still
-writes the whole report as one JSON document.
+JSON) and ``exit``. ``reevaluate`` judges its rows in batches, each an ITEM
+(fc-shared's job model: a new root trace linked to the run) holding that
+batch's withdrawn/restored lines and an ``app.reevaluate_batch`` line; its
+job.end carries the counts. Every line carries run_id. A refusal is job.end's
+err. ``run --report FILE`` still writes the whole report as one JSON document.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -291,7 +294,29 @@ def _backend_options(parser: argparse.ArgumentParser) -> None:
 SERVICE = "media-masks"
 
 
-def _command(args: argparse.Namespace) -> dict[str, Any]:
+def _reevaluate(
+    db: Session, args: argparse.Namespace, run: telemetry.JobRun, log: telemetry.Logger
+) -> dict[str, Any]:
+    """Each batch of rows is an item of the run: its records and its line in its own trace."""
+
+    def scope(index: int, judge: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        def batch() -> dict[str, Any]:
+            part = judge()
+            records = {"withdrawn": part["withdrawn"], "restored": part["restored"]}
+            counts = report_lines(log, records)
+            log.info("", event="app.reevaluate_batch", batch=index, **counts,
+                     unchanged=part["unchanged"])  # fmt: skip
+            return part
+
+        return run.item(batch, name="item.batch", attributes={"fc.batch": index})
+
+    report = reevaluate_masks(db, dry_run=not args.apply, batch_scope=scope)
+    return {**report, "withdrawn": len(report["withdrawn"]), "restored": len(report["restored"])}
+
+
+def _command(
+    args: argparse.Namespace, run: telemetry.JobRun, log: telemetry.Logger
+) -> dict[str, Any]:
     if args.command in ("run", "restore-store"):
         # refuse before touching any store
         chosen = make_backend(args.backend, args.model, args.isnet_general, args.isnet_anime)
@@ -305,7 +330,7 @@ def _command(args: argparse.Namespace) -> dict[str, Any]:
         if args.command == "run":
             return _run(db, store, args)
         if args.command == "reevaluate":
-            return reevaluate_masks(db, dry_run=not args.apply)
+            return _reevaluate(db, args, run, log)
         if args.command in ("revoke-store", "restore-store"):
             return _store_command(db, store, args)
         return _report(db, args.batch)
@@ -319,8 +344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     telemetry.start_tracing(SERVICE)
     summary: dict[str, Any] = {}
 
-    def body() -> int:
-        summary.update(report_lines(log, _command(args)))
+    def body(run: telemetry.JobRun) -> int:
+        summary.update(report_lines(log, _command(args, run, log)))
         return 0
 
     try:

@@ -12,32 +12,46 @@ OTEL_PROPAGATION_ALLOWLIST (default ``*.svc.cluster.local,*.svc,localhost``;
 loopback IPs deliberately absent). Nothing here instruments httpx, so the
 worker's fetches of store and user-photo URLs never carry a trace header.
 
-run_job: one CLI run is ONE root trace ``job.<name>``, bracketed by a
-job.start and a job.end line (code, duration_ms, the run's counts, err on
-failure).
+run_job (fc-shared server/job runJob): a CLI run is a ROOT span
+``job.<name>``, bracketed by a job.start and a job.end line (code,
+duration_ms, the run's counts, err on failure). One trace per ITEM (Ross's
+choice): ``run.item(fn)`` runs fn as a NEW root trace (``item.enqueue`` by
+default, kind PRODUCER) with a span link and ``fc.run_id`` pointing back at
+the run, so requests made inside the item carry the item's traceparent;
+``run.open_item()`` (fc-shared itemContext) is the same item for work that
+does not fit one call (the caller ends it). Every line of the run and of its
+items carries ``run_id`` (log.RUN_ID_KEY): ``run_id`` finds the whole run,
+``trace_id`` one item. Spans are flushed before run_job returns (a CronJob
+exits right after); a failed flush never masks the run's own result.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping, MutableMapping
-from typing import Any, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, Protocol, TypeVar
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.trace import SpanContext, Status, StatusCode, TraceFlags
+from opentelemetry.trace import Link, Span, SpanContext, SpanKind, Status, StatusCode, TraceFlags
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.util.types import Attributes
 
-from .log import Env, Logger, resolve_identity, round_ms
+from .log import RUN_ID_KEY, Env, Logger, resolve_identity, round_ms
 
 T = TypeVar("T")
 
 TRACER_NAME = "media-manager/job"
+ITEM_SPAN = "item.enqueue"
+_DIAG = logging.getLogger("opentelemetry.media_manager")
 DEFAULT_PROPAGATION_HOSTS = ("*.svc.cluster.local", "*.svc", "localhost")
 PROPAGATION_ALLOWLIST_ENV = "OTEL_PROPAGATION_ALLOWLIST"
 _PROPAGATOR = TraceContextTextMapPropagator()
@@ -127,32 +141,136 @@ def propagation_allowed(host: str, env: Env | None = None) -> bool:
     return False
 
 
+class Item(Protocol):
+    """What a run's item offers its caller: ItemScope, or NULL_ITEM outside a run."""
+
+    def run(self, fn: Callable[[], T]) -> T: ...
+
+    def end(self, error: bool = False) -> None: ...
+
+
+class ItemScope:
+    """One item of a run: its context (the item's span, the run's id) and its
+    span. ``run(fn)`` runs fn in it, as often as needed and on any thread;
+    ``end()`` ends the span (once; ``error`` marks it failed)."""
+
+    def __init__(self, context: Context, span: Span) -> None:
+        self.context = context
+        self.span = span
+        self._ended = False
+        self._lock = threading.Lock()
+
+    def run(self, fn: Callable[[], T]) -> T:
+        token = otel_context.attach(self.context)
+        try:
+            return fn()
+        finally:
+            otel_context.detach(token)
+
+    def end(self, error: bool = False) -> None:
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+        self.span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
+        self.span.end()
+
+
+class _NullItem:
+    """No item: fn runs in the caller's own context, and there is nothing to end."""
+
+    def run(self, fn: Callable[[], T]) -> T:
+        return fn()
+
+    def end(self, error: bool = False) -> None:
+        return None
+
+
+#: For a library caller with no run: items are not separate traces.
+NULL_ITEM = _NullItem()
+
+
+def _with_run_id(ctx: Context, run_id: str | None) -> Context:
+    return ctx if run_id is None else otel_context.set_value(RUN_ID_KEY, run_id, ctx)
+
+
+@dataclass(frozen=True)
+class JobRun:
+    name: str
+    #: The run's trace id: what every item's fc.run_id points at.
+    run_id: str
+    span: Span
+    tracer: trace.Tracer
+    _valid: bool = field(default=True, repr=False)
+
+    def open_item(self, name: str | None = None, attributes: Attributes = None) -> ItemScope:
+        """A new root trace for one item, linked to this run (fc-shared itemContext). The caller ends it."""
+        run_context = self.span.get_span_context()
+        span = self.tracer.start_span(
+            name or ITEM_SPAN,
+            context=Context(),
+            kind=SpanKind.PRODUCER,
+            links=[Link(run_context)],
+            attributes={**(attributes or {}), "fc.run_id": self.run_id},
+        )
+        ctx = trace.set_span_in_context(span, Context())
+        return ItemScope(_with_run_id(ctx, self.run_id if self._valid else None), span)
+
+    def item(
+        self, fn: Callable[[], T], *, name: str | None = None, attributes: Attributes = None
+    ) -> T:
+        """Run fn as its own root trace, linked to this run. Rethrows fn's error (the item failed)."""
+        scope = self.open_item(name, attributes)
+        failed = True
+        try:
+            result = scope.run(fn)
+            failed = False
+            return result
+        finally:
+            scope.end(error=failed)
+
+
+def _flush() -> None:
+    """Flush whatever provider is registered; one with nothing to flush is fine."""
+    try:
+        flush = getattr(trace.get_tracer_provider(), "force_flush", None)
+        if flush is not None:
+            flush()
+    except Exception:
+        _DIAG.warning("run_job: span flush failed", exc_info=True)
+
+
 def run_job(
     name: str,
-    fn: Callable[[], T],
+    fn: Callable[[JobRun], T],
     *,
     logger: Logger,
     counts: Callable[[T], Mapping[str, Any]] | None = None,
     ok: Callable[[T], bool] | None = None,
     env: Env | None = None,
+    tracer: trace.Tracer | None = None,
 ) -> T:
-    """Run ``fn`` as ONE root trace ``job.<name>``: a job.start line, then a
-    job.end line with ``counts(result)`` (code ok, or error at warn when
+    """Run ``fn(run)`` as the root span ``job.<name>``: a job.start line, then
+    a job.end line with ``counts(result)`` (code ok, or error at warn when
     ``ok(result)`` is false). A failure ends with code error and err, and is
-    re-raised unchanged."""
+    re-raised unchanged. Spans are flushed before it returns."""
     environ = os.environ if env is None else env
     k8s_job = (environ.get("JOB_NAME") or "").strip() or None
     job = k8s_job or name
     attributes = {"fc.job.name": name, **({"k8s.job.name": k8s_job} if k8s_job else {})}
-    span = trace.get_tracer(TRACER_NAME).start_span(
-        f"job.{name}", context=Context(), attributes=attributes
+    tracer = tracer or trace.get_tracer(TRACER_NAME)
+    span = tracer.start_span(f"job.{name}", context=Context(), attributes=attributes)
+    span_context = span.get_span_context()
+    run = JobRun(name, format(span_context.trace_id, "032x"), span, tracer, span_context.is_valid)
+    run_context = _with_run_id(
+        trace.set_span_in_context(span, Context()), run.run_id if span_context.is_valid else None
     )
-    token = otel_context.attach(trace.set_span_in_context(span, Context()))
+    token = otel_context.attach(run_context)
     started = time.perf_counter()
     try:
         logger.info(f"{name} started", event="job.start", job=job)
         try:
-            result = fn()
+            result = fn(run)
         except BaseException as exc:
             span.set_status(Status(StatusCode.ERROR))
             logger.error(
@@ -173,3 +291,4 @@ def run_job(
     finally:
         span.end()
         otel_context.detach(token)
+        _flush()
