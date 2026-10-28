@@ -576,6 +576,39 @@ def test_a_copy_with_no_mask_rows_is_reported_without_an_appearance(
     assert not sent.HasField("thumbhash") and not sent.HasField("dominant_color")
 
 
+def test_a_collectors_own_photo_judged_ineligible_still_has_its_clean_copy_reported(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    """An MFC /upload/pictures/ photo gets no mask (mask_policy: user_photo),
+    but its sanitized copy is public and must reach the spine, or it never
+    shows in the picker."""
+    fake, url = spine
+    pic = seed_copy(db_session, "pic", masks=())
+    db_session.add(
+        ImageMask(
+            source_sha256=pic["clean"],
+            pipeline_version="mask-v1",
+            status="ineligible",
+            reason="user_photo",
+            origin_class="user_photo",
+            created_at=AT,
+            updated_at=AT,
+        )
+    )
+    db_session.commit()
+    plan = rp.load_plan(db_session)
+    assert plan.copy_of == {pic["origin"]: pic["clean"]} and pic["clean"] in plan.live
+    assert plan.masked == set() and plan.reports_for(pic["clean"]) == []
+    pid = fake.depict(pic["origin"])
+    code, lines = _run(db_session, url)
+    assert code == rp.EXIT_DONE
+    sent = fake.sent("ReportDerivative")
+    assert [r.derivative_sha256.hex() for r in sent] == [pic["clean"]]
+    assert fake.depictions[pid]["state"] == "derived"
+    assert fake.sent("ReportMask") == [] and fake.sent("WithdrawMask") == []
+    assert _batches(lines)[0]["local"]["refused"] == {}
+
+
 def test_a_lease_the_mesh_refuses_stops_the_run(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
