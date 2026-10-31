@@ -40,9 +40,9 @@ PURGE. Depictions reported more than ``purge_days`` ago, and the seeded or
 failed originals left with none.
 
 Exit status: 0 done; 1 done, but a report was refused or FAILED reports were
-held; 2 a configuration fault (the mesh refused the identity, or the spine
-refused the lease); 3 stopped, resumable (the spine stayed down, or a
-deployment fault).
+held; 2 a configuration fault (the mesh refused the identity, the spine
+refused the lease, the database refused the role); 3 stopped, resumable
+(the spine or the database stayed down, or a deployment fault).
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import CursorResult, and_, delete, exists, func, or_, select
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from ..models import DisplayDepiction, DisplayOriginal
@@ -470,10 +471,18 @@ def run_sync(
     """REPORT, then ENQUEUE, then PURGE; the exit status."""
     client = connect()
     try:
-        reported = report(db, client, config, emit, now())
-        enqueue(db, client, config, emit, monotonic)
+        try:
+            reported = report(db, client, config, emit, now())
+            enqueue(db, client, config, emit, monotonic)
+        except (OperationalError, ProgrammingError) as exc:
+            # the database down (resumable) or refusing the role (a grant, the schema): never a traceback
+            db.rollback()
+            raise _Stop(
+                EXIT_STOPPED if isinstance(exc, OperationalError) else EXIT_CONFIG,
+                f"database: {type(exc).__name__}",
+            ) from exc
     except _Stop as stop:
-        emit({"event": "stopped", "why": stop.why, **_lag(db)})
+        emit({"event": "stopped", "why": stop.why})
         return stop.code
     purged = purge(db, config, now())
     emit({"event": "done", "purged": purged, **_lag(db)})

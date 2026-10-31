@@ -1185,3 +1185,27 @@ def test_a_database_outage_outside_the_seed_gives_the_attempt_back_and_stops_3(
     assert next(x for x in lines if x["event"] == "stopped")["why"] == "outages"
     row = db.get(DisplayOriginal, sha)
     assert (row.state, row.attempts) == ("pending", 0)
+
+
+def test_a_missing_privilege_is_a_configuration_fault_exit_2(
+    lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A grant the role lacks (or a schema not migrated) fails every item the
+    same way: the run stops at once and gives the attempt back."""
+    from sqlalchemy.exc import ProgrammingError
+
+    db = lane["db"]
+    sha, key = lane["raw"].put(_photo(87))
+    _queue(db, sha, key, depictions=[(_pid(87), _pid(187), STORE.format(n=87), "amiami")])
+
+    def denied(*a: Any, **k: Any) -> Any:
+        raise ProgrammingError(
+            "INSERT", {}, Exception("permission denied for table figure_galleries")
+        )
+
+    monkeypatch.setattr(dc, "seed_with_retry", denied)
+    code, lines = _seed_all(lane)
+    assert code == dc.EXIT_CONFIG
+    assert next(x for x in lines if x["event"] == "stopped")["why"] == "configuration"
+    row = db.get(DisplayOriginal, sha)
+    assert (row.state, row.attempts) == ("pending", 0)

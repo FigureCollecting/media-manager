@@ -712,3 +712,28 @@ def test_enqueue_stops_at_its_rounds_and_its_budget(
     assert _event(out, "enqueued")["why"] == "budget"
     code, lines = _sync(db_session, url, lease_items=1, max_new=1)
     assert _event(lines, "enqueued")["why"] == "max_new"
+
+
+@pytest.mark.parametrize(
+    ("error", "code"), [("operational", feed.EXIT_STOPPED), ("programming", feed.EXIT_CONFIG)]
+)
+def test_a_database_fault_stops_the_sync_with_its_class(
+    db_session: Session,
+    spine: tuple[QueueSpine, str],
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+    code: int,
+) -> None:
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    fake, url = spine
+    fake.depict_full(sha("a"), seen=T0)
+
+    def broken(*a: Any, **k: Any) -> Any:
+        cls = OperationalError if error == "operational" else ProgrammingError
+        raise cls("SELECT", {}, Exception("the database said no"))
+
+    monkeypatch.setattr(feed, "report", broken)
+    got, lines = _sync(db_session, url)
+    assert got == code
+    assert _event(lines, "stopped")["why"].startswith("database:")

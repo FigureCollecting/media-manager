@@ -39,8 +39,9 @@ of app.workers.image_limits) and ``undecodable`` (the bytes are not an image
 the decoder can read). A FAILED report is permanent on the spine in
 practice, so nothing else ever becomes one:
   * a bad credential or configuration (the bucket's AccessDenied,
-    InvalidAccessKeyId, SignatureDoesNotMatch, RequestTimeTooSkewed, ...)
-    stops the run at once, exit 2, its attempt given back;
+    InvalidAccessKeyId, SignatureDoesNotMatch, RequestTimeTooSkewed, ...;
+    the database's ProgrammingError: a grant the role lacks, a schema not
+    migrated) stops the run at once, exit 2, its attempt given back;
   * an outage (the network, a 5xx, the database) gives the attempt back;
     ``max_outages`` in a row stop the run, exit 3;
   * anything else (a missing raw object, a corrupt stored object, a bug) is
@@ -86,7 +87,7 @@ from typing import Any, Literal
 from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from ..models import DisplayDepiction, DisplayOriginal, ImageMask, PublicObject, PublicObjectImage
@@ -302,6 +303,9 @@ def _raised(where: str, exc: Exception) -> SeedResult:
         return SeedResult("failed", f"refused:{exc.code}")
     if isinstance(exc, IntegrityError):
         return SeedResult("interrupted", f"{where}:IntegrityError")
+    if isinstance(exc, ProgrammingError):
+        # a grant the role lacks, a schema not migrated: every item alike, the deployment's
+        return SeedResult("config", f"{where}:ProgrammingError")
     if is_configuration_error(exc):
         return SeedResult("config", f"{where}:{bucket_error_code(exc)}")
     if is_outage(exc):
