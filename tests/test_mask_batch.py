@@ -3553,3 +3553,112 @@ def test_seed_clean_image_refuses_a_bomb_before_it_stores_or_decodes_anything(
         mask_seed.make_clean_copy(_png_claiming(3000, 3000))
     with pytest.raises(ImageLimitError):
         mask_seed.pixel_digest(_png_claiming(3000, 3000))
+
+
+# --------------------------------------------------------------------------
+# SHOW1: a concurrent first seed (the cluster display-copy lane)
+# --------------------------------------------------------------------------
+
+
+def test_a_seed_that_loses_a_concurrent_first_seed_is_retried_and_lands(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The display-copy lane may insert the same picture's first rows a moment
+    earlier: the batch's seed rolls back and seeds again, finding them."""
+    from sqlalchemy.exc import IntegrityError
+
+    real = mb.seed_clean_image
+    calls: list[int] = []
+
+    def raced(*a: Any, **k: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise IntegrityError(
+                "INSERT", {}, Exception("duplicate key value violates unique constraint")
+            )
+        return real(*a, **k)
+
+    monkeypatch.setattr(mb, "seed_clean_image", raced)
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 0
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert record["status"] == "ok" and len(calls) == 2
+
+
+def test_a_seed_that_keeps_losing_the_race_is_interrupted_never_failed(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An IntegrityError is a race, not the image's fault: a plain rerun takes it."""
+    from sqlalchemy.exc import IntegrityError
+
+    def always(*a: Any, **k: Any) -> Any:
+        raise IntegrityError(
+            "INSERT", {}, Exception("duplicate key value violates unique constraint")
+        )
+
+    monkeypatch.setattr(mb, "seed_clean_image", always)
+    raw = _Raw(tmp_path / "raw")
+    item = raw.add(1)
+    assert mb.run_batch([item], mb.BatchConfig(), _runtime(db_session, tmp_path, raw)) == 1
+    record = mb.Progress(tmp_path / "progress.jsonl").load()[item.blob_sha256]
+    assert (record["status"], record["reason"]) == ("interrupted", "seed:IntegrityError")
+
+
+# --------------------------------------------------------------------------
+# SHOW1 step 3: the daily store work list
+# --------------------------------------------------------------------------
+
+
+def test_the_stores_worklist_covers_every_site_since_an_instant_newest_first() -> None:
+    sql = mb.stores_worklist_sql("2026-10-23T21:21Z")
+    assert sql.startswith("BEGIN TRANSACTION READ ONLY;") and sql.endswith("ROLLBACK;\n")
+    assert "s.site = 'mfc'" not in sql  # every site: the catalog list is MFC's
+    assert "pi.first_seen_at >= '2026-10-23T21:21:00+00:00'::timestamptz" in sql
+    assert "s.derive_permitted IN ('silent', 'granted')" in sql  # showable by default
+    assert "'rank', 8" in sql  # ahead of every rank-9 list, whatever the file order
+    assert "JOIN raw.url u ON u.id = c.url_id" in sql  # never an originless row (F3)
+    assert "pi.state <> 'suppressed' AND pi.suppressed_at IS NULL" in sql
+    assert "ORDER BY pi.first_seen_at DESC" in sql
+
+
+def test_the_stores_worklist_takes_a_site_list_a_scope_and_a_rank() -> None:
+    sql = mb.stores_worklist_sql(
+        "2026-10-23T21:21:00+00:00", scope="all", sites="amiami,hlj,hobby-genki", rank=9
+    )
+    assert "derive_permitted" not in sql
+    assert "AND s.site IN ('amiami', 'hlj', 'hobby-genki')" in sql
+    assert "'rank', 9" in sql
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"since": "yesterday"}, "since"),
+        ({"since": "2026-10-23T21:21"}, "time zone"),
+        ({"since": "2026-10-23T21:21Z", "scope": "some"}, "scope"),
+        ({"since": "2026-10-23T21:21Z", "sites": "amiami,x'; DROP"}, "site"),
+        ({"since": "2026-10-23T21:21Z", "sites": ""}, "site"),
+        ({"since": "2026-10-23T21:21Z", "rank": 10}, "rank"),
+    ],
+)
+def test_the_stores_worklist_refuses_bad_input(kwargs: dict[str, Any], why: str) -> None:
+    with pytest.raises(ValueError, match=why):
+        mb.stores_worklist_sql(**kwargs)
+
+
+def test_the_mfc_lists_sql_is_unchanged_by_the_split() -> None:
+    """The catalog and gallery lists keep their exact text (the live batch's
+    lists were built with it)."""
+    assert mb._IMAGE_JOINS.startswith("JOIN source s ON s.id = pi.source_id\n")
+    assert "WHERE s.site = 'mfc'\n  AND pi.state <> 'suppressed'" in mb._IMAGE_JOINS
+    assert "s.site" not in mb._ANY_SITE_JOINS
+    assert mb._ANY_SITE_JOINS.endswith("AND b.visibility = 'visible'")
+
+
+def test_main_prints_the_stores_worklist(capsys: pytest.CaptureFixture[str]) -> None:
+    argv = ["sql", "stores-worklist", "--since", "2026-10-23T21:21Z", "--sites", "amiami"]
+    assert mb.main(argv) == 0
+    printed = capsys.readouterr().out
+    assert "s.site IN ('amiami')" in printed and "'rank', 8" in printed
+    assert mb.main(["sql", "stores-worklist", "--since", "nope"]) == 2

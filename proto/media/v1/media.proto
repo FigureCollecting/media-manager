@@ -2,12 +2,13 @@
 // media.v1 — the wire contract between the fc-aggregation spine and the
 // derivative pipeline that sanitizes captured originals.
 //
-// One consumer-facing service, SpineMedia, with four RPCs:
+// One consumer-facing service, SpineMedia, with five RPCs:
 //   LeasePendingImages(...) -> pending originals to sanitize
 //   ReportDerivative(...)   -> one sanitized derivative, registered
 //   ReportMask(...)         -> one published alpha mask over a derivative
 //   WithdrawMask(...)       -> a mask withdrawn, or restored
-// The two mask RPCs arrived in 0.10.0.
+//   ReportTiers(...)        -> the sized tiers of a derivative or a mask
+// The two mask RPCs arrived in 0.10.0. ReportTiers arrived in 0.11.0.
 //
 // WHY A SEPARATE PACKAGE, AND NOT A THIRD RPC ON SpineIngest. The caller here
 // is not a producer of observations; it is a WORKER that consumes the spine's
@@ -120,6 +121,76 @@ message PendingImage {
   // are built for a caller. A worker that ever branches on this value has
   // moved the gate into the one place the doctrine says it must not live.
   optional string content_level = 8;
+
+  // ----- 0.12.0: what a display-copy worker records with the copy ----------
+  // PROVENANCE, every one, exactly as source_site is: carried so the copy
+  // records where its original came from, NEVER a rights input. A server
+  // built before 0.12.0 never sends them, so a worker that needs them stops
+  // on a PendingImage without product_id or first_seen_at: that answer came
+  // from an older server, which also ignored the request's order and scope.
+
+  // The spine's uuid of the product this depiction belongs to. The copy is
+  // recorded against it, so one original depicted by two products is
+  // recorded twice. Always set by a 0.12.0 server.
+  string product_id = 9;
+
+  // The URL the original was fetched from: the depiction's origin capture's
+  // requested URL, never the URL after redirects. ABSENT when the spine holds
+  // no origin capture for the depiction; LEASE_SCOPE_SHOWABLE never hands such
+  // a row out. The worker never fetches it: the bytes are in the raw store.
+  optional string origin_url = 10;
+
+  // How the raw-store object is encoded at rest ('identity' or 'gzip' today),
+  // so the worker can decode the stored bytes before it hashes them. A codec
+  // the worker does not know is the worker's refusal, never the original's
+  // fault. Always set by a 0.12.0 server.
+  string codec = 11;
+
+  // When the spine first saw this depiction, as a RAW STRING TOKEN on the
+  // SERVER's clock (UTC, microseconds). The order a lease hands rows out in
+  // (LeasePendingImagesRequest.order) is by this instant, so a worker can
+  // check the order it asked for and measure its own lag. Always set by a
+  // 0.12.0 server.
+  string first_seen_at = 12;
+}
+
+// ---------------------------------------------------------------------------
+// LeaseOrder — which end of the pending queue a lease starts from (0.12.0).
+// ---------------------------------------------------------------------------
+enum LeaseOrder {
+  // The order of every earlier server: oldest first.
+  LEASE_ORDER_UNSPECIFIED = 0;
+
+  // The longest-pending depictions first, so a backlog drains in the order it
+  // arrived. The same as UNSPECIFIED, spelled out.
+  LEASE_ORDER_OLDEST_FIRST = 1;
+
+  // The most recently first-seen depictions first, so a scheduled worker keeps
+  // new captures moving while a backlog drains beside it.
+  LEASE_ORDER_NEWEST_FIRST = 2;
+}
+
+// ---------------------------------------------------------------------------
+// LeaseScope — which pending depictions a lease may hand out (0.12.0).
+//
+// A SCHEDULING CHOICE THE SPINE MAKES, NEVER A VERDICT HANDED TO THE WORKER.
+// The spine applies its own display gate to choose which rows go first. The
+// answer carries nothing per row that the worker could branch on: every row
+// of a SHOWABLE batch passed the same gate, so the worker sanitizes each one
+// the same way. The rest of the queue is deferred, never refused: an ALL
+// lease still hands it out.
+// ---------------------------------------------------------------------------
+enum LeaseScope {
+  // Every pending depiction: the behaviour of every earlier server.
+  LEASE_SCOPE_UNSPECIFIED = 0;
+
+  // The same as UNSPECIFIED, spelled out.
+  LEASE_SCOPE_ALL = 1;
+
+  // Only the depictions a derivative would make SHOWABLE: their source's
+  // derivation rights admit display, the gate read.v1 builds its rows behind,
+  // and the spine holds their origin capture, so origin_url is set.
+  LEASE_SCOPE_SHOWABLE = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +250,25 @@ message LeasePendingImagesRequest {
   // origin_sha256 against its list and report only the matches; the rest it
   // leaves alone, and their holds lapse.
   repeated bytes origin_sha256 = 4;
+
+  // WHICH END OF THE QUEUE (0.12.0). UNSPECIFIED and OLDEST_FIRST lease the
+  // longest-pending depictions first, as every earlier server did; NEWEST_FIRST
+  // the most recently first-seen. It combines with origin_sha256 and scope, and
+  // the lease lock still means two leases never hand out the same unheld row,
+  // whichever order each asked for.
+  // REFUSED: a value LeaseOrder does not declare -> INVALID_ARGUMENT, nothing
+  // leased. A server built before 0.12.0 IGNORES this field and leases oldest
+  // first, so a caller that asked for NEWEST_FIRST checks that every returned
+  // row carries first_seen_at, which such a server never sends, and stops.
+  LeaseOrder order = 5;
+
+  // WHICH ROWS (0.12.0): every pending depiction (UNSPECIFIED, ALL) or only the
+  // SHOWABLE ones (LeaseScope). It combines with origin_sha256 and order.
+  // REFUSED: a value LeaseScope does not declare -> INVALID_ARGUMENT, nothing
+  // leased. A server built before 0.12.0 IGNORES this field and leases from
+  // the whole queue; a caller that asked for SHOWABLE detects such a server as
+  // it does for order, and stops.
+  LeaseScope scope = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,8 +276,9 @@ message LeasePendingImagesRequest {
 // ---------------------------------------------------------------------------
 message LeasePendingImagesResponse {
   // Oldest first, so a backlog drains in the order it arrived rather than
-  // starving its own tail. EMPTY means there is no pending work — a normal,
-  // expected answer that a scheduled worker will get most of the time.
+  // starving its own tail, unless the request asked for NEWEST_FIRST (0.12.0).
+  // EMPTY means there is no pending work — a normal, expected answer that a
+  // scheduled worker will get most of the time.
   repeated PendingImage images = 1;
 
   // When another caller may be handed these same rows, as a RAW STRING TOKEN
@@ -649,6 +740,161 @@ message MaskWithdrawal {
 }
 
 // ---------------------------------------------------------------------------
+// TierParentKind — what a tier was minted from (0.11.0).
+// ---------------------------------------------------------------------------
+enum TierParentKind {
+  // Never sent: a report that leaves it unset is REFUSED.
+  TIER_PARENT_KIND_UNSPECIFIED = 0;
+
+  // A clean derivative: parent_sha256 is the derivative_sha256 its
+  // DerivativeReport carried.
+  TIER_PARENT_KIND_DERIVATIVE = 1;
+
+  // A mask: parent_sha256 is the mask_sha256 its MaskReport carried. A mask's
+  // tiers are masks.
+  TIER_PARENT_KIND_MASK = 2;
+}
+
+// ---------------------------------------------------------------------------
+// TierReport — the sized tiers media-manager minted from one parent picture
+// (0.11.0), so a client decodes the size it needs rather than the full
+// picture, and a phone can keep the small ones offline.
+//
+// WHAT A TIER IS. A tier (a rung) is a downscaled copy of a parent picture:
+// the whole picture scaled uniformly so its long edge is long_edge_px, never
+// past the parent's own long edge, never cropped or padded. So a tier has its
+// parent's aspect to within rounding, and every fraction measured on the
+// parent (its Grounding) holds on every tier. A parent is either a clean
+// DERIVATIVE or a MASK. The rungs are 256, 512 and 1,024 px, plus one at the
+// parent's own size when that is at most 1,024 px, so a parent has at most
+// three tiers today. The contract does not fix the ladder, only the rules
+// below, so a smaller rung can come later without a contract change.
+//
+// A MASK'S TIERS ARE MASKS: images whose alpha channel is the mask, as the
+// full mask's is, scaled from the full mask and never re-predicted. Each
+// pairs with the tier of the mask's derivative that has the same
+// long_edge_px.
+//
+// ONE IDENTITY: (parent_sha256, pipeline_version, long_edge_px). That triple
+// names a tier, and a report is idempotent on it, tier by tier. A tier's own
+// sha256 is its ADDRESS, never its identity: two parents may mint the same
+// bytes. TIERS NAME PARENT BYTES, not a registry row: every row carrying
+// parent_sha256 has them, a row that gains those bytes later included. A new
+// pipeline_version is a new set of tiers beside the old one, and the read
+// sends the newest version of each parent's tiers.
+//
+// TIERS HAVE NO STATUS OF THEIR OWN. They follow their parent: the read sends
+// a derivative's tiers only with an image row it already sends, and a mask's
+// tiers only inside the PUBLISHED mask it already picked. So a withdrawal, a
+// takedown, a suppression or a display restriction that hides a parent hides
+// its tiers, and no RPC withdraws a tier: there is no WithdrawTiers.
+//
+// NEVER EDITED IN PLACE. Different bytes for a (parent_sha256,
+// pipeline_version, long_edge_px) the spine already holds are ABSORBED:
+// warned, and the held tier stands, because its address may be cached on a
+// phone. A report never deletes a tier it leaves out. A changed encoder is a
+// new pipeline_version.
+// ---------------------------------------------------------------------------
+message TierReport {
+  // The parent's bytes, raw: the derivative_sha256 its DerivativeReport
+  // carried (DERIVATIVE) or the mask_sha256 its MaskReport carried (MASK). An
+  // IDENTITY.
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT. No registered
+  // derivative (DERIVATIVE) or no mask row (MASK) carries these bytes ->
+  // FAILED_PRECONDITION, nothing written: the parent's own report has not
+  // landed yet, and the same call succeeds once it has, so the caller reports
+  // the parent and then retries this.
+  bytes parent_sha256 = 1;
+
+  // What the parent is.
+  // REFUSED: UNSPECIFIED, or a number TierParentKind does not declare ->
+  // INVALID_ARGUMENT.
+  TierParentKind parent_kind = 2;
+
+  // Which tier encoder minted them, e.g. 'mm-tier-v1'. An IDENTITY: with the
+  // parent and the edge, the key of a tier's row.
+  // REFUSED: empty, a NUL, or over 256 bytes of UTF-8 -> INVALID_ARGUMENT.
+  string pipeline_version = 3;
+
+  // When the tiers were minted, a RAW STRING TOKEN.
+  // REFUSED: empty, a NUL, over 256 bytes of UTF-8, or a token PostgreSQL does
+  // not read as an instant -> INVALID_ARGUMENT. As for a mask, a tier row has
+  // no unknown instant to store it as.
+  string generated_at = 4;
+
+  // The parent's tiers at this pipeline_version, in strictly ascending
+  // long_edge_px.
+  // REFUSED: empty, more than 8, or not strictly ascending by long_edge_px ->
+  // INVALID_ARGUMENT, and Tier's own rule for each.
+  repeated Tier tiers = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Tier — one rung of a parent (0.11.0).
+//
+// THE PARENT'S SIZE, W x H with long edge L, is the width and height a
+// derivative's DerivativeReport carried, or, for a mask, those of the
+// derivative it was computed over. When the spine holds it, the checks
+// marked 'when the parent's size is held' apply; when it does not (a
+// derivative whose width or height was stored as unknown), they are skipped
+// and the answer carries a warning.
+// ---------------------------------------------------------------------------
+message Tier {
+  // The rung: the tier's long edge in pixels.
+  // REFUSED: 0, over 1,024, or not above the previous tier's ->
+  // INVALID_ARGUMENT. REFUSED when the parent's size is held: over L ->
+  // INVALID_ARGUMENT, since a tier is never past its parent.
+  uint32 long_edge_px = 1;
+
+  // sha-256 of the tier's bytes, raw: its content address on the public
+  // origin, the same grammar as a derivative's, computed over the bytes that
+  // were stored. Its ADDRESS, not its identity (see TierReport).
+  // REFUSED: not exactly 32 bytes -> INVALID_ARGUMENT.
+  bytes sha256 = 2;
+
+  // The tier's media type: 'image/webp', the one a tier is encoded as; it
+  // carries the alpha channel a mask's tier needs.
+  // REFUSED: any other value -> INVALID_ARGUMENT.
+  string mime = 3;
+
+  // The tier's pixel width.
+  // REFUSED: 0, or max(width, height) != long_edge_px -> INVALID_ARGUMENT.
+  // REFUSED when the parent's size is held: more than 1 px off
+  // round(W * long_edge_px / L) -> INVALID_ARGUMENT.
+  uint32 width = 4;
+
+  // The tier's pixel height.
+  // REFUSED: 0, or max(width, height) != long_edge_px -> INVALID_ARGUMENT.
+  // REFUSED when the parent's size is held: more than 1 px off
+  // round(H * long_edge_px / L) -> INVALID_ARGUMENT.
+  uint32 height = 5;
+
+  // The tier's size at rest, in bytes: what lets a phone budget its offline
+  // storage before a fetch. 0 = unknown, stored as unknown.
+  // ABSORBED: a value over 9223372036854775807 (the most PostgreSQL's bigint
+  // holds) is stored as unknown too, warned. No value is REFUSED.
+  uint64 bytes = 6;
+}
+
+// ---------------------------------------------------------------------------
+// TierAck — what the spine did with a tier report (0.11.0). COUNTS, as in
+// MaskAck. Like DerivativeAck, it names no URL and nothing about display.
+// ---------------------------------------------------------------------------
+message TierAck {
+  // Tier rows THIS call wrote: one for each tier the spine did not hold yet.
+  // 0 on a repeat: the normal answer to a duplicate, never an error.
+  uint32 stored = 1;
+
+  // Rows carrying parent_sha256: registry rows for a DERIVATIVE, mask rows
+  // for a MASK (at least 1, or the call was refused).
+  uint32 matched = 2;
+
+  // What the spine ABSORBED on the way in, and each check it skipped for want
+  // of the parent's size, each truncated to 1 KB.
+  repeated string warnings = 3;
+}
+
+// ---------------------------------------------------------------------------
 // SpineMedia — the derivative pipeline's whole surface.
 //
 // LEASE SEMANTICS, decided and stated rather than left to the implementation:
@@ -712,9 +958,13 @@ message MaskWithdrawal {
 //   * FAILED_PRECONDITION, nothing written (0.10.0): a ReportMask over
 //     derivative bytes no registered derivative has. It is RETRYABLE once
 //     the derivative's own report (ReportDerivative) lands, and the same call
-//     then succeeds. Nothing else in media.v1 is FAILED_PRECONDITION: a
-//     WithdrawMask never is (a restore of bytes the spine holds neither a
-//     mask row nor a withdrawal tombstone for is OK, matched=0, stored=0).
+//     then succeeds. A ReportTiers whose parent the spine does not hold is
+//     FAILED_PRECONDITION too (0.11.0): no registered derivative (DERIVATIVE)
+//     or no mask row (MASK) carries parent_sha256. It is RETRYABLE once the
+//     parent's own report (ReportDerivative or ReportMask) lands. Nothing
+//     else in media.v1 is FAILED_PRECONDITION: a WithdrawMask never is (a
+//     restore of bytes the spine holds neither a mask row nor a withdrawal
+//     tombstone for is OK, matched=0, stored=0).
 //   * Infrastructure faults -> UNAVAILABLE/INTERNAL, nothing written.
 //   * RETRY SAFETY: ReportDerivative is idempotent on
 //     (product_image_id, derivative_sha256) and may be retried on any status;
@@ -737,10 +987,17 @@ message MaskWithdrawal {
 //     is kept as a tombstone, so that report, landing or retried later, lands
 //     withdrawn; a caller need not re-read a mask's status before retrying a
 //     ReportMask.
+//     ReportTiers (0.11.0) is idempotent on each tier's identity
+//     (parent_sha256, pipeline_version, long_edge_px): a repeat returns
+//     stored=0, and different bytes for a held tier are ABSORBED, warned. It
+//     may be retried on UNAVAILABLE, DEADLINE_EXCEEDED and INTERNAL, and on
+//     FAILED_PRECONDITION once the parent's report has landed; never
+//     unchanged on INVALID_ARGUMENT.
 // ---------------------------------------------------------------------------
 service SpineMedia {
   rpc LeasePendingImages(LeasePendingImagesRequest) returns (LeasePendingImagesResponse);
   rpc ReportDerivative(DerivativeReport) returns (DerivativeAck);
   rpc ReportMask(MaskReport) returns (MaskAck);
   rpc WithdrawMask(MaskWithdrawal) returns (MaskAck);
+  rpc ReportTiers(TierReport) returns (TierAck);
 }

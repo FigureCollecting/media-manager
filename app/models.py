@@ -489,6 +489,95 @@ class SpineMaskWithdrawal(Base):
     )
 
 
+class DisplayOriginal(Base):
+    """SHOW1: one captured original the display-copy lane owes a clean copy
+    (app.workers.display_copy), queued from the spine's lease
+    (app.spine.display_feed) by the sha its raw-store object hashes to.
+
+    ``pending`` -> the seeder claims it (``claimed_until``, ``attempts``
+    counted and committed BEFORE its bytes are decoded, so a pod killed in
+    the decode leaves a trace) and settles it ``seeded`` (the copy and its
+    appearance recorded here for the reporter), ``failed`` (the image's own
+    fault: ``reason``), ``held`` (seeding would take a published mask
+    offline: ``reason``) or ``stuck`` (the lane gave up for a reason that is
+    not the image's: ``reason``). Only ``seeded`` and ``failed`` are ever
+    reported to the spine. A new depiction of a ``seeded`` original puts it
+    back to ``pending``, so its gallery link is written too."""
+
+    __tablename__ = "display_originals"
+
+    origin_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    codec: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: The newest first_seen_at among its depictions: the seeder's order.
+    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    #: Claims that have not settled (an outage gives its attempt back).
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claimed_until: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(128))
+    reason: Mapped[str | None] = mapped_column(String(256))
+    #: Seed even when that would take a published mask offline (an operator's
+    #: ``display_copy requeue --force``).
+    force_seed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    copy_sha256: Mapped[str | None] = mapped_column(String(64))
+    copy_mime: Mapped[str | None] = mapped_column(String(100))
+    copy_width: Mapped[int | None] = mapped_column(Integer)
+    copy_height: Mapped[int | None] = mapped_column(Integer)
+    copy_generated_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    thumbhash: Mapped[str | None] = mapped_column(String(64))
+    dominant_color: Mapped[str | None] = mapped_column(String(7))
+    own_grounding: Mapped[dict[str, float] | None] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state in ('pending','seeded','failed','held','stuck')",
+            name="ck_display_original_state",
+        ),
+        Index("ix_display_originals_state_seen", "state", "first_seen_at"),
+    )
+
+
+class DisplayDepiction(Base):
+    """SHOW1: one spine depiction (product_image) of a queued original, as
+    the lease handed it out: what its gallery link records (product, URL,
+    site, class) and whether the reporter has told the spine
+    (``reported_at``, ``outcome``: derived | failed | refused | no_copy)."""
+
+    __tablename__ = "display_depictions"
+
+    product_image_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    origin_sha256: Mapped[str] = mapped_column(
+        ForeignKey("display_originals.origin_sha256", ondelete="CASCADE"), nullable=False
+    )
+    product_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    origin_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_site: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_class: Mapped[str | None] = mapped_column(String(32))
+    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    #: When the seed wrote its gallery link; NULL until then.
+    linked_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    reported_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str | None] = mapped_column(String(16))
+    note: Mapped[str | None] = mapped_column(String(256))
+    enqueued_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_display_depictions_origin", "origin_sha256"),
+        Index("ix_display_depictions_reported_at", "reported_at"),
+    )
+
+
 # Useful indexes
 Index("ix_image_versions_image_id_visibility", ImageVersion.image_id, ImageVersion.visibility)
 Index("ix_album_title_trgm", Album.title)

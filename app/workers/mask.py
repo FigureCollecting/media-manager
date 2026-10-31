@@ -193,6 +193,30 @@ def _appearance(rgba: Image.Image) -> Appearance:
     )
 
 
+def _oriented_rgba(clean: bytes) -> Image.Image:
+    """``clean`` with its EXIF orientation applied, as RGBA: what a browser
+    draws, and what every appearance and mask is measured on."""
+    with Image.open(io.BytesIO(clean)) as src:
+        oriented = ImageOps.exif_transpose(src) or src
+        return oriented.convert("RGBA")
+
+
+def _own_grounding(rgba: Image.Image) -> AlphaGrounding | None:
+    own = np.asarray(rgba)[..., 3]
+    return measure_alpha_grounding(own) if bool((own < 255).any()) else None
+
+
+def plain_appearance(clean: bytes) -> tuple[Appearance, AlphaGrounding | None]:
+    """The clean copy's own appearance WITHOUT a mask, and the grounding of its
+    own alpha channel (a transparent copy only): exactly what
+    ``build_mask_artifact`` measures as ``unmasked`` and
+    ``own_alpha_grounding``, by the same code, with no model (SHOW1: the
+    display-copy lane reports a copy before any mask exists, and the replay
+    reports the mask row's plain values later, which are these)."""
+    rgba = _oriented_rgba(clean)
+    return _appearance(rgba), _own_grounding(rgba)
+
+
 def build_mask_artifact(
     clean: bytes, *, backend: MattingBackend | None = None, timings: StageTimings | None = None
 ) -> MaskOutcome:
@@ -205,13 +229,10 @@ def build_mask_artifact(
     the mask must line up with what is drawn.
     """
     active = backend or get_matting_backend()
-    with Image.open(io.BytesIO(clean)) as src:
-        oriented = ImageOps.exif_transpose(src) or src
-        rgba = oriented.convert("RGBA")
+    rgba = _oriented_rgba(clean)
     width, height = rgba.size
 
-    own = np.asarray(rgba)[..., 3]
-    own_alpha_grounding = measure_alpha_grounding(own) if bool((own < 255).any()) else None
+    own_alpha_grounding = _own_grounding(rgba)
     unmasked = _appearance(rgba)
 
     answer = (

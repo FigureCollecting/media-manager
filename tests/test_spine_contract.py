@@ -16,8 +16,10 @@ REPO = Path(__file__).resolve().parent.parent
 def test_the_vendored_proto_is_the_tagged_file() -> None:
     data = (REPO / contract.PROTO_PATH).read_bytes()
     assert hashlib.sha256(data).hexdigest() == contract.PROTO_SHA256
-    assert contract.PROTO_TAG == "v0.10.0"
-    assert contract.PROTO_COMMIT == "e06b1f61f941c1ac65f9876064ac4d6a8f71993d"
+    # SHOW1: 0.12.0, the lease's order and scope and four PendingImage fields
+    # (fc-ingest-contract feat/media-lease-order-0120; the tag lands with its merge).
+    assert contract.PROTO_TAG == "v0.12.0"
+    assert contract.PROTO_COMMIT == "9d88b4b27ed15dad992b718f17d8df7e1545f35e"
     assert contract.verify_vendored_proto(REPO) == data
 
 
@@ -43,9 +45,25 @@ def test_the_generated_stubs_name_the_contract_service() -> None:
         "LeasePendingImages",
         "ReportDerivative",
         "ReportMask",
+        "ReportTiers",
         "WithdrawMask",
     ]
     assert media_pb2.DESCRIPTOR.package == "media.v1"
     assert hasattr(media_pb2_grpc, "SpineMediaStub")
     report = media_pb2.DerivativeReport(product_image_id="x")
     assert not report.HasField("derivative_sha256")
+
+
+def test_the_stubs_carry_the_0120_lease_order_scope_and_provenance() -> None:
+    from app.spine.media_v1 import media_pb2
+
+    request = media_pb2.LeasePendingImagesRequest(
+        order=media_pb2.LEASE_ORDER_NEWEST_FIRST, scope=media_pb2.LEASE_SCOPE_SHOWABLE
+    )
+    assert request.order == 2 and request.scope == 2
+    image = media_pb2.PendingImage(
+        product_id="p", codec="identity", first_seen_at="2026-10-31T00:00:00.000000Z"
+    )
+    assert not image.HasField("origin_url")
+    image.origin_url = "https://img.example.test/a.jpg"
+    assert image.HasField("origin_url")
