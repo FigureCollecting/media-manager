@@ -54,9 +54,15 @@ rounds, budget, high water or max_new spent) goes on from there next time,
 never past the rest of them. It goes on past an answer of skipped rows
 alone, the walk's place left where it is: a skipped row was never queued, so
 it is no sign of ground covered, and the next run's pass goes on past it the
-same way. At the first answer with a row queued already and nothing new it
-goes on from where the walk stood when the run began, the place put back
-there (or carries the walk on, once it reaches that place). The price of a
+same way. It does so in the first half of the run's rounds and of its time
+only: skipped rows stay pending, so a pass that went on past them until
+either ran out would never reach the walk's place once more of them lie
+before it than a run gets through, and every later run would queue new
+captures alone, its walk never deeper (round 3 verifier, V3); what lies
+behind so many waits for the walk to wrap round. At the first answer with a
+row queued already and nothing new, or of skipped rows alone past half the
+run, it goes on from where the walk stood when the run began, the place put
+back there (or carries the walk on, once it reaches that place). The price of a
 run cut off among new rows: past them, the next goes on through rows the
 walk had covered already, a round per ``lease_items`` of those still
 pending, until it is past the deeper place. Each round's place is committed
@@ -64,8 +70,7 @@ with the rows it queued. A walk that reaches the
 end of the queue (an empty answer) ends, and the next run starts a new one at
 the newest end, which comes back for rows that were held when it passed
 them. A run that queued nothing and left the walk where it found it, its
-rounds or time spent (on rows queued already, or on skipped rows at the
-newest end), is STALLED (exit 1): a person looks.
+rounds or time spent, is STALLED (exit 1): a person looks.
 
 THE HOLD is ``lease_seconds``, at most 120. The feed reports none of its rows
 under it (a report needs no live lease), and a hold ends only by lapsing
@@ -686,15 +691,23 @@ def enqueue(
             # past the rest of them to a deeper place
             walk = _move_walk(db, walk, config.order, last, now)
             after = last
-        elif not already:
+        elif (
+            not already
+            and counts["rounds"] * 2 <= config.max_rounds
+            and (monotonic() - start) * 2 <= config.budget_seconds
+        ):
             # rows all skipped: never queued, so no sign of ground covered, nor
             # a place to keep (the next run's pass goes on past them the same
-            # way): on past them, the walk's place left where it is
+            # way): on past them, the walk's place left where it is. In the
+            # first half of the run's rounds and time only: past it, back to
+            # the walk, so more skipped rows before it than a run gets through
+            # never starve it
             after = last
         else:
             # ground already covered: on from the walk's place, and the walk
             # back there now (all before it is covered), so a run that stops
-            # past here keeps the deep place
+            # past here keeps the deep place. Skipped rows past half the run
+            # go the same way: what lies behind them waits for the walk to wrap
             assert found is not None  # a run with no walk is walking from its first round
             walk = _move_walk(db, walk, config.order, found, now)
             walking, after = True, found

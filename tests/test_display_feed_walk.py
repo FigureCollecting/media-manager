@@ -324,6 +324,122 @@ def test_a_head_pass_cut_off_among_skipped_rows_leaves_the_walks_place_alone(
     assert _walk(db_session) == _place(fake, backlog[8])
 
 
+def _skip_wall(db: Session, fake: QueueSpine, url: str) -> tuple[list[str], list[str]]:
+    """A backlog walk at b5 (2 rounds x 3 rows), then, newer, 12 rows the feed
+    skips (no codec): more than either run below gets through."""
+    backlog = [
+        fake.depict_full(sha(f"b{i}"), seen=T0 - dt.timedelta(days=3, minutes=i)) for i in range(30)
+    ]
+    _sync(db, url, lease_items=3, max_rounds=2)
+    assert _walk(db) == _place(fake, backlog[5])
+    wall = [
+        fake.depict_full(sha(f"x{i}"), seen=T0 + dt.timedelta(minutes=20, seconds=-i), codec="")
+        for i in range(12)
+    ]
+    return backlog, wall
+
+
+def _between_runs(db: Session, fake: QueueSpine, k: int, arrivals: bool) -> None:
+    """The seeder and the sync's report take every queued row off the spine's
+    queue; a new capture lands (``arrivals``); the holds lapse."""
+    for pid in db.execute(select(DisplayDepiction.product_image_id)).scalars():
+        fake.depictions[pid]["state"] = "derived"
+    if arrivals:
+        fake.depict_full(sha(f"g{k}"), seen=T0 + dt.timedelta(minutes=30 + k))
+    fake.lapse(1800)
+
+
+@pytest.mark.parametrize("arrivals", [True, False])
+def test_skipped_rows_before_the_walk_beyond_a_runs_rounds_never_starve_it(
+    db_session: Session, spine: tuple[QueueSpine, str], arrivals: bool
+) -> None:
+    """Skipped rows stay pending: 12 of them before the walk's place, more
+    than a run of 4 rounds x 3 rows gets through. A pass that went on past
+    them in every round would never reach the walk's place: with a new
+    capture before them each run every run would end 0 queuing that capture
+    alone, its walk never deeper; with none every run would be STALLED. Past
+    half its rounds the pass goes back to the walk: a round of backlog a run."""
+    fake, url = spine
+    backlog, wall = _skip_wall(db_session, fake, url)
+    codes = []
+    for k in range(4):
+        _between_runs(db_session, fake, k, arrivals)
+        codes.append(_sync(db_session, url, lease_items=3, max_rounds=4)[0])
+    assert codes == [feed.EXIT_DONE] * 4
+    assert _queued(db_session, wall) == 0
+    assert _queued(db_session, backlog) == 6 + 4 * 3
+    assert _walk(db_session) == _place(fake, backlog[17])
+
+
+@pytest.mark.parametrize("arrivals", [True, False])
+def test_skipped_rows_before_the_walk_beyond_a_runs_time_never_starve_it(
+    db_session: Session, spine: tuple[QueueSpine, str], arrivals: bool
+) -> None:
+    """The same wall, the run's time spent before its rounds: a lease takes
+    4 s of a 16 s budget, four leases a run, the 200 rounds never near. Past
+    half its time (half spent goes on, as with rounds) the pass goes back to
+    the walk: a round of backlog a run. (Bounded by rounds alone, every run
+    with arrivals ends 0 with its walk in the wall, the backlog never
+    reached; with none every run is STALLED.)"""
+    fake, url = spine
+    backlog, wall = _skip_wall(db_session, fake, url)
+    codes = []
+    for k in range(3):
+        _between_runs(db_session, fake, k, arrivals)
+        lines: list[dict[str, Any]] = []
+        codes.append(
+            feed.run_sync(
+                db_session,
+                lambda: _client(url),
+                feed.FeedConfig(lease_items=3, budget_seconds=16),
+                emit=lines.append,
+                now=lambda: T0,
+                monotonic=lambda: 4.0 * len(fake.sent("LeasePendingImages")),
+            )
+        )
+        assert _event(lines, "enqueued")["why"] == "budget"
+    assert codes == [feed.EXIT_DONE] * 3
+    assert _queued(db_session, wall) == 0
+    assert _queued(db_session, backlog) == 6 + 3 * 3
+    assert _walk(db_session) == _place(fake, backlog[14])
+
+
+def test_a_run_stopped_among_skipped_rows_keeps_the_walks_deep_place(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """Skipped rows are no place to keep: a run stopped right after an answer
+    of them alone (here the spine down) leaves the walk where the run found
+    it, never at the skipped rows."""
+    fake, url = spine
+    backlog, _wall = _skip_wall(db_session, fake, url)
+    fake.lapse(1800)
+    fake.fail("LeasePendingImages", None, grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.UNAVAILABLE)
+    code, lines = _sync(db_session, url, lease_items=3, max_rounds=4)
+    assert code == feed.EXIT_STOPPED and "UNAVAILABLE" in _event(lines, "stopped")["why"]
+    assert _walk(db_session) == _place(fake, backlog[5])
+
+
+def test_a_head_answer_of_skipped_and_queued_already_rows_goes_back_to_the_walk(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """One row queued already in the answer is ground covered, skipped rows
+    beside it or not: back to the walk's place (the rule is "nothing queued
+    already", never "something skipped")."""
+    fake, url = spine
+    backlog = [
+        fake.depict_full(sha(f"b{i}"), seen=T0 - dt.timedelta(days=3, minutes=i)) for i in range(30)
+    ]
+    _sync(db_session, url, lease_items=3, max_rounds=2)
+    x = fake.depict_full(sha("x0"), seen=T0 + dt.timedelta(minutes=20), codec="")
+    fake.lapse(1800)  # the head answer is [x0, b0, b1]
+    first = len(fake.sent("LeasePendingImages"))
+    code, lines = _sync(db_session, url, lease_items=3, max_rounds=2)
+    e = _event(lines, "enqueued")
+    assert (code, e["new_depictions"], e["already"], e["skipped"]) == (0, 3, 2, {"no_codec": 1})
+    assert _afters(fake)[first:] == [None, _place(fake, backlog[5])]
+    assert _walk(db_session) == _place(fake, backlog[8]) and _queued(db_session, [x]) == 0
+
+
 def test_a_head_pass_that_meets_ground_covered_puts_the_walk_back_before_it_goes_on(
     db_session: Session, spine: tuple[QueueSpine, str]
 ) -> None:
