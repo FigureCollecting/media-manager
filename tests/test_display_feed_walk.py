@@ -253,6 +253,77 @@ def test_a_run_cut_off_among_new_rows_leaves_the_walk_there_not_past_the_rest(
     assert _walk(db_session) == _place(fake, backlog[2])
 
 
+def _backlog_walk_then_skipped_and_good(
+    db: Session, fake: QueueSpine, url: str, skipped: int
+) -> tuple[list[str], list[str], list[str]]:
+    """A backlog walk at b5 (2 rounds x 3 rows), then 3 new good captures and,
+    newer still, ``skipped`` the feed skips (no codec)."""
+    backlog = [
+        fake.depict_full(sha(f"b{i}"), seen=T0 - dt.timedelta(days=3, minutes=i)) for i in range(30)
+    ]
+    _sync(db, url, lease_items=3, max_rounds=2)
+    assert _walk(db) == _place(fake, backlog[5])
+    good = [
+        fake.depict_full(sha(f"g{i}"), seen=T0 + dt.timedelta(minutes=10, seconds=-i))
+        for i in range(3)
+    ]
+    bad = [
+        fake.depict_full(sha(f"x{i}"), seen=T0 + dt.timedelta(minutes=20, seconds=-i), codec="")
+        for i in range(skipped)
+    ]
+    fake.lapse(1800)
+    return backlog, good, bad
+
+
+def test_a_head_pass_goes_on_past_an_answer_it_skipped_whole(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """Rows the feed skips are never queued, so an answer of them alone is no
+    sign of ground covered: the new captures just behind it are queued by the
+    same run, not left for the backlog walk to wrap round to (red team round
+    3: the 10th run)."""
+    fake, url = spine
+    _backlog, good, bad = _backlog_walk_then_skipped_and_good(db_session, fake, url, skipped=3)
+    first = len(fake.sent("LeasePendingImages"))
+    code, lines = _sync(db_session, url, lease_items=3, max_rounds=2)
+    e = _event(lines, "enqueued")
+    assert (code, e["new_depictions"], e["skipped"]) == (0, 3, {"no_codec": 3})
+    assert _afters(fake)[first:] == [None, _place(fake, bad[2])]  # on past them, not to b5
+    assert _queued(db_session, good) == 3 and _queued(db_session, bad) == 0
+    assert _walk(db_session) == _place(fake, good[2])  # cut off among new rows: the walk with them
+
+
+def test_a_head_pass_cut_off_among_skipped_rows_leaves_the_walks_place_alone(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """A skipped row is no place to keep either. A run whose rounds all go to
+    skipped rows leaves the walk at its deep place (it queued nothing and
+    moved nothing: STALLED, a person looks); a run with rounds to spare goes
+    on past them to the new captures behind, then back to the deep place,
+    never through the covered backlog again."""
+    fake, url = spine
+    backlog, good, bad = _backlog_walk_then_skipped_and_good(db_session, fake, url, skipped=6)
+    code, lines = _sync(db_session, url, lease_items=3, max_rounds=2)
+    assert _walk(db_session) == _place(fake, backlog[5])
+    assert code == feed.EXIT_REFUSED and _event(lines, "stalled")["rounds"] == 2
+    assert _queued(db_session, good) == 0
+    fake.lapse(1800)
+    first = len(fake.sent("LeasePendingImages"))
+    code, lines = _sync(db_session, url, lease_items=3, max_rounds=5)
+    assert code == feed.EXIT_DONE
+    # the skipped (on past them), the good (new: on), b0-b2 (queued already:
+    # back to b5), then b6-b8
+    assert _afters(fake)[first:] == [
+        None,
+        _place(fake, bad[2]),
+        _place(fake, bad[5]),
+        _place(fake, good[2]),
+        _place(fake, backlog[5]),
+    ]
+    assert _queued(db_session, good) == 3 and _queued(db_session, backlog) == 9
+    assert _walk(db_session) == _place(fake, backlog[8])
+
+
 def test_a_head_pass_that_meets_ground_covered_puts_the_walk_back_before_it_goes_on(
     db_session: Session, spine: tuple[QueueSpine, str]
 ) -> None:

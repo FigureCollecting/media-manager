@@ -51,8 +51,11 @@ order in ``display_feed_walks``: a run looks at the newest end first (new
 captures land within the hour whatever the backlog) and goes on through new
 rows, the walk's place moving with it, so a run cut off among them (its
 rounds, budget, high water or max_new spent) goes on from there next time,
-never past the rest of them. At the first answer with nothing new to queue
-it goes on from where the walk stood when the run began, the place put back
+never past the rest of them. It goes on past an answer of skipped rows
+alone, the walk's place left where it is: a skipped row was never queued, so
+it is no sign of ground covered, and the next run's pass goes on past it the
+same way. At the first answer with a row queued already and nothing new it
+goes on from where the walk stood when the run began, the place put back
 there (or carries the walk on, once it reaches that place). The price of a
 run cut off among new rows: past them, the next goes on through rows the
 walk had covered already, a round per ``lease_items`` of those still
@@ -61,7 +64,8 @@ with the rows it queued. A walk that reaches the
 end of the queue (an empty answer) ends, and the next run starts a new one at
 the newest end, which comes back for rows that were held when it passed
 them. A run that queued nothing and left the walk where it found it, its
-rounds or time spent, is STALLED (exit 1): a person looks.
+rounds or time spent (on rows queued already, or on skipped rows at the
+newest end), is STALLED (exit 1): a person looks.
 
 THE HOLD is ``lease_seconds``, at most 120. The feed reports none of its rows
 under it (a report needs no live lease), and a hold ends only by lapsing
@@ -661,7 +665,7 @@ def enqueue(
             counts["walk_done"] = 1
             break
         seen = _check_answer(images, config.order, after)
-        new = 0
+        new = already = 0
         for image, instant in zip(images, seen, strict=True):
             reason = _skip_reason(image)
             if reason is not None:
@@ -669,8 +673,9 @@ def enqueue(
             elif _queue_one(db, image, instant):
                 new += 1
             else:
-                counts["already"] += 1
+                already += 1
         counts["new_depictions"] += new
+        counts["already"] += already
         last = Place.of(images[-1])
         if not walking and found is not None and not found.comes_after(last, config.order):
             walking = True  # this pass has reached the walk's place: it carries the walk on
@@ -680,6 +685,11 @@ def enqueue(
             # budget, high water or max_new spent) goes on from here, never
             # past the rest of them to a deeper place
             walk = _move_walk(db, walk, config.order, last, now)
+            after = last
+        elif not already:
+            # rows all skipped: never queued, so no sign of ground covered, nor
+            # a place to keep (the next run's pass goes on past them the same
+            # way): on past them, the walk's place left where it is
             after = last
         else:
             # ground already covered: on from the walk's place, and the walk
