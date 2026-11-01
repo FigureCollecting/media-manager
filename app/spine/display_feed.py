@@ -62,10 +62,11 @@ from sqlalchemy import CursorResult, and_, delete, exists, func, or_, select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from ..models import DisplayDepiction, DisplayOriginal
+from ..models import DisplayDepiction, DisplayOriginal, PublicObject
+from ..models import Image as ImageModel
 from ..workers.mask_seed import CLEAN_PIPELINE_VERSION
 from . import messages as msg
-from .copies import reported_copy
+from .copies import measured_appearance, reported_copy
 from .field_rules import FieldRefused
 from .media_client import LEASE_ORDERS, LEASE_SCOPES, SpineCallError, SpineMediaClient, Verdict
 from .media_v1 import media_pb2
@@ -169,11 +170,29 @@ def report(
         )
         or 0
     )
-    send_failed = waiting_failed <= config.max_failed_reports
+    # The cap counts what this feed made permanent in the last day too: the
+    # seeder's breaker stops each RUN at max_failed own faults, so a fault that
+    # only looks like the images' would otherwise pass ~max_failed FAILED
+    # reports to the spine every run, the cap never reached.
+    sent_today = (
+        db.scalar(
+            select(func.count(func.distinct(DisplayDepiction.origin_sha256))).where(
+                DisplayDepiction.outcome == "failed",
+                DisplayDepiction.reported_at >= now - dt.timedelta(days=1),
+            )
+        )
+        or 0
+    )
+    send_failed = not waiting_failed or waiting_failed + sent_today <= config.max_failed_reports
     if not send_failed:
         counts["failed_held"] = waiting_failed
         emit(
-            {"event": "failed_held", "originals": waiting_failed, "cap": config.max_failed_reports}
+            {
+                "event": "failed_held",
+                "originals": waiting_failed,
+                "sent_last_day": sent_today,
+                "cap": config.max_failed_reports,
+            }
         )
     ready = and_(DisplayOriginal.state == "seeded", DisplayDepiction.linked_at.is_not(None))
     rows = db.execute(
@@ -241,13 +260,96 @@ def report(
         counts[outcome] += 1
         counts["warnings"] += len(warnings)
         db.commit()
+    _report_left_to_the_batch(db, client, config, counts, now)
     emit(
         {
             "event": "reported",
-            **{k: counts[k] for k in ("derived", "failed", "refused", "no_copy", "reseed")},
+            **{
+                k: counts[k]
+                for k in ("derived", "failed", "refused", "no_copy", "reseed", "batch_copy")
+            },
         }
     )
     return counts
+
+
+def _report_left_to_the_batch(
+    db: Session,
+    client: SpineMediaClient,
+    config: FeedConfig,
+    counts: Counter[str],
+    now: dt.datetime,
+) -> None:
+    """Depictions of ``held`` or ``stuck`` originals that another seeder (the
+    GPU batch, an operator's force) has since put in the media DB: DERIVED
+    with the copy the replay would report (reported_copy, its record as
+    replay._load_chunk builds it). The replay reports them too, once the
+    feed's short hold on them lapses; both reports are idempotent, and this
+    one also settles the lane's own row (purged after ``purge_days``), so a
+    row the lane leaves to the batch never waits on the replay's schedule.
+    Only originals the media DB holds an image of are looked at."""
+    rows = db.execute(
+        select(DisplayDepiction, DisplayOriginal)
+        .join(DisplayOriginal, DisplayOriginal.origin_sha256 == DisplayDepiction.origin_sha256)
+        .where(
+            DisplayDepiction.reported_at.is_(None),
+            DisplayOriginal.state.in_(("held", "stuck")),
+            # a column the role may read: EXISTS (SELECT * ...) needs them all
+            select(ImageModel.id)
+            .where(ImageModel.sha256 == DisplayOriginal.origin_sha256)
+            .exists(),
+        )
+        .order_by(DisplayDepiction.first_seen_at.desc(), DisplayDepiction.product_image_id)
+        .limit(config.report_limit)
+    ).all()
+    records: dict[str, msg.CopyRecord | None] = {}
+    for depiction, original in rows:
+        origin = original.origin_sha256
+        if origin not in records:
+            copy = reported_copy(db, origin)
+            obj = db.get(PublicObject, copy) if copy is not None else None
+            look = measured_appearance(db, copy) if copy is not None else None
+            records[origin] = (
+                msg.CopyRecord(
+                    sha256=obj.sha256,
+                    mime=obj.mime,
+                    width=obj.width,
+                    height=obj.height,
+                    generated_at=_utc(obj.created_at),
+                    thumbhash=look.plain_thumbhash if look else None,
+                    dominant_color=look.plain_dominant_color if look else None,
+                    own_grounding=look.own_alpha_grounding if look else None,
+                )
+                if obj is not None
+                else None
+            )
+        record = records[origin]
+        if record is None:
+            continue  # nothing in media yet: the row stays the lane's, unreported
+        try:
+            built = msg.derivative_report(
+                depiction.product_image_id, record, pipeline_version=CLEAN_PIPELINE_VERSION
+            )
+            ack = client.report_derivative(built.message)
+        except FieldRefused as exc:
+            depiction.reported_at, depiction.outcome = now, "refused"
+            depiction.note = f"not sent: {exc}"[:256]
+            counts["refused"] += 1
+            db.commit()
+            continue
+        except SpineCallError as exc:
+            if exc.verdict is not Verdict.REFUSED:
+                db.rollback()
+                raise _stop_for(exc) from exc
+            depiction.reported_at, depiction.outcome = now, "refused"
+            depiction.note = f"{exc.code.name}: {exc.details}"[:256]
+            counts["refused"] += 1
+            db.commit()
+            continue
+        depiction.reported_at, depiction.outcome = now, "derived"
+        depiction.note = "; ".join([*built.warnings, *ack.warnings])[:256] or None
+        counts["batch_copy"] += 1
+        db.commit()
 
 
 # --------------------------------------------------------------------------
@@ -406,6 +508,12 @@ def enqueue(
                 counts["already"] += 1
         db.commit()
         pending = _pending(db)
+    if why in ("rounds", "budget") and counts["new_depictions"] == 0 and counts["already"]:
+        # every leased row was one the lane holds already (held, stuck, still
+        # pending or unreportable): the newest-first window is full of them and
+        # nothing older is ever reached. A person must look (exit 1).
+        counts["stalled"] = 1
+        emit({"event": "stalled", "already": counts["already"], "rounds": counts["rounds"]})
     emit(
         {
             "event": "enqueued",
@@ -473,7 +581,7 @@ def run_sync(
     try:
         try:
             reported = report(db, client, config, emit, now())
-            enqueue(db, client, config, emit, monotonic)
+            queued = enqueue(db, client, config, emit, monotonic)
         except (OperationalError, ProgrammingError) as exc:
             # the database down (resumable) or refusing the role (a grant, the schema): never a traceback
             db.rollback()
@@ -486,4 +594,6 @@ def run_sync(
         return stop.code
     purged = purge(db, config, now())
     emit({"event": "done", "purged": purged, **_lag(db)})
-    return EXIT_REFUSED if reported["refused"] or reported["failed_held"] else EXIT_DONE
+    if reported["refused"] or reported["failed_held"] or queued["stalled"]:
+        return EXIT_REFUSED
+    return EXIT_DONE

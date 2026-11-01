@@ -47,6 +47,15 @@ CONFIGURATION_CODES = frozenset(
 )  # fmt: skip
 
 
+#: The bucket's error codes of a TRANSIENT refusal (a request the bucket
+#: timed out on, throttled, or failed inside): an outage whatever the HTTP
+#: status says (S3 sends RequestTimeout as a 400, throttling as a 429 or 503).
+OUTAGE_CODES = frozenset(
+    {"RequestTimeout", "SlowDown", "TooManyRequests", "Throttling", "ThrottlingException",
+     "RequestLimitExceeded", "InternalError", "ServiceUnavailable"}
+)  # fmt: skip
+
+
 class ReadOnlyStore:
     """The raw bucket as a reader sees it: it reads originals, never writes."""
 
@@ -94,8 +103,10 @@ def is_outage(exc: BaseException) -> bool:
     5xx): the image is not at fault, a rerun should try it again."""
     if any(cls.__name__ in OUTAGE_CLASSES for cls in type(exc).__mro__):
         return True
+    if bucket_error_code(exc) in OUTAGE_CODES:
+        return True
     status = _status(exc)
-    return status is not None and status >= 500
+    return status is not None and (status >= 500 or status == 429)
 
 
 def is_outage_reason(reason: str | None) -> bool:

@@ -54,11 +54,14 @@ THE BREAKER: more than ``max_failed`` own faults that are also more than
 ``max_failed_fraction`` of the originals settled stop the run, exit 1, so a
 fault that only looks like the images' (a bucket full of wrong objects) is
 looked at by a person before the reporter makes it permanent (the reporter
-holds FAILED reports past its own cap, too).
+holds FAILED reports past its own cap, which counts the last day's reports
+too).
 
-HELD, NOT SEEDED: a depiction whose origin the mask policy would judge
-``not_granted`` or ``unknown_origin``, of a picture whose clean copy carries
-a published mask. Mask eligibility is POOLED over every capture of a picture
+HELD, NOT SEEDED: depictions whose seed would turn the pooled mask verdict
+of a picture whose clean copy serves a published mask into a refusal
+(``not_granted``, ``unknown_origin``, ``user_photo``, ``store_revoked``, or
+``no_origin`` when the product already links the URL to another image).
+Mask eligibility is POOLED over every capture of a picture
 (app.publication), so seeding it would take that mask offline at the origin
 while the spine still advertises it. Such an original is ``held``
 (``would_withdraw_mask:<class>``), never reported, until an operator
@@ -71,6 +74,7 @@ by outages, resumable.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -87,18 +91,25 @@ from typing import Any, Literal
 from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from ..models import DisplayDepiction, DisplayOriginal, ImageMask, PublicObject, PublicObjectImage
+from ..models import (
+    DisplayDepiction,
+    DisplayOriginal,
+    FigureGallery,
+    ImageMask,
+    PublicObject,
+    PublicObjectImage,
+)
 from ..models import Image as ImageModel
 from ..object_store import ObjectStore
-from ..publication import mask_refusal
+from ..publication import gallery_origins, judged_origins, mask_refusal, store_revocations
 from ..spine.copies import measured_appearance, reported_copy
 from .grounding import AlphaGrounding
 from .image_limits import ImageLimitError, check_image
 from .mask import plain_appearance
-from .mask_policy import ImageOrigin, StoreGrants, classify_origin
+from .mask_policy import MASKABLE, ImageOrigin, StoreGrants, classify_origin, mask_eligibility
 from .mask_seed import _copies_showing, picture_keys, seed_with_retry
 from .raw_source import (
     KNOWN_CODECS,
@@ -115,9 +126,6 @@ EXIT_STOPPED = 3
 
 #: The states an operator may put back to pending (``requeue``).
 REQUEUEABLE = ("failed", "held", "stuck")
-#: The origin classes whose capture, seeded, would withdraw a published mask
-#: of its picture that the policy would otherwise keep.
-_WITHDRAWING = ("not_granted", "unknown_origin")
 
 Kind = Literal["seeded", "failed", "held", "stuck", "error", "outage", "interrupted", "config"]
 
@@ -155,6 +163,8 @@ class SeedResult:
     reason: str | None = None
     #: Seeded: the copy and its appearance, as ``display_originals`` records them.
     look: Mapping[str, Any] | None = None
+    #: Seeded: the depictions whose gallery links this seed wrote.
+    linked: tuple[str, ...] = ()
 
 
 def grounding_dict(grounding: AlphaGrounding | None) -> dict[str, float] | None:
@@ -210,18 +220,31 @@ def claim_with_history(
 
 
 class _Units:
-    """Decode units: an original takes ``n`` at once, never more than all."""
+    """Decode units: an original takes ``n`` at once, never more than all.
+    A request for EVERY unit (an isolated claim) goes first: while one waits
+    no smaller request is granted, so it waits out only the seeds already in
+    flight -- never past its own claim, beside threads that keep the units
+    busy forever."""
 
     def __init__(self, total: int) -> None:
         self.total = total
         self._free = total
+        self._whole_waiting = 0
         self._cond = threading.Condition()
 
     def acquire(self, n: int) -> int:
         n = max(1, min(n, self.total))
         with self._cond:
-            while self._free < n:
-                self._cond.wait()
+            if n == self.total:
+                self._whole_waiting += 1
+                try:
+                    while self._free < n:
+                        self._cond.wait()
+                finally:
+                    self._whole_waiting -= 1
+            else:
+                while self._free < n or self._whole_waiting:
+                    self._cond.wait()
             self._free -= n
         return n
 
@@ -254,34 +277,84 @@ def _origins(depictions: Sequence[DisplayDepiction]) -> list[ImageOrigin]:
     ]
 
 
+def _seeded_origins(
+    db: Session, origin_sha256: str, depictions: Sequence[DisplayDepiction]
+) -> list[ImageOrigin]:
+    """The live origins the image will have once ``depictions`` are seeded:
+    its live gallery links now, plus each depiction's URL unless the product
+    already links that URL (uq_figure_source_url: the seed then writes NO
+    link for this image) -- and, with none at all, the originless stand-in
+    app.publication.judged_origins pools it as (``no_origin``)."""
+    image_id = db.execute(
+        select(ImageModel.id).where(ImageModel.sha256 == origin_sha256)
+    ).scalar_one_or_none()
+    origins = gallery_origins(db, image_id) if image_id is not None else []
+    for d in depictions:
+        taken = db.execute(
+            select(FigureGallery.id).where(
+                FigureGallery.figure_id == d.product_id, FigureGallery.source_url == d.origin_url
+            )
+        ).first()
+        if taken is None:
+            origins.append(
+                ImageOrigin(url=d.origin_url, source=d.source_site, source_class=d.source_class)
+            )
+    return origins or [ImageOrigin(url=None)]
+
+
+def _picture_copies(db: Session, copies: set[str], origin_sha256: str) -> set[str]:
+    """Every clean copy the seed's _join_picture will put the image behind:
+    ``copies`` grown through the recorded copy-image links to their fixed
+    point (a capture behind two copies joins them)."""
+    images = set(
+        db.execute(select(ImageModel.id).where(ImageModel.sha256 == origin_sha256)).scalars()
+    )
+    while True:
+        more_images = set(
+            db.execute(
+                select(PublicObjectImage.image_id).where(PublicObjectImage.sha256.in_(copies))
+            ).scalars()
+        )
+        more_copies = set(
+            db.execute(
+                select(PublicObjectImage.sha256).where(PublicObjectImage.image_id.in_(images))
+            ).scalars()
+        )
+        if more_images <= images and more_copies <= copies:
+            return copies
+        images, copies = images | more_images, copies | more_copies
+
+
 def _withdraws_a_mask(
     db: Session,
     data: bytes,
     origin_sha256: str,
-    origins: Sequence[ImageOrigin],
+    depictions: Sequence[DisplayDepiction],
     grants: StoreGrants | None,
 ) -> str | None:
-    """The origin class that would take a published mask of this picture
-    offline if these origins were seeded behind it, or None."""
-    risky = [cls for cls in (classify_origin(o, grants) for o in origins) if cls in _WITHDRAWING]
-    if not risky:
-        return None
+    """Why seeding ``depictions`` would take a published mask of this picture
+    offline (the pooled verdict's refusal: not_granted, unknown_origin,
+    user_photo, store_revoked or no_origin), or None. JUDGED, NOT GUESSED:
+    every copy of the picture that serves a mask now is judged again over
+    its current origins plus the ones this seed would add, with the
+    persisted revocations, exactly as app.publication will judge it."""
+    revoked = store_revocations(db)
+    added = _seeded_origins(db, origin_sha256, depictions)
+    if all(classify_origin(o, grants, revoked) in MASKABLE for o in added):
+        return None  # every origin it adds is maskable: no verdict can turn (and no decode)
     keys = picture_keys(data)
     shown = {c.sha256 for c in _copies_showing(db, keys.digest, origin_sha256)}
     shown |= {c.sha256 for c in _copies_showing(db, keys.own_digest, keys.clean_sha256)}
-    shown |= set(
-        db.execute(
-            select(PublicObjectImage.sha256)
-            .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
-            .where(ImageModel.sha256 == origin_sha256)
-        ).scalars()
-    )
+    shown = _picture_copies(db, shown, origin_sha256)
     for copy in sorted(shown):
         published = db.execute(
             select(ImageMask.id).where(ImageMask.source_sha256 == copy, ImageMask.status == "ok")
         ).first()
-        if published is not None and mask_refusal(db, copy, grants) is None:
-            return risky[0]
+        if published is None or mask_refusal(db, copy, grants, revoked) is not None:
+            continue
+        verdict = mask_eligibility([*(judged_origins(db, copy) or []), *added], grants, revoked)
+        if not verdict.eligible:
+            return verdict.reason
     return None
 
 
@@ -298,6 +371,17 @@ def _decodable(data: bytes) -> tuple[SeedResult | None, int]:
         return SeedResult("failed", "undecodable"), 0
 
 
+#: What Pillow's decoders raise (a bare OSError) for broken image data.
+_PIL_DECODE_FAULTS = (
+    "image file is truncated",
+    "broken data stream",
+    "decoder error",
+    "Truncated File Read",
+    "unrecognized data stream contents",
+    "buffer overrun",
+)
+
+
 def _raised(where: str, exc: Exception) -> SeedResult:
     if isinstance(exc, ImageLimitError):
         return SeedResult("failed", f"refused:{exc.code}")
@@ -311,6 +395,10 @@ def _raised(where: str, exc: Exception) -> SeedResult:
     if is_outage(exc):
         return SeedResult("outage", f"{where}:{type(exc).__name__}")
     if isinstance(exc, UnidentifiedImageError | PILImage.DecompressionBombError):
+        return SeedResult("failed", "undecodable")
+    if type(exc) is OSError and any(m in str(exc) for m in _PIL_DECODE_FAULTS):
+        # past the header, the decoder found the bytes broken (a truncated
+        # capture): the image's own fault, as an unreadable header is
         return SeedResult("failed", "undecodable")
     return SeedResult("error", f"{where}:{type(exc).__name__}")
 
@@ -379,7 +467,7 @@ def _seed_and_measure(
     unlinked = [d for d in depictions if d.linked_at is None] or depictions
     try:
         if not original.force_seed:
-            withdrawing = _withdraws_a_mask(db, data, origin, _origins(unlinked), config.grants)
+            withdrawing = _withdraws_a_mask(db, data, origin, unlinked, config.grants)
             if withdrawing is not None:
                 return SeedResult("held", f"would_withdraw_mask:{withdrawing}")
         recording = _Recording(media)
@@ -416,7 +504,7 @@ def _seed_and_measure(
     except Exception as exc:  # noqa: BLE001 -- classified, never swallowed
         db.rollback()
         return _raised("seed", exc)
-    return SeedResult("seeded", look=look)
+    return SeedResult("seeded", look=look, linked=tuple(d.product_image_id for d in unlinked))
 
 
 def _settle(
@@ -442,13 +530,19 @@ def _settle(
         original.force_seed = False
         for name, value in (result.look or {}).items():
             setattr(original, name, value)
+        late = False
         for d in db.execute(
             select(DisplayDepiction).where(
                 DisplayDepiction.origin_sha256 == original.origin_sha256,
                 DisplayDepiction.linked_at.is_(None),
             )
         ).scalars():
-            d.linked_at = now
+            if d.product_image_id in result.linked:
+                d.linked_at = now
+            else:  # queued by the feed while this seed ran: its link is still to write
+                late = True
+        if late:
+            original.state = "pending"
     elif result.kind in ("failed", "held", "stuck"):
         original.state, original.reason = result.kind, result.reason
     elif result.kind in ("outage", "interrupted", "config"):
@@ -565,6 +659,17 @@ class _Run:
                     hold_until=self.hold_until,
                 )
                 self.record(result)
+        except Exception as exc:  # noqa: BLE001 -- the claim or the settle: the run stops, never ends "done"
+            with contextlib.suppress(Exception):  # the connection may be gone; the stop says so
+                db.rollback()
+            if isinstance(exc, OperationalError | InterfaceError):
+                why = (EXIT_STOPPED, f"database:{type(exc).__name__}")
+            elif isinstance(exc, ProgrammingError):
+                why = (EXIT_CONFIG, "database:ProgrammingError")
+            else:
+                why = (EXIT_BREAKER, f"lane:{type(exc).__name__}")
+            with self.lock:
+                self.stop = self.stop or why
         finally:
             if self.config.threads:  # threads=0 runs on the caller's session, which it closes
                 db.close()
