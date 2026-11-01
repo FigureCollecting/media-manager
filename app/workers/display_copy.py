@@ -352,9 +352,9 @@ def _withdraws_a_mask(
         ).first()
         if published is None or mask_refusal(db, copy, grants, revoked) is not None:
             continue
-        verdict = mask_eligibility([*(judged_origins(db, copy) or []), *added], grants, revoked)
-        if not verdict.eligible:
-            return verdict.reason
+        # The copy's own origins pass (no refusal) and ``added`` holds one that
+        # is not maskable (above), so the pooled verdict refuses: its reason.
+        return mask_eligibility([*(judged_origins(db, copy) or []), *added], grants, revoked).reason
     return None
 
 

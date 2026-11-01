@@ -19,7 +19,7 @@ from app.workers.raw_source import ReadOnlyStore
 from botocore.exceptions import ClientError
 from PIL import Image
 from sqlalchemy import create_engine, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
 from test_display_copy import (  # noqa: F401
@@ -179,10 +179,11 @@ def test_a_request_for_every_unit_goes_before_new_small_ones() -> None:
     assert order == ["whole", "small"]
 
 
-@pytest.mark.parametrize("where", ["claim_with_history", "_settle"])
-def test_a_database_drop_at_the_claim_or_the_settle_stops_the_run_3(
-    tmp_path: Path, monkeypatch, where: str
-) -> None:
+def _run_with_a_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str, error: Exception
+) -> tuple[int, list[dict[str, Any]]]:
+    """Four queued originals; ``where`` (the claim or the settle) raises
+    ``error`` from its second call on."""
     engine = create_engine(
         f"sqlite:///{tmp_path / 'q.db'}", connect_args={"check_same_thread": False, "timeout": 30}
     )
@@ -199,9 +200,7 @@ def test_a_database_drop_at_the_claim_or_the_settle_stops_the_run_3(
     def flaky(*a: Any, **k: Any) -> Any:
         calls["n"] += 1
         if calls["n"] >= 2:
-            raise OperationalError(
-                "UPDATE", {}, Exception("server closed the connection unexpectedly")
-            )
+            raise error
         return real(*a, **k)
 
     monkeypatch.setattr(dc, where, flaky)
@@ -214,8 +213,36 @@ def test_a_database_drop_at_the_claim_or_the_settle_stops_the_run_3(
         emit=lines.append,
         now=lambda: T0,
     )
+    return code, lines
+
+
+@pytest.mark.parametrize("where", ["claim_with_history", "_settle"])
+def test_a_database_drop_at_the_claim_or_the_settle_stops_the_run_3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    drop = OperationalError("UPDATE", {}, Exception("server closed the connection unexpectedly"))
+    code, lines = _run_with_a_fault(tmp_path, monkeypatch, where, drop)
     assert code == dc.EXIT_STOPPED
     assert lines[-1]["event"] == "stopped" and lines[-1]["why"] == "database:OperationalError"
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "why"),
+    [
+        (
+            ProgrammingError("SELECT", {}, Exception("permission denied")),
+            dc.EXIT_CONFIG,
+            "database:ProgrammingError",
+        ),
+        (RuntimeError("a bug in the settle"), dc.EXIT_BREAKER, "lane:RuntimeError"),
+    ],
+)
+def test_a_grant_or_a_bug_at_the_settle_stops_the_run_with_its_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, code: int, why: str
+) -> None:
+    got, lines = _run_with_a_fault(tmp_path, monkeypatch, "_settle", error)
+    assert got == code
+    assert lines[-1]["event"] == "stopped" and lines[-1]["why"] == why
 
 
 def test_a_decoder_buffer_overrun_is_the_images_own() -> None:
