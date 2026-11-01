@@ -16,8 +16,10 @@ from pathlib import Path
 
 PROTO_PATH = "proto/media/v1/media.proto"
 PROTO_TAG = "v0.12.0"
-PROTO_COMMIT = "9d88b4b27ed15dad992b718f17d8df7e1545f35e"
-PROTO_SHA256 = "4cfab26ba87ba29aec815eb92867df6005c7d82777588c455fd048d09fbc7b6e"
+# The branch head until fc-ingest-contract squash-merges 0.12.0; then this line
+# alone moves to the merge commit (the bytes, and PROTO_SHA256, stay the same).
+PROTO_COMMIT = "317271207a28bec1c5872ab8e481085d996670aa"
+PROTO_SHA256 = "c5cc34de2d1f4d87d2d59350be6bf3bc86e12ecf5093cf817633da14c1ecfd5c"
 
 
 class ProtoMismatch(RuntimeError):

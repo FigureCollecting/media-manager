@@ -5,6 +5,7 @@ the contract's service and messages."""
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -16,10 +17,12 @@ REPO = Path(__file__).resolve().parent.parent
 def test_the_vendored_proto_is_the_tagged_file() -> None:
     data = (REPO / contract.PROTO_PATH).read_bytes()
     assert hashlib.sha256(data).hexdigest() == contract.PROTO_SHA256
-    # SHOW1: 0.12.0, the lease's order and scope and four PendingImage fields
-    # (fc-ingest-contract feat/media-lease-order-0120; the tag lands with its merge).
+    # SHOW1: 0.12.0, the lease's order, scope and cursor and four PendingImage
+    # fields (fc-ingest-contract feat/media-lease-order-0120; the tag lands with
+    # its merge). The commit is not repeated here: the squash merge re-pins it in
+    # app/spine/contract.py alone, the bytes and their sha-256 unchanged.
     assert contract.PROTO_TAG == "v0.12.0"
-    assert contract.PROTO_COMMIT == "9d88b4b27ed15dad992b718f17d8df7e1545f35e"
+    assert re.fullmatch(r"[0-9a-f]{40}", contract.PROTO_COMMIT)
     assert contract.verify_vendored_proto(REPO) == data
 
 
@@ -67,3 +70,21 @@ def test_the_stubs_carry_the_0120_lease_order_scope_and_provenance() -> None:
     assert not image.HasField("origin_url")
     image.origin_url = "https://img.example.test/a.jpg"
     assert image.HasField("origin_url")
+
+
+def test_the_stubs_carry_the_0120_lease_cursor() -> None:
+    """LeasePendingImagesRequest.after = 7, a LeaseCursor of the two halves of
+    the lease's sort key, both plain strings: presence is the message's."""
+    from app.spine.media_v1 import media_pb2
+
+    after = media_pb2.LeasePendingImagesRequest.DESCRIPTOR.fields_by_name["after"]
+    assert after.number == 7 and after.message_type.full_name == "media.v1.LeaseCursor"
+    cursor = media_pb2.LeaseCursor.DESCRIPTOR
+    assert [(f.name, f.number) for f in cursor.fields] == [
+        ("first_seen_at", 1),
+        ("product_image_id", 2),
+    ]
+    request = media_pb2.LeasePendingImagesRequest()
+    assert not request.HasField("after")
+    request.after.SetInParent()
+    assert request.HasField("after")  # present though empty: the spine refuses that

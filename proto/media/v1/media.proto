@@ -127,7 +127,8 @@ message PendingImage {
   // records where its original came from, NEVER a rights input. A server
   // built before 0.12.0 never sends them, so a worker that needs them stops
   // on a PendingImage without product_id or first_seen_at: that answer came
-  // from an older server, which also ignored the request's order and scope.
+  // from an older server, which also ignored the request's order, scope and
+  // cursor.
 
   // The spine's uuid of the product this depiction belongs to. The copy is
   // recorded against it, so one original depicted by two products is
@@ -135,9 +136,14 @@ message PendingImage {
   string product_id = 9;
 
   // The URL the original was fetched from: the depiction's origin capture's
-  // requested URL, never the URL after redirects. ABSENT when the spine holds
-  // no origin capture for the depiction; LEASE_SCOPE_SHOWABLE never hands such
-  // a row out. The worker never fetches it: the bytes are in the raw store.
+  // requested URL, never the URL after redirects. SENT ONLY ON A
+  // LEASE_SCOPE_SHOWABLE LEASE, and there on every row, because that scope
+  // hands out only depictions whose origin capture the spine holds. Every
+  // other lease (scope UNSPECIFIED or ALL, with or without an origin_sha256
+  // filter) leaves it ABSENT on every row, as no lease named a URL before
+  // 0.12.0, so a lease whose rows have not passed the display gate never
+  // names the address of a source that may not derive or that nobody has
+  // reviewed. The worker never fetches it: the bytes are in the raw store.
   optional string origin_url = 10;
 
   // How the raw-store object is encoded at rest ('identity' or 'gzip' today),
@@ -147,10 +153,12 @@ message PendingImage {
   string codec = 11;
 
   // When the spine first saw this depiction, as a RAW STRING TOKEN on the
-  // SERVER's clock (UTC, microseconds). The order a lease hands rows out in
-  // (LeasePendingImagesRequest.order) is by this instant, so a worker can
-  // check the order it asked for and measure its own lag. Always set by a
-  // 0.12.0 server.
+  // SERVER's clock: YYYY-MM-DDTHH:MM:SS.ffffffZ, UTC, always six fractional
+  // digits, so tokens sort as text in time order. A lease orders its rows by
+  // this instant and then by product_image_id
+  // (LeasePendingImagesRequest.order), so a worker can check the order it
+  // asked for, continue after a row it was handed (LeaseCursor), and measure
+  // its own lag. Always set by a 0.12.0 server.
   string first_seen_at = 12;
 }
 
@@ -181,7 +189,8 @@ enum LeaseOrder {
 // lease still hands it out.
 // ---------------------------------------------------------------------------
 enum LeaseScope {
-  // Every pending depiction: the behaviour of every earlier server.
+  // Every pending depiction, none of them with its origin_url: the behaviour
+  // of every earlier server.
   LEASE_SCOPE_UNSPECIFIED = 0;
 
   // The same as UNSPECIFIED, spelled out.
@@ -189,8 +198,40 @@ enum LeaseScope {
 
   // Only the depictions a derivative would make SHOWABLE: their source's
   // derivation rights admit display, the gate read.v1 builds its rows behind,
-  // and the spine holds their origin capture, so origin_url is set.
+  // and the spine holds their origin capture. The only scope whose rows carry
+  // origin_url, and every one of them does.
   LEASE_SCOPE_SHOWABLE = 2;
+}
+
+// ---------------------------------------------------------------------------
+// LeaseCursor — a place in the order a lease hands rows out in (0.12.0).
+//
+// The lease's own sort key, both halves: (first_seen_at, product_image_id),
+// the second breaking ties, because many depictions share one first_seen_at
+// (one capture's transaction writes them together). A caller copies both,
+// VERBATIM, from the last PendingImage it was handed. A cursor names a PLACE,
+// not a row: the row it was copied from may since have been derived, failed,
+// suppressed or leased to another caller, and the cursor still names the same
+// place. The server keeps no cursor between calls; a caller that resumes a
+// walk in a later run keeps its own.
+// ---------------------------------------------------------------------------
+message LeaseCursor {
+  // PendingImage.first_seen_at of the row to continue after, exactly as the
+  // lease sent it: YYYY-MM-DDTHH:MM:SS.ffffffZ, UTC, six fractional digits.
+  // REFUSED: empty, any other spelling, even of the same instant (an offset,
+  // fewer or more digits), or a date or time that does not exist (a 30
+  // February, an hour 24) -> INVALID_ARGUMENT, nothing leased. Another
+  // spelling is refused rather than read so that a caller which formats the
+  // instant itself fails on its first call, instead of naming a slightly
+  // different place and skipping rows with nothing to show why.
+  string first_seen_at = 1;
+
+  // PendingImage.product_image_id of the same row: a uuid in its 36-character
+  // 8-4-4-4-12 hex form, either case. Ties are broken by the uuid's value,
+  // which is the order of its lowercase spelling as text.
+  // REFUSED: empty, or anything but a uuid in that form -> INVALID_ARGUMENT,
+  // nothing leased.
+  string product_image_id = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +260,14 @@ message LeasePendingImagesRequest {
   // hold the rows back from another caller, never a lock the worker can extend
   // by asking for more.
   // ABSORBED, silently: every value is served, clamped as above.
+  //
+  // A HOLD ENDS ONLY BY LAPSING (stated in 0.12.0). There is no release RPC,
+  // so a caller that leases rows it will not report cannot hand them back. It
+  // asks for the shortest hold that covers taking the batch in (there is no
+  // floor: 1 holds for one second), and the rows it does not take go back to
+  // every other caller, a replay leasing by origin_sha256 among them, when
+  // the hold lapses. A caller that walks the queue with a cursor (after)
+  // moves on whatever it holds, so a short hold costs it nothing.
   uint32 lease_seconds = 3;
 
   // There is deliberately NO caller clock here, though every other instant in
@@ -253,9 +302,11 @@ message LeasePendingImagesRequest {
 
   // WHICH END OF THE QUEUE (0.12.0). UNSPECIFIED and OLDEST_FIRST lease the
   // longest-pending depictions first, as every earlier server did; NEWEST_FIRST
-  // the most recently first-seen. It combines with origin_sha256 and scope, and
-  // the lease lock still means two leases never hand out the same unheld row,
-  // whichever order each asked for.
+  // the most recently first-seen. Rows that share a first_seen_at are ordered
+  // by product_image_id in the same direction, so the order is TOTAL and a
+  // cursor (after) names exactly one place in it. It combines with
+  // origin_sha256, scope and after, and the lease lock still means two leases
+  // never hand out the same unheld row, whichever order each asked for.
   // REFUSED: a value LeaseOrder does not declare -> INVALID_ARGUMENT, nothing
   // leased. A server built before 0.12.0 IGNORES this field and leases oldest
   // first, so a caller that asked for NEWEST_FIRST checks that every returned
@@ -263,12 +314,40 @@ message LeasePendingImagesRequest {
   LeaseOrder order = 5;
 
   // WHICH ROWS (0.12.0): every pending depiction (UNSPECIFIED, ALL) or only the
-  // SHOWABLE ones (LeaseScope). It combines with origin_sha256 and order.
+  // SHOWABLE ones (LeaseScope). It combines with origin_sha256, order and
+  // after, and it alone decides whether the rows carry origin_url: only a
+  // SHOWABLE lease sends it.
   // REFUSED: a value LeaseScope does not declare -> INVALID_ARGUMENT, nothing
   // leased. A server built before 0.12.0 IGNORES this field and leases from
   // the whole queue; a caller that asked for SHOWABLE detects such a server as
   // it does for order, and stops.
   LeaseScope scope = 6;
+
+  // CONTINUE AFTER A PLACE (0.12.0): a keyset cursor over the order this lease
+  // asks for. ABSENT: the lease starts at the end the order names, as every
+  // earlier lease did. PRESENT: it hands out only the rows STRICTLY AFTER the
+  // cursor in that order, for NEWEST_FIRST the rows whose (first_seen_at,
+  // product_image_id) is LESS than the cursor's, for UNSPECIFIED and
+  // OLDEST_FIRST the rows whose pair is GREATER. Equal is not after, so the
+  // row the cursor was copied from is not handed out again. It combines with
+  // origin_sha256, order and scope, and still skips rows another caller holds;
+  // a cursor past the last pending row gets an EMPTY answer, never an error.
+  //
+  // WHY. Without a cursor every lease starts at the same end, so a caller
+  // whose newest pending rows are rows it will never report (held back, too
+  // large, a codec it does not read) is handed them again on every call and
+  // never reaches older ones. With a cursor it passes the last row it was
+  // handed and walks on: its progress no longer rides on its holds, so it can
+  // ask for a short one (lease_seconds). A walk does not come back for rows
+  // that were held when it passed them; the next walk from the end does.
+  //
+  // REFUSED: a cursor that breaks LeaseCursor's rules, an empty LeaseCursor
+  // included -> INVALID_ARGUMENT, nothing leased. A server built before 0.12.0
+  // IGNORES this field and starts at the end again; such a server never sends
+  // first_seen_at, so a caller that sent a cursor detects it as it does for
+  // order, and stops. A caller can also check the answer itself: every row it
+  // is handed comes after its cursor.
+  LeaseCursor after = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,9 +355,10 @@ message LeasePendingImagesRequest {
 // ---------------------------------------------------------------------------
 message LeasePendingImagesResponse {
   // Oldest first, so a backlog drains in the order it arrived rather than
-  // starving its own tail, unless the request asked for NEWEST_FIRST (0.12.0).
-  // EMPTY means there is no pending work — a normal, expected answer that a
-  // scheduled worker will get most of the time.
+  // starving its own tail, unless the request asked for NEWEST_FIRST, and only
+  // the rows after the request's cursor when it sent one (0.12.0). EMPTY means
+  // there is no pending work — a normal, expected answer that a scheduled
+  // worker will get most of the time.
   repeated PendingImage images = 1;
 
   // When another caller may be handed these same rows, as a RAW STRING TOKEN
