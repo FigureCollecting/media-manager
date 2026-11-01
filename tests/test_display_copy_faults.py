@@ -150,7 +150,9 @@ def test_a_depiction_queued_mid_seed_goes_back_to_pending(
     assert code == dc.EXIT_DONE
     late = db.get(DisplayDepiction, _pid(92))
     links = {(g.figure_id, g.source_url) for g in db.execute(select(FigureGallery)).scalars()}
-    assert late.linked_at is None or (_pid(192), UNLISTED.format(n=92)) in links
+    # sent back to pending, claimed again in the same run and linked
+    assert late.linked_at is not None and (_pid(192), UNLISTED.format(n=92)) in links
+    assert db.get(DisplayOriginal, sha).state == "seeded"
 
 
 def test_a_request_for_every_unit_goes_before_new_small_ones() -> None:

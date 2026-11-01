@@ -332,12 +332,15 @@ def test_a_new_depiction_of_a_seeded_original_puts_it_back_to_pending(
     _sync(db_session, url)
     row = db_session.get(DisplayOriginal, origin)
     row.state = "seeded"
+    for d in db_session.execute(select(DisplayDepiction)).scalars():
+        d.linked_at = T0  # as the seed left it: every depiction linked
     db_session.commit()
     fake.held.clear()
     for d in fake.depictions.values():
         d["state"] = "derived"
     fake.depict_full(origin, seen=T0)
-    _sync(db_session, url, report_limit=0)
+    _code, lines = _sync(db_session, url, report_limit=0)
+    assert _event(lines, "reported")["relink"] == 0  # the enqueue sent it back, not the report
     assert db_session.get(DisplayOriginal, origin).state == "pending"
     assert db_session.scalar(select(func.count()).select_from(DisplayDepiction)) == 2
 
@@ -635,6 +638,9 @@ def test_publicobject_rows_are_read_never_written(
         ({"lease_seconds": 0}, "lease_seconds"),
         ({"lease_seconds": 121}, "lease_seconds"),
         ({"max_new": -1}, "max_new"),
+        # one round goes to the newest end: a walk under way never moves
+        ({"max_rounds": 1}, "max_rounds"),
+        ({"max_rounds": 0}, "max_rounds"),
         ({"purge_days": 0}, "purge_days"),
     ],
 )
@@ -766,7 +772,7 @@ def test_enqueue_stops_at_its_rounds_and_its_budget(
     fake, url = spine
     for n in range(3):
         fake.depict_full(sha(f"r{n}"), seen=T0 - dt.timedelta(minutes=n))
-    code, lines = _sync(db_session, url, lease_items=1, max_rounds=1)
+    code, lines = _sync(db_session, url, lease_items=1, max_rounds=2)
     assert _event(lines, "enqueued")["why"] == "rounds"
     out: list[dict[str, Any]] = []
     ticks = iter([0.0, 10_000.0])
@@ -784,7 +790,13 @@ def test_enqueue_stops_at_its_rounds_and_its_budget(
 
 
 @pytest.mark.parametrize(
-    ("error", "code"), [("operational", feed.EXIT_STOPPED), ("programming", feed.EXIT_CONFIG)]
+    ("error", "code", "why"),
+    [
+        ("operational", feed.EXIT_STOPPED, "database: OperationalError"),
+        ("programming", feed.EXIT_CONFIG, "database: ProgrammingError"),
+        # a row another writer committed first: two syncs at once
+        ("integrity", feed.EXIT_STOPPED, "database: IntegrityError: another sync"),
+    ],
 )
 def test_a_database_fault_stops_the_sync_with_its_class(
     db_session: Session,
@@ -792,17 +804,22 @@ def test_a_database_fault_stops_the_sync_with_its_class(
     monkeypatch: pytest.MonkeyPatch,
     error: str,
     code: int,
+    why: str,
 ) -> None:
-    from sqlalchemy.exc import OperationalError, ProgrammingError
+    from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
     fake, url = spine
     fake.depict_full(sha("a"), seen=T0)
+    cls = {
+        "operational": OperationalError,
+        "programming": ProgrammingError,
+        "integrity": IntegrityError,
+    }[error]
 
     def broken(*a: Any, **k: Any) -> Any:
-        cls = OperationalError if error == "operational" else ProgrammingError
         raise cls("SELECT", {}, Exception("the database said no"))
 
     monkeypatch.setattr(feed, "report", broken)
     got, lines = _sync(db_session, url)
     assert got == code
-    assert _event(lines, "stopped")["why"].startswith("database:")
+    assert _event(lines, "stopped")["why"].startswith(why)

@@ -1,7 +1,8 @@
 """SHOW1 on a real postgres:16 (the migration test's
 disposable container, removed by name at module teardown): the claim's
 FOR UPDATE SKIP LOCKED (a mutant without it survives every SQLite test),
-and the seed race between two seeders inside real transactions."""
+the seed race between two seeders inside real transactions, and a
+depiction the feed commits inside the seed's settle."""
 
 from __future__ import annotations
 
@@ -15,14 +16,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from app.models import DisplayOriginal, PublicObject
+from app.models import DisplayDepiction, DisplayOriginal, PublicObject
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
+from app.spine import display_feed as feed
 from app.workers import display_copy as dc
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import seed_clean_image, seed_with_retry
 from PIL import Image
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -152,3 +154,95 @@ def test_pg2_two_seeders_racing_one_picture(factory: Any, tmp_path: Path, late: 
         objects = db.scalar(select(func.count()).select_from(PublicObject))
     assert (images, objects) == (1, 1)
     assert outcomes == {"lane": "ok", "batch": "IntegrityError" if late == "batch" else "ok"}
+
+
+class _NoSpine:
+    """The feed's client where no report may be sent."""
+
+    def report_derivative(self, message: Any) -> Any:
+        raise AssertionError(f"nothing is reported here: {message}")
+
+
+def test_pg3_a_depiction_committed_inside_the_settle_goes_back_to_the_seeder(
+    factory: Any,
+) -> None:
+    """The settle reads the original's unlinked depictions, then commits
+    ``seeded``. The feed (its own transaction; it read the original
+    ``pending``, so left its state) commits D2 between the two: the original
+    ends seeded with D2 never linked, and no claim takes a seeded original.
+    The feed's next REPORT sends it back to the seeder."""
+    origin = "c" * 64
+
+    def depiction(pid: str, product: str) -> DisplayDepiction:
+        return DisplayDepiction(
+            product_image_id=pid,
+            origin_sha256=origin,
+            product_id=product,
+            origin_url=f"https://img.amiami.example/{pid}.jpg",
+            source_site="amiami",
+            first_seen_at=T0,
+        )
+
+    d1, d2 = "00000000-0000-0000-0000-0000000000d1", "00000000-0000-0000-0000-0000000000d2"
+    with factory() as db:
+        db.add(
+            DisplayOriginal(
+                origin_sha256=origin,
+                storage_key="k",
+                codec="identity",
+                first_seen_at=T0,
+                state="pending",
+                attempts=0,
+            )
+        )
+        db.flush()
+        db.add(depiction(d1, "00000000-0000-0000-0000-000000000001"))
+        db.commit()
+    seeder = factory()
+    original = dc.claim_next(seeder, owner="pod-a", claim_seconds=900, now=T0)
+    assert original is not None
+    fired: list[str] = []
+
+    def feed_commits_d2(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        if (
+            fired
+            or "FROM display_depictions" not in statement
+            or "linked_at IS NULL" not in statement
+        ):
+            return
+        fired.append(statement)  # right after the settle's read: the feed queues D2
+        with factory() as feed_db:
+            feed_db.add(depiction(d2, "00000000-0000-0000-0000-000000000002"))
+            feed_db.commit()
+
+    engine = seeder.get_bind()
+    event.listen(engine, "after_cursor_execute", feed_commits_d2)
+    try:
+        dc._settle(
+            seeder,
+            original,
+            dc.SeedResult("seeded", look={}, linked=(d1,)),
+            now=T0 + dt.timedelta(seconds=5),
+            max_attempts=3,
+            hold_until=T0 + dt.timedelta(hours=1),
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", feed_commits_d2)
+        seeder.close()
+    assert fired
+    with factory() as db:
+        assert db.get(DisplayOriginal, origin).state == "seeded"  # the race happened
+        assert db.get(DisplayDepiction, d2).linked_at is None
+        counts = feed.report(
+            db,
+            _NoSpine(),  # type: ignore[arg-type]
+            feed.FeedConfig(),
+            lambda e: None,
+            T0 + dt.timedelta(minutes=30),
+        )
+        assert db.get(DisplayOriginal, origin).state == "pending"
+        assert counts["relink"] == 1
+        claimed = dc.claim_next(
+            db, owner="pod-b", claim_seconds=900, now=T0 + dt.timedelta(minutes=31)
+        )
+        assert claimed is not None and claimed.origin_sha256 == origin

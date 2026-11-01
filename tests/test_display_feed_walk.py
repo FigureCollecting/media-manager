@@ -139,12 +139,11 @@ def test_a_run_walks_on_after_the_last_row_it_was_handed_verbatim_ties_included(
     db_session: Session, spine: tuple[QueueSpine, str]
 ) -> None:
     """Rows that share a first_seen_at are ordered by product_image_id (by
-    value: either case); the cursor carries both halves back as sent."""
+    value: either case, mixed here, so ``B`` sorts between ``a`` and ``c``);
+    the cursor carries both halves back as sent."""
     fake, url = spine
-    tied = [
-        fake.depict_full(sha(f"t{n}"), seen=T0, pid=str(uuid.UUID(int=n)).upper())
-        for n in (0xA, 0xB, 0xC)
-    ]
+    spelt = [str(uuid.UUID(int=0xA)), str(uuid.UUID(int=0xB)).upper(), str(uuid.UUID(int=0xC))]
+    tied = [fake.depict_full(sha(f"t{n}"), seen=T0, pid=pid) for n, pid in enumerate(spelt)]
     older = fake.depict_full(sha("older"), seen=T0 - dt.timedelta(hours=1))
     code, lines = _sync(db_session, url, lease_items=1)
     assert code == feed.EXIT_DONE
@@ -167,7 +166,7 @@ def test_a_later_run_looks_at_the_newest_end_then_goes_on_from_the_walks_place(
 ) -> None:
     fake, url = spine
     w = [fake.depict_full(sha(f"w{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(4)]
-    _sync(db_session, url, lease_items=2, max_rounds=1)
+    _sync(db_session, url, lease_items=2, max_new=2)
     assert _walk(db_session) == _place(fake, w[1])
     fake.lapse(3600)
     first = len(fake.sent("LeasePendingImages"))
@@ -186,7 +185,7 @@ def test_a_head_pass_that_reaches_the_walks_place_carries_the_walk_on(
     the walk's place it is the walk, and its place moves with it."""
     fake, url = spine
     w = [fake.depict_full(sha(f"w{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(4)]
-    _sync(db_session, url, lease_items=2, max_rounds=1)  # the walk at w1
+    _sync(db_session, url, lease_items=2, max_new=2)  # the walk at w1
     fresh = fake.depict_full(sha("fresh"), seen=T0 + dt.timedelta(minutes=5))
     fake.lapse(3600)
     first = len(fake.sent("LeasePendingImages"))
@@ -198,14 +197,106 @@ def test_a_head_pass_that_reaches_the_walks_place_carries_the_walk_on(
     assert _event(lines, "enqueued")["walk_after"] == _place(fake, w[2])[0]
 
 
+def test_a_head_pass_with_nothing_new_that_reaches_the_walks_place_carries_it_on(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """Rows past the walk's place may be queued already (here the oldest-first
+    walk queued them). An answer with nothing new that reaches the walk's
+    place carries the walk on from its last row, never back to the place it
+    passed."""
+    fake, url = spine
+    r = [fake.depict_full(sha(f"r{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(4)]
+    _sync(db_session, url, lease_items=2, max_new=2)  # the newest walk at r1
+    fake.lapse(3600)
+    _sync(db_session, url, order="oldest", lease_items=2, max_new=2)  # r3 and r2 queued
+    fake.lapse(3600)
+    first = len(fake.sent("LeasePendingImages"))
+    code, lines = _sync(db_session, url, lease_items=3)
+    assert code == feed.EXIT_DONE and _event(lines, "enqueued")["new_depictions"] == 0
+    # r0-r2, all queued already and past r1: on after r2, then r3, then the end
+    assert _afters(fake)[first:] == [None, _place(fake, r[2]), _place(fake, r[3])]
+    assert _walk(db_session) is None
+
+
+def test_a_run_cut_off_among_new_rows_leaves_the_walk_there_not_past_the_rest(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """A walk is under way in the backlog when a burst of new captures larger
+    than a run's window lands (2 rounds x 3 rows). The head pass moves the
+    walk with it, so the next run goes on through the rest of the burst, not
+    to the backlog walk's place (the rest would wait for that walk to wrap).
+    The price: past the burst, the walk goes on through backlog rows queued
+    already, a round per lease of them, never a row lost."""
+    fake, url = spine
+    backlog = [
+        fake.depict_full(sha(f"b{i}"), seen=T0 - dt.timedelta(days=3, minutes=i)) for i in range(30)
+    ]
+    cfg = {"lease_items": 3, "max_rounds": 2}
+    _sync(db_session, url, **cfg)
+    assert _walk(db_session) == _place(fake, backlog[5])
+    burst = [
+        fake.depict_full(sha(f"n{i}"), seen=T0 + dt.timedelta(minutes=30, seconds=-i))
+        for i in range(12)
+    ]
+    per_run = []
+    for _run in range(3):
+        fake.lapse(1800)  # the next half-hourly run: every hold of the last one has lapsed
+        _sync(db_session, url, **cfg)
+        per_run.append(_queued(db_session, burst))
+    assert per_run == [6, 9, 12]
+    assert _queued(db_session, backlog) == 6  # no backlog row went before a newer capture
+    assert _walk(db_session) == _place(fake, burst[11])
+    fake.lapse(1800)
+    code, lines = _sync(db_session, url, **cfg)
+    e = _event(lines, "enqueued")
+    assert (code, e["new_depictions"], e["already"]) == (0, 0, 6)  # n0-n2, then b0-b2 again
+    assert _walk(db_session) == _place(fake, backlog[2])
+
+
+def test_a_head_pass_that_meets_ground_covered_puts_the_walk_back_before_it_goes_on(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The head pass queues two new captures (the walk moves with it), then
+    meets rows queued already: everything before the walk's place is covered,
+    so the walk goes back there at once. A run that then stops (the spine
+    down) keeps the deep place, never the head pass's."""
+    fake, url = spine
+    w = [fake.depict_full(sha(f"w{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(8)]
+    _sync(db_session, url, lease_items=2, max_rounds=2)
+    assert _walk(db_session) == _place(fake, w[3])
+    fresh = [
+        fake.depict_full(sha(f"f{i}"), seen=T0 + dt.timedelta(minutes=5 - i)) for i in range(2)
+    ]
+    fake.lapse(3600)
+    fake.fail(
+        "LeasePendingImages", None, None, grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.UNAVAILABLE
+    )
+    first = len(fake.sent("LeasePendingImages"))
+    code, _lines = _sync(db_session, url, lease_items=2)
+    assert code == feed.EXIT_STOPPED
+    # fresh (new: on), w0 and w1 (queued already: back to the walk's place), then down
+    assert _afters(fake)[first : first + 3] == [None, _place(fake, fresh[1]), _place(fake, w[3])]
+    assert _queued(db_session, fresh) == 2
+    assert _walk(db_session) == _place(fake, w[3])
+
+
 def test_a_run_that_neither_queues_nor_moves_its_walk_is_stalled_and_ends_1(
     db_session: Session, spine: tuple[QueueSpine, str]
 ) -> None:
     fake, url = spine
     k = [fake.depict_full(sha(f"k{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(4)]
-    _sync(db_session, url, lease_items=2, max_rounds=1)  # the walk at k1
+    _sync(db_session, url, lease_items=2, max_new=2)  # the walk at k1
     fake.lapse(3600)
-    code, lines = _sync(db_session, url, lease_items=2, max_rounds=1)
+    lines: list[dict[str, Any]] = []
+    ticks = iter([0.0, 0.0, 10_000.0])  # its budget spent after one round
+    code = feed.run_sync(
+        db_session,
+        lambda: _client(url),
+        feed.FeedConfig(lease_items=2),
+        emit=lines.append,
+        now=lambda: T0,
+        monotonic=lambda: next(ticks),
+    )
     # its one round went to the newest end, every row of it queued already
     assert code == feed.EXIT_REFUSED
     assert _event(lines, "stalled") == {
@@ -230,7 +321,7 @@ def test_a_walk_that_moves_without_queueing_is_progress_not_a_stall(
     _sync(db_session, url, lease_items=2)  # queues all four; the walk ends
     _stick(db_session)
     fake.lapse(3600)
-    code, lines = _sync(db_session, url, lease_items=2, max_rounds=1)  # a new walk: all known
+    code, lines = _sync(db_session, url, lease_items=2, max_rounds=2)  # a new walk: all known
     assert code == feed.EXIT_DONE
     assert _event(lines, "enqueued")["new_depictions"] == 0
     assert not [e for e in lines if e["event"] == "stalled"]
@@ -240,7 +331,7 @@ def test_an_empty_queue_ends_the_walk(db_session: Session, spine: tuple[QueueSpi
     fake, url = spine
     for i in range(3):
         fake.depict_full(sha(f"e{i}"), seen=T0 - dt.timedelta(minutes=i))
-    _sync(db_session, url, lease_items=1, max_rounds=1)
+    _sync(db_session, url, lease_items=1, max_new=1)
     assert _walk(db_session) is not None
     for d in fake.depictions.values():
         d["state"] = "derived"
@@ -268,13 +359,50 @@ def test_each_order_keeps_its_own_walk_and_oldest_walks_upward(
 ) -> None:
     fake, url = spine
     r = [fake.depict_full(sha(f"r{i}"), seen=T0 - dt.timedelta(minutes=i)) for i in range(3)]
-    _sync(db_session, url, lease_items=1, max_rounds=1)
+    _sync(db_session, url, lease_items=1, max_new=1)
     fake.lapse(3600)
     first = len(fake.sent("LeasePendingImages"))
     _sync(db_session, url, order="oldest", lease_items=1, max_rounds=2)
     assert _afters(fake)[first:] == [None, _place(fake, r[2])]
     assert _walk(db_session, "newest") == _place(fake, r[0])
     assert _walk(db_session, "oldest") == _place(fake, r[1])
+
+
+def test_two_syncs_at_once_stop_the_later_one_cleanly_and_keep_the_others_walk(
+    db_session: Session, spine: tuple[QueueSpine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CronJob's concurrencyPolicy Forbid is the only guard; a Job made
+    by hand from it bypasses it. Both read "no walk"; the other commits its
+    walk first, so this one's commit of a new walk breaks the key. It stops,
+    resumable (exit 3), naming the clash: never a traceback, never exit 1."""
+    from app.models import DisplayFeedWalk
+
+    fake, url = spine
+    for i in range(4):
+        fake.depict_full(sha(f"q{i}"), seen=T0 - dt.timedelta(minutes=i))
+    theirs = ("2026-10-31T11:00:00.000000Z", str(uuid.UUID(int=1)))
+    db_session.add(
+        DisplayFeedWalk(
+            lease_order="newest",
+            after_first_seen_at=theirs[0],
+            after_product_image_id=theirs[1],
+            started_at=T0,
+            updated_at=T0,
+        )
+    )
+    db_session.commit()
+    real_get = db_session.get
+
+    def read_before_their_commit(entity: Any, key: Any, **kw: Any) -> Any:
+        return None if entity is DisplayFeedWalk else real_get(entity, key, **kw)
+
+    monkeypatch.setattr(db_session, "get", read_before_their_commit)
+    code, lines = _sync(db_session, url, lease_items=2)
+    monkeypatch.undo()
+    assert code == feed.EXIT_STOPPED
+    assert "another sync" in _event(lines, "stopped")["why"]
+    assert _walk(db_session) == theirs
+    assert db_session.scalar(select(func.count()).select_from(DisplayDepiction)) == 0
 
 
 # --------------------------------------------------------------------------
@@ -309,6 +437,8 @@ def test_a_spine_that_ignores_the_cursor_is_a_deployment_fault(
         "2026-10-31T24:00:00.000000Z",  # hour 24 (PostgreSQL reads it)
         "2026-10-31T12:00:60.000000Z",  # second 60 (PostgreSQL reads it)
         "2026-02-30T12:00:00.000000Z",  # no such day
+        "\uff12\uff10\uff12\uff16-10-31T12:00:00.000000Z",  # fullwidth digits (a str \d matches them)
+        "2026-10-31T12:0\u0660:00.000000Z",  # an Arabic-Indic digit (strptime's %M reads it)
     ],
 )
 def test_a_first_seen_at_a_cursor_could_not_carry_back_is_a_deployment_fault(

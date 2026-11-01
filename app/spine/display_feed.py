@@ -20,9 +20,16 @@ a FAILED report with its reason -- unless the originals waiting for one and
 those it sent one for in the last day are more than ``max_failed_reports``,
 when none is sent and the run ends 1: a FAILED report is permanent on the
 spine in practice, so a flood of them is looked at by a person first, across
-seeder runs too. ``held`` and ``stuck`` originals are reported only once
-another seeder (the GPU batch, an operator's force) has put a copy of them
-in the media DB: DERIVED with the copy the replay would report.
+seeder runs too. A seeded original with a depiction no seed linked (the feed
+queued it while the seed settled) goes back to the seeder, ``relink``. A
+``stuck`` original (left to the GPU batch) is reported once the media DB
+holds an image of its bytes -- the batch's seed of it, or any earlier seed
+of the same bytes for another product: DERIVED with the copy the replay
+would report, as the replay itself does. A ``held`` one is never reported
+here: the media DB may hold its bytes from the start, so a copy there is no
+operator's decision; it waits for ``display_copy requeue --state held
+--force`` (the mm-report replay is not the lane and does not wait:
+app.workers.display_copy, HELD).
 A report needs no live lease (fc-aggregation derivative-writer.ts: "a
 report is never refused for a stale lease") and is idempotent.
 
@@ -42,9 +49,15 @@ them out again on every round and never reach older ones (RT4). The feed
 walks the queue with the lease's cursor instead, and keeps its place per
 order in ``display_feed_walks``: a run looks at the newest end first (new
 captures land within the hour whatever the backlog) and goes on through new
-rows; at the first answer with nothing new to queue it goes on from where
-the walk stopped (or carries the walk on, once it reaches that place). Each
-round's place is committed with the rows it queued. A walk that reaches the
+rows, the walk's place moving with it, so a run cut off among them (its
+rounds, budget, high water or max_new spent) goes on from there next time,
+never past the rest of them. At the first answer with nothing new to queue
+it goes on from where the walk stood when the run began, the place put back
+there (or carries the walk on, once it reaches that place). The price of a
+run cut off among new rows: past them, the next goes on through rows the
+walk had covered already, a round per ``lease_items`` of those still
+pending, until it is past the deeper place. Each round's place is committed
+with the rows it queued. A walk that reaches the
 end of the queue (an empty answer) ends, and the next run starts a new one at
 the newest end, which comes back for rows that were held when it passed
 them. A run that queued nothing and left the walk where it found it, its
@@ -69,8 +82,8 @@ failed originals left with none.
 Exit status: 0 done; 1 done, but a report was refused, FAILED reports were
 held or the enqueue stalled; 2 a configuration fault (the mesh refused the
 identity, the spine refused the lease or its cursor, the database refused the
-role); 3 stopped, resumable (the spine or the database stayed down, or a
-deployment fault).
+role); 3 stopped, resumable (the spine or the database stayed down, a
+deployment fault, or another sync writing the same rows at the same time).
 """
 
 from __future__ import annotations
@@ -86,8 +99,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import CursorResult, and_, delete, exists, func, or_, select
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy import CursorResult, and_, delete, exists, func, or_, select, update
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from ..models import DisplayDepiction, DisplayFeedWalk, DisplayOriginal, PublicObject
@@ -112,8 +125,10 @@ URL_MAX = 2048
 SITE_MAX = 50
 CLASS_MAX = 32
 #: PendingImage.first_seen_at as a 0.12.0 server spells it, and the only
-#: spelling a LeaseCursor may carry back: UTC, always six fractional digits.
-INSTANT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z")
+#: spelling a LeaseCursor may carry back: UTC, always six fractional digits,
+#: ASCII digits only (a str pattern's \d matches every Unicode digit, and
+#: strptime reads some of them).
+INSTANT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", re.ASCII)
 INSTANT_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 #: The longest hold the feed asks for (see THE HOLD).
 MAX_LEASE_SECONDS = 120
@@ -147,7 +162,12 @@ class FeedConfig:
             raise ValueError(
                 f"lease_seconds must be 1-{MAX_LEASE_SECONDS}: a hold ends only by lapsing"
             )
-        for name in ("max_rounds", "max_new", "high_water", "report_limit", "max_failed_reports"):
+        if self.max_rounds < 2:
+            raise ValueError(
+                "max_rounds must be at least 2: a run's first round goes to the newest end, "
+                "so with one a walk under way never moves"
+            )
+        for name in ("max_new", "high_water", "report_limit", "max_failed_reports"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative")
         if self.purge_days < 1 or not self.budget_seconds > 0:
@@ -298,17 +318,51 @@ def report(
         counts[outcome] += 1
         counts["warnings"] += len(warnings)
         db.commit()
+    counts["relink"] = _relink(db, now)
     _report_left_to_the_batch(db, client, config, counts, now)
     emit(
         {
             "event": "reported",
             **{
                 k: counts[k]
-                for k in ("derived", "failed", "refused", "no_copy", "reseed", "batch_copy")
+                for k in (
+                    "derived",
+                    "failed",
+                    "refused",
+                    "no_copy",
+                    "reseed",
+                    "relink",
+                    "batch_copy",
+                )
             },
         }
     )
     return counts
+
+
+def _relink(db: Session, now: dt.datetime) -> int:
+    """Seeded originals with a depiction no seed linked, sent back to the
+    seeder: the feed queued it between the settle's read of the unlinked
+    depictions and its commit of ``seeded`` (it read the original pending,
+    so left its state). No claim takes a seeded original and nothing here
+    reports an unlinked depiction, so it would wait forever; the seeder
+    links it (and only it) and the next REPORT sends it."""
+    sent_back: CursorResult[Any] = db.execute(  # type: ignore[assignment] # an UPDATE's result
+        update(DisplayOriginal)
+        .where(
+            DisplayOriginal.state == "seeded",
+            select(DisplayDepiction.product_image_id)
+            .where(
+                DisplayDepiction.origin_sha256 == DisplayOriginal.origin_sha256,
+                DisplayDepiction.linked_at.is_(None),
+            )
+            .exists(),
+        )
+        .values(state="pending", updated_at=now),
+        execution_options={"synchronize_session": "fetch"},
+    )
+    db.commit()
+    return int(sent_back.rowcount or 0)
 
 
 def _report_left_to_the_batch(
@@ -318,20 +372,23 @@ def _report_left_to_the_batch(
     counts: Counter[str],
     now: dt.datetime,
 ) -> None:
-    """Depictions of ``held`` or ``stuck`` originals that another seeder (the
-    GPU batch, an operator's force) has since put in the media DB: DERIVED
-    with the copy the replay would report (reported_copy, its record as
+    """Depictions of ``stuck`` originals (left to the GPU batch) whose bytes
+    the media DB now holds an image of -- the batch's seed of them, or any
+    earlier seed of the same bytes for another product: DERIVED with the
+    copy the replay would report (reported_copy, its record as
     replay._load_chunk builds it). The replay reports them too, once the
     feed's short hold on them lapses; both reports are idempotent, and this
     one also settles the lane's own row (purged after ``purge_days``), so a
     row the lane leaves to the batch never waits on the replay's schedule.
-    Only originals the media DB holds an image of are looked at."""
+    Never ``held`` ones: the media DB may hold their bytes from the start
+    (another product's capture), so a copy there is no operator's decision;
+    they wait for ``display_copy requeue --state held --force``."""
     rows = db.execute(
         select(DisplayDepiction, DisplayOriginal)
         .join(DisplayOriginal, DisplayOriginal.origin_sha256 == DisplayDepiction.origin_sha256)
         .where(
             DisplayDepiction.reported_at.is_(None),
-            DisplayOriginal.state.in_(("held", "stuck")),
+            DisplayOriginal.state == "stuck",
             # a column the role may read: EXISTS (SELECT * ...) needs them all
             select(ImageModel.id)
             .where(ImageModel.sha256 == DisplayOriginal.origin_sha256)
@@ -617,13 +674,20 @@ def enqueue(
         last = Place.of(images[-1])
         if not walking and found is not None and not found.comes_after(last, config.order):
             walking = True  # this pass has reached the walk's place: it carries the walk on
-        if walking:
+        if walking or new:
+            # the walk, or new rows at this end: on through them, the walk's
+            # place with them, so a run cut off among new rows (its rounds,
+            # budget, high water or max_new spent) goes on from here, never
+            # past the rest of them to a deeper place
             walk = _move_walk(db, walk, config.order, last, now)
             after = last
-        elif new:
-            after = last  # new rows at this end: go on through them
         else:
-            walking, after = True, found  # ground already covered: on from the walk's place
+            # ground already covered: on from the walk's place, and the walk
+            # back there now (all before it is covered), so a run that stops
+            # past here keeps the deep place
+            assert found is not None  # a run with no walk is walking from its first round
+            walk = _move_walk(db, walk, config.order, found, now)
+            walking, after = True, found
         db.commit()
         pending = _pending(db)
     place = _walk_place(walk)
@@ -721,6 +785,16 @@ def run_sync(
             raise _Stop(
                 EXIT_STOPPED if isinstance(exc, OperationalError) else EXIT_CONFIG,
                 f"database: {type(exc).__name__}",
+            ) from exc
+        except IntegrityError as exc:
+            # a row another writer committed first (the walk, an original, a
+            # depiction): two syncs at once, the CronJob's Forbid bypassed by a
+            # Job made by hand. This round is rolled back; the next run goes on.
+            db.rollback()
+            said = str(exc.orig).split("\n", 1)[0][:120]  # the constraint, never the row
+            raise _Stop(
+                EXIT_STOPPED,
+                f"database: IntegrityError: another sync wrote the row first (two at once?): {said}",
             ) from exc
     except _Stop as stop:
         emit({"event": "stopped", "why": stop.why})

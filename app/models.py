@@ -585,8 +585,9 @@ class DisplayFeedWalk(Base):
     The place is the last row a lease handed the walk, its first_seen_at and
     product_image_id kept VERBATIM as the spine sent them (the contract
     refuses any other spelling of the instant). A run looks at the newest end
-    first, then goes on from here (app.spine.display_feed), so rows it will
-    never report no longer stand between it and older ones. The row goes
+    first, the place moving with it through new rows, then goes on from where
+    the place stood when the run began (app.spine.display_feed), so rows it
+    will never report no longer stand between it and older ones. The row goes
     when a walk reaches the end of the queue: the next run starts a new walk
     at the order's end. Deleting it by hand does the same."""
 

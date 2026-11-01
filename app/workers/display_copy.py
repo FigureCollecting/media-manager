@@ -64,8 +64,12 @@ of a picture whose clean copy serves a published mask into a refusal
 Mask eligibility is POOLED over every capture of a picture
 (app.publication), so seeding it would take that mask offline at the origin
 while the spine still advertises it. Such an original is ``held``
-(``would_withdraw_mask:<class>``), never reported, until an operator
-decides (``display_copy requeue --state held --force``).
+(``would_withdraw_mask:<class>``), never reported by the lane, until an
+operator decides (``display_copy requeue --state held --force``). The
+mm-report replay is not the lane: it reports every pending depiction of an
+origin the media DB holds a copy of, so a held capture of bytes the media DB
+holds already (another product's capture of them) is reported DERIVED by
+the replay's next run, with no gallery link of its own.
 
 Exit status: 0 done (the queue empty or the budget spent); 1 the breaker
 (own faults or errors past their limits); 2 a configuration fault; 3 stopped

@@ -10,7 +10,15 @@ import io
 from typing import Any
 
 import pytest
-from app.models import DisplayOriginal, FigureGallery, ImageMask, MaskStoreRevocation, PublicObject
+from app.models import (
+    DisplayOriginal,
+    FigureGallery,
+    ImageMask,
+    MaskStoreRevocation,
+    PublicObject,
+    PublicObjectImage,
+)
+from app.models import Image as ImageModel
 from app.publication import mask_refusal, servable
 from app.workers import display_copy as dc
 from app.workers.mask_policy import ImageOrigin
@@ -134,3 +142,55 @@ def test_a_held_capture_leaves_the_mask_servable(lane: dict[str, Any]) -> None:
         "refusal": None,
         "mask_servable": True,
     }
+
+
+def test_a_capture_of_bytes_the_media_db_holds_pools_their_link_with_the_new_one(
+    lane: dict[str, Any],
+) -> None:
+    """The SAME bytes, seeded for another product with an MFC item-main
+    origin (maskable) and masked; this product's depiction is an MFC
+    collector photo. What the seed adds is the image's current origin AND
+    the new one: one not maskable is enough to hold (all, never any)."""
+    clean, mask_sha = _published(
+        lane, 63, url=MFC_ITEM.format(n=63), source="mfc", figure=_pid(9801)
+    )
+    sha, key = lane["raw"].put(_photo(63))
+    _queue(lane["db"], sha, key, depictions=[(_pid(63), _pid(9802), MFC_USER.format(n=63), "mfc")])
+    assert _seed_all(lane)[0] == dc.EXIT_DONE
+    v = _verdict(lane, sha, clean, mask_sha)
+    assert (v["state"], v["reason"], v["mask_servable"]) == (
+        "held",
+        "would_withdraw_mask:user_photo",
+        True,
+    )
+
+
+def test_a_masked_copy_found_only_through_the_copy_image_links_is_judged(
+    lane: dict[str, Any],
+) -> None:
+    """The image is already behind a masked copy of ANOTHER picture (a
+    recorded copy-image link: the picture joined), which the picture digest
+    of its own bytes does not find. The seed puts it behind every copy that
+    link reaches (_join_picture), so the guard judges that mask too."""
+    db = lane["db"]
+    masked, mask_sha = _published(
+        lane, 64, url=MFC_ITEM.format(n=64), source="mfc", figure=_pid(9901)
+    )
+    data = _photo(65)
+    seed_clean_image(
+        db,
+        lane["media"],
+        data,
+        origins=[ImageOrigin(url=MFC_ITEM.format(n=65), source="mfc")],
+        figure_id=_pid(9902),
+    )
+    image = db.execute(
+        select(ImageModel).where(ImageModel.sha256 == dc.hashlib.sha256(data).hexdigest())
+    ).scalar_one()
+    db.add(PublicObjectImage(sha256=masked, image_id=image.id))  # the picture joined
+    db.commit()
+    sha, key = lane["raw"].put(data)
+    _queue(db, sha, key, depictions=[(_pid(65), _pid(9903), MFC_USER.format(n=65), "mfc")])
+    assert _seed_all(lane)[0] == dc.EXIT_DONE
+    v = _verdict(lane, sha, masked, mask_sha)
+    assert (v["state"], v["mask_servable"]) == ("held", True)

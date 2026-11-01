@@ -1,7 +1,8 @@
 # ruff: noqa: F811  (the spine fixture is imported from test_display_feed)
 """SHOW1 feed faults: the batch's copy of a row the lane left to it is
-reported by the feed; the FAILED cap counts a day. (A window full of
-never-reportable rows: tests/test_display_feed_walk.py.)"""
+reported by the feed, a held one's never; the FAILED cap counts a day; a
+depiction the seed's settle missed goes back to the seeder. (A window full
+of never-reportable rows: tests/test_display_feed_walk.py.)"""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from typing import Any
 
 import grpc
 import pytest
-from app.models import DisplayDepiction, DisplayOriginal
+from app.models import DisplayDepiction, DisplayOriginal, ImageMask
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
 from app.spine import display_feed as feed
@@ -27,8 +28,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from spine_fakes import sha
-from test_display_copy import _photo
+from test_display_copy import (
+    MFC_ITEM,
+    STORE,
+    _mask,
+    _photo,
+    _pid,
+    _queue,
+    _seed_all,
+    lane,  # noqa: F401 -- fixture
+)
 from test_display_feed import T0, QueueSpine, _event, _sync, spine  # noqa: F401
+
+MFC_USER = "https://static.myfigurecollection.net/upload/pictures/2026/10/31/{n}.jpeg"
 
 
 def _left_to_the_batch(db: Session, fake: QueueSpine, url: str, media: Path) -> str:
@@ -136,6 +148,81 @@ def test_a_row_left_to_the_batch_is_reported_once_the_batch_seeds_it(
     code, lines = _sync(db_session, url)
     assert _event(lines, "reported")["batch_copy"] == 1
     assert fake.depictions[pid]["state"] == "derived"
+
+
+def test_a_held_capture_of_bytes_the_media_db_holds_is_never_reported(
+    lane: dict[str, Any], spine: tuple[QueueSpine, str]
+) -> None:
+    """Another product's capture of the same bytes is seeded and its mask
+    published, so the media DB holds an image of them from the start. This
+    product's depiction is an MFC collector photo: held. "The media DB has a
+    copy" is no operator's decision, so the feed reports nothing for it."""
+    db = lane["db"]
+    fake, url = spine
+    data = _photo(61)
+    clean = seed_clean_image(
+        db,
+        lane["media"],
+        data,
+        origins=[ImageOrigin(url=MFC_ITEM.format(n=61), source="mfc")],
+        figure_id=_pid(9601),
+    )
+    _mask(db, lane["media"], clean.sha256)
+    origin, key = lane["raw"].put(data)
+    pid = fake.depict_full(origin, seen=T0, pid=_pid(61), url=MFC_USER.format(n=61), site="mfc")
+    _queue(db, origin, key, depictions=[(pid, _pid(9602), MFC_USER.format(n=61), "mfc")])
+    assert _seed_all(lane)[0] == dc.EXIT_DONE
+    held = db.get(DisplayOriginal, origin)
+    assert (held.state, held.reason) == ("held", "would_withdraw_mask:user_photo")
+    code, lines = _sync(db, url, max_new=0)
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["batch_copy"] == 0
+    assert fake.sent("ReportDerivative") == []
+    assert fake.depictions[pid]["state"] == "captured"
+    assert db.get(DisplayDepiction, pid).reported_at is None
+    assert db.get(DisplayOriginal, origin).state == "held"  # still the operator's call
+    mask = db.execute(select(ImageMask).where(ImageMask.source_sha256 == clean.sha256)).scalar_one()
+    assert mask.status == "ok"
+
+
+def test_a_depiction_the_settle_missed_goes_back_to_the_seeder_and_is_reported(
+    lane: dict[str, Any], spine: tuple[QueueSpine, str]
+) -> None:
+    """S3's last window: the feed commits a depiction between the settle's
+    read of the unlinked depictions and its commit of ``seeded`` (the feed
+    read the original pending, so left it so; on postgres:
+    tests/test_display_claim_pg.py). No claim takes a seeded original, so the
+    feed's REPORT sends it back to the seeder, after reporting the depiction
+    the seed linked; the seeder links the other and the next REPORT sends it."""
+    db = lane["db"]
+    fake, url = spine
+    origin, key = lane["raw"].put(_photo(71))
+    first = fake.depict_full(origin, seen=T0, pid=_pid(71), url=STORE.format(n=71))
+    _queue(db, origin, key, depictions=[(first, _pid(171), STORE.format(n=71), "amiami")])
+    assert _seed_all(lane)[0] == dc.EXIT_DONE
+    late = fake.depict_full(origin, seen=T0, pid=_pid(72), url=STORE.format(n=72))
+    db.add(
+        DisplayDepiction(
+            product_image_id=late,
+            origin_sha256=origin,
+            product_id=_pid(172),
+            origin_url=STORE.format(n=72),
+            source_site="amiami",
+            first_seen_at=T0,
+        )
+    )
+    db.commit()
+    assert db.get(DisplayOriginal, origin).state == "seeded"  # and the late one unlinked
+    code, lines = _sync(db, url, max_new=0)
+    assert fake.depictions[first]["state"] == "derived"
+    assert db.get(DisplayOriginal, origin).state == "pending"
+    assert db.get(DisplayDepiction, late).reported_at is None
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["relink"] == 1
+    assert _seed_all(lane)[0] == dc.EXIT_DONE
+    assert db.get(DisplayDepiction, late).linked_at is not None
+    code, lines = _sync(db, url, max_new=0)
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["relink"] == 0
+    assert fake.depictions[late]["state"] == "derived"
+    assert db.get(DisplayOriginal, origin).state == "seeded"
 
 
 def test_failed_reports_are_capped_across_runs_not_per_run(
