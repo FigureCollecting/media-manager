@@ -5,7 +5,6 @@ the contract's service and messages."""
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
 import pytest
@@ -18,11 +17,10 @@ def test_the_vendored_proto_is_the_tagged_file() -> None:
     data = (REPO / contract.PROTO_PATH).read_bytes()
     assert hashlib.sha256(data).hexdigest() == contract.PROTO_SHA256
     # SHOW1: 0.12.0, the lease's order, scope and cursor and four PendingImage
-    # fields (fc-ingest-contract feat/media-lease-order-0120; the tag lands with
-    # its merge). The commit is not repeated here: the squash merge re-pins it in
-    # app/spine/contract.py alone, the bytes and their sha-256 unchanged.
+    # fields: fc-ingest-contract #20, squash-merged to develop and tagged
+    # v0.12.0 at that commit (the branch head's bytes, the same sha-256).
     assert contract.PROTO_TAG == "v0.12.0"
-    assert re.fullmatch(r"[0-9a-f]{40}", contract.PROTO_COMMIT)
+    assert contract.PROTO_COMMIT == "527308a75a83f4b46eec656ea622642d5b6af6e6"
     assert contract.verify_vendored_proto(REPO) == data
 
 
