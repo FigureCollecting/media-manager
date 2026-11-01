@@ -1,8 +1,9 @@
 """SHOW1 on a real postgres:16 (the migration test's
 disposable container, removed by name at module teardown): the claim's
 FOR UPDATE SKIP LOCKED (a mutant without it survives every SQLite test),
-the seed race between two seeders inside real transactions, and a
-depiction the feed commits inside the seed's settle."""
+the seed race between two seeders inside real transactions, a
+depiction the feed commits inside the seed's settle, and what a sync that
+races another says (postgres's message has a DETAIL line naming the row)."""
 
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from spine_fakes import serve, sha
+from test_display_feed import QueueSpine, _event, _sync
 from test_migration_chain_replay import (  # noqa: F401  (fixtures)
     _run_alembic,
     empty_database_url,
@@ -246,3 +249,44 @@ def test_pg3_a_depiction_committed_inside_the_settle_goes_back_to_the_seeder(
             db, owner="pod-b", claim_seconds=900, now=T0 + dt.timedelta(minutes=31)
         )
         assert claimed is not None and claimed.origin_sha256 == origin
+
+
+def test_pg4_a_sync_racing_another_names_the_constraint_never_the_row(
+    factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another sync commits the same bytes' original after this one read
+    none: the insert clashes. Postgres puts the clashing row's key on a
+    DETAIL line after the constraint; the stop names the constraint alone."""
+    origin = sha("same-bytes")
+    with factory() as other:
+        other.add(
+            DisplayOriginal(
+                origin_sha256=origin,
+                storage_key="k",
+                codec="identity",
+                first_seen_at=T0,
+                state="pending",
+                attempts=0,
+            )
+        )
+        other.commit()
+    fake = QueueSpine()
+    fake.depict_full(origin, seen=T0)
+    db = factory()
+    real_get = db.get
+
+    def read_before_their_commit(entity: Any, key: Any, **kw: Any) -> Any:
+        return None if entity is DisplayOriginal else real_get(entity, key, **kw)
+
+    monkeypatch.setattr(db, "get", read_before_their_commit)
+    try:
+        with serve(fake) as url:
+            code, lines = _sync(db, url, lease_items=5)
+    finally:
+        monkeypatch.undo()
+        db.close()
+    assert code == feed.EXIT_STOPPED
+    assert _event(lines, "stopped")["why"] == (
+        "database: IntegrityError: another sync wrote the row first (two at once?): "
+        'duplicate key value violates unique constraint "display_originals_pkey"'
+    )

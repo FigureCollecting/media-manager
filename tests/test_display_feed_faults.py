@@ -122,6 +122,46 @@ def test_a_batch_copy_taken_down_since_is_not_reported(
     assert fake.sent("ReportDerivative") == []
 
 
+def test_rows_left_to_the_batch_with_no_copy_yet_never_fill_the_report_window(
+    db_session: Session, spine: tuple[QueueSpine, str], tmp_path: Path
+) -> None:
+    """Only stuck originals the media DB holds an image of are read, so the
+    ``report_limit`` window is never spent on the (many) stuck rows the GPU
+    batch has not reached yet: a newer one with no copy leaves room for the
+    copy."""
+    fake, url = spine
+    pid = _left_to_the_batch(db_session, fake, url, tmp_path / "m")
+    waiting = sha("not-reached-yet")
+    db_session.add(
+        DisplayOriginal(
+            origin_sha256=waiting,
+            storage_key="k",
+            codec="zstd",
+            first_seen_at=T0 + dt.timedelta(hours=1),
+            state="stuck",
+            reason="unsupported_codec:zstd",
+            attempts=1,
+        )
+    )
+    db_session.flush()
+    later = str(uuid.uuid5(uuid.NAMESPACE_URL, waiting))
+    db_session.add(
+        DisplayDepiction(
+            product_image_id=later,
+            origin_sha256=waiting,
+            product_id=str(uuid.uuid5(uuid.NAMESPACE_DNS, waiting)),
+            origin_url="https://img.store.example/waits.jpg",
+            source_site="amiami",
+            first_seen_at=T0 + dt.timedelta(hours=1),  # newer: first in the window
+        )
+    )
+    db_session.commit()
+    code, lines = _sync(db_session, url, max_new=0, report_limit=1)
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["batch_copy"] == 1
+    assert fake.depictions[pid]["state"] == "derived"
+    assert db_session.get(DisplayDepiction, later).reported_at is None
+
+
 def test_a_row_left_to_the_batch_is_reported_once_the_batch_seeds_it(
     db_session: Session, spine: tuple[QueueSpine, str], tmp_path: Any
 ) -> None:
@@ -223,6 +263,46 @@ def test_a_depiction_the_settle_missed_goes_back_to_the_seeder_and_is_reported(
     assert code == feed.EXIT_DONE and _event(lines, "reported")["relink"] == 0
     assert fake.depictions[late]["state"] == "derived"
     assert db.get(DisplayOriginal, origin).state == "seeded"
+
+
+def test_the_relink_sends_back_only_the_original_whose_depiction_is_unlinked(
+    db_session: Session,
+) -> None:
+    """The relink's EXISTS is per original: another original's unlinked
+    depiction (a pending one, as the queue always has) leaves a seeded
+    original whose every depiction is linked alone. Without the correlation
+    every seeded original would go back to the seeder on every run."""
+    done, waiting = sha("done"), sha("waiting")
+    for origin, state in ((done, "seeded"), (waiting, "pending")):
+        db_session.add(
+            DisplayOriginal(
+                origin_sha256=origin,
+                storage_key="k",
+                codec="identity",
+                first_seen_at=T0,
+                state=state,
+                attempts=0,
+            )
+        )
+    db_session.flush()
+    for origin, linked in ((done, T0), (waiting, None)):
+        db_session.add(
+            DisplayDepiction(
+                product_image_id=str(uuid.uuid5(uuid.NAMESPACE_URL, origin)),
+                origin_sha256=origin,
+                product_id=str(uuid.uuid5(uuid.NAMESPACE_DNS, origin)),
+                origin_url=f"https://img.store.example/{origin[:8]}.jpg",
+                source_site="amiami",
+                first_seen_at=T0,
+                linked_at=linked,
+                reported_at=linked,
+                outcome="derived" if linked else None,
+            )
+        )
+    db_session.commit()
+    assert feed._relink(db_session, T0) == 0
+    assert db_session.get(DisplayOriginal, done).state == "seeded"
+    assert db_session.get(DisplayOriginal, waiting).state == "pending"
 
 
 def test_failed_reports_are_capped_across_runs_not_per_run(
