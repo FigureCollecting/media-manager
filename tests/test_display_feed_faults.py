@@ -205,3 +205,29 @@ def test_failed_reports_sent_today_alone_hold_nothing_and_say_nothing(
     code, lines = _sync(db_session, url, max_new=0, max_failed_reports=0)
     assert code == feed.EXIT_DONE
     assert [e for e in lines if e["event"] == "failed_held"] == []
+
+
+def test_every_depiction_of_a_batch_copy_is_reported_with_the_one_record(
+    db_session: Session, spine: tuple[QueueSpine, str], tmp_path: Path
+) -> None:
+    """Two products depict the original the batch seeded: one copy, read once."""
+    fake, url = spine
+    pid = _left_to_the_batch(db_session, fake, url, tmp_path / "m")
+    origin = db_session.get(DisplayDepiction, pid).origin_sha256
+    other = fake.depict_full(origin, seen=T0 - dt.timedelta(minutes=1))
+    db_session.add(
+        DisplayDepiction(
+            product_image_id=other,
+            origin_sha256=origin,
+            product_id=str(uuid.UUID(int=9)),
+            origin_url="https://img.store.example/6b.jpg",
+            source_site="amiami",
+            first_seen_at=T0 - dt.timedelta(minutes=1),
+        )
+    )
+    db_session.commit()
+    code, lines = _sync(db_session, url, max_new=0)
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["batch_copy"] == 2
+    sent = fake.sent("ReportDerivative")
+    assert {r.product_image_id for r in sent} == {pid, other}
+    assert len({r.derivative_sha256 for r in sent}) == 1
