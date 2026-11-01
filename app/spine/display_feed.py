@@ -67,9 +67,10 @@ PURGE. Depictions reported more than ``purge_days`` ago, and the seeded or
 failed originals left with none.
 
 Exit status: 0 done; 1 done, but a report was refused, FAILED reports were
-held or the enqueue stalled; 2 a configuration fault (the mesh refused the identity, the spine
-refused the lease, the database refused the role); 3 stopped, resumable
-(the spine or the database stayed down, or a deployment fault).
+held or the enqueue stalled; 2 a configuration fault (the mesh refused the
+identity, the spine refused the lease or its cursor, the database refused the
+role); 3 stopped, resumable (the spine or the database stayed down, or a
+deployment fault).
 """
 
 from __future__ import annotations

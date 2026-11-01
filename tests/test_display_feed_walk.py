@@ -323,6 +323,19 @@ def test_a_first_seen_at_a_cursor_could_not_carry_back_is_a_deployment_fault(
     assert db_session.scalar(select(func.count()).select_from(DisplayDepiction)) == 0
 
 
+def test_a_row_with_first_seen_at_but_no_product_id_is_a_deployment_fault(
+    db_session: Session,
+) -> None:
+    """A 0.12.0 server always sends both; one without the other is not
+    skipped as a bad row but stops the run, as a server before 0.12.0 does."""
+    fake = _Rows()
+    fake.rows = [_row(sha("a"), product_id=None)]
+    with serve(fake) as url:
+        code, lines = _sync(db_session, url)
+    assert code == feed.EXIT_STOPPED
+    assert "0.12.0" in _event(lines, "stopped")["why"]
+
+
 def test_a_product_image_id_that_is_not_a_uuid_is_a_deployment_fault(
     db_session: Session,
 ) -> None:
