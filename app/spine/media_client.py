@@ -235,14 +235,17 @@ class SpineMediaClient:
         max_items: int,
         lease_owner: str,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        after: tuple[str, str] | None = None,
     ) -> LeaseOutcome:
         """An UNFILTERED lease of the pending queue (media.v1 0.12.0): from its
         ``order`` end (``oldest`` | ``newest``), in its ``scope`` (``all`` |
-        ``showable``, the spine's scheduling choice behind its own gate). A
-        server before 0.12.0 ignores both and leases oldest first from the
-        whole queue, so the caller checks every row carries ``product_id``
-        and ``first_seen_at`` (app.spine.display_feed) before it trusts the
-        answer."""
+        ``showable``, the spine's scheduling choice behind its own gate), or
+        only the rows strictly ``after`` a place in that order (a LeaseCursor:
+        a row's first_seen_at and product_image_id, sent back verbatim). A
+        server before 0.12.0 ignores all three and leases oldest first from
+        the whole queue, so the caller checks every row carries
+        ``product_id`` and ``first_seen_at``, in the order asked and after
+        its cursor (app.spine.display_feed), before it trusts the answer."""
         if order not in LEASE_ORDERS:
             raise ValueError(f"lease order must be one of {', '.join(LEASE_ORDERS)}, not {order!r}")
         if scope not in LEASE_SCOPES:
@@ -255,6 +258,13 @@ class SpineMediaClient:
             order=LEASE_ORDERS[order],
             scope=LEASE_SCOPES[scope],
         )
+        if after is not None:
+            first_seen_at, product_image_id = after
+            request.after.CopyFrom(
+                media_pb2.LeaseCursor(
+                    first_seen_at=first_seen_at, product_image_id=product_image_id
+                )
+            )
         response, failed = self._call("LeasePendingImages", request)
         return LeaseOutcome(response, failed, [f"lease_owner: {w}" for w in cleaned])
 

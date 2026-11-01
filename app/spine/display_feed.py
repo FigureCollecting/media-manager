@@ -16,31 +16,58 @@ would report, re-read first (app.spine.copies.reported_copy): no live copy
 now (a takedown since the seed) -> nothing sent, ``no_copy``; another copy
 -> the original goes back to the seeder, nothing sent. Every unreported
 depiction of a ``failed`` original (the image's own fault, a closed list):
-a FAILED report with its reason -- unless more than ``max_failed_reports``
-originals wait for one, when none is sent and the run ends 1: a FAILED
-report is permanent on the spine in practice, so a flood of them is looked
-at by a person first. ``held`` and ``stuck`` originals are never reported.
+a FAILED report with its reason -- unless the originals waiting for one and
+those it sent one for in the last day are more than ``max_failed_reports``,
+when none is sent and the run ends 1: a FAILED report is permanent on the
+spine in practice, so a flood of them is looked at by a person first, across
+seeder runs too. ``held`` and ``stuck`` originals are reported only once
+another seeder (the GPU batch, an operator's force) has put a copy of them
+in the media DB: DERIVED with the copy the replay would report.
 A report needs no live lease (fc-aggregation derivative-writer.ts: "a
 report is never refused for a stale lease") and is idempotent.
 
 ENQUEUE. While fewer than ``high_water`` originals are pending:
-LeasePendingImages{order, scope} (media.v1 0.12.0; newest first and
-SHOWABLE by default, so new captures land within the hour whatever the
-backlog), each row queued with its product, origin URL, site, class, codec
-and first-seen instant. A row the seeder could not seed safely is skipped
-and counted, never queued: no origin URL (the seed would write an
-originless image, which takes a published mask of its picture offline, F3),
-a URL past the gallery link's 2048 characters, a storage key outside the
-``sha256-v1`` scheme or naming other bytes, a site past 50 characters. Its
-hold lapses; the lag check sees it. AN ANSWER FROM A SERVER BEFORE 0.12.0
-(no product_id or first_seen_at) or out of the order asked is a DEPLOYMENT
-FAULT: nothing is queued, the run stops (exit 3), the holds lapse.
+LeasePendingImages{order, scope, after} (media.v1 0.12.0; newest first and
+SHOWABLE, the only scope whose rows carry origin_url), each row queued with
+its product, origin URL, site, class, codec and first-seen instant. A row the
+seeder could not seed safely is skipped and counted, never queued: no origin
+URL (the seed would write an originless image, which takes a published mask
+of its picture offline, F3), a URL past the gallery link's 2048 characters, a
+storage key outside the ``sha256-v1`` scheme or naming other bytes, a site
+past 50 characters. Its hold lapses; the lag check sees it.
+
+THE WALK. Rows the lane will never report (held, stuck, skipped) stay pending
+on the spine, so a lease that always started at the newest end would hand
+them out again on every round and never reach older ones (RT4). The feed
+walks the queue with the lease's cursor instead, and keeps its place per
+order in ``display_feed_walks``: a run looks at the newest end first (new
+captures land within the hour whatever the backlog) and goes on through new
+rows; at the first answer with nothing new to queue it goes on from where
+the walk stopped (or carries the walk on, once it reaches that place). Each
+round's place is committed with the rows it queued. A walk that reaches the
+end of the queue (an empty answer) ends, and the next run starts a new one at
+the newest end, which comes back for rows that were held when it passed
+them. A run that queued nothing and left the walk where it found it, its
+rounds or time spent, is STALLED (exit 1): a person looks.
+
+THE HOLD is ``lease_seconds``, at most 120. The feed reports none of its rows
+under it (a report needs no live lease), and a hold ends only by lapsing
+(there is no release RPC), so a row it leased goes back to every other caller
+-- the mm-report replay's origin-filtered lease among them -- within two
+minutes of the feed's run (RT5); the walk's cursor, not its holds, keeps the
+feed from leasing its own rows twice.
+
+A DEPLOYMENT FAULT -- an answer from a server before 0.12.0 (no product_id or
+first_seen_at), a first_seen_at or product_image_id a cursor could not carry
+back verbatim, rows out of the total order asked, or a row not after the
+cursor sent (a 0.12.0 draft that ignores it) -- queues nothing from that
+answer and stops the run (exit 3); the holds lapse.
 
 PURGE. Depictions reported more than ``purge_days`` ago, and the seeded or
 failed originals left with none.
 
-Exit status: 0 done; 1 done, but a report was refused or FAILED reports were
-held; 2 a configuration fault (the mesh refused the identity, the spine
+Exit status: 0 done; 1 done, but a report was refused, FAILED reports were
+held or the enqueue stalled; 2 a configuration fault (the mesh refused the identity, the spine
 refused the lease, the database refused the role); 3 stopped, resumable
 (the spine or the database stayed down, or a deployment fault).
 """
@@ -62,13 +89,13 @@ from sqlalchemy import CursorResult, and_, delete, exists, func, or_, select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from ..models import DisplayDepiction, DisplayOriginal, PublicObject
+from ..models import DisplayDepiction, DisplayFeedWalk, DisplayOriginal, PublicObject
 from ..models import Image as ImageModel
 from ..workers.mask_seed import CLEAN_PIPELINE_VERSION
 from . import messages as msg
 from .copies import measured_appearance, reported_copy
 from .field_rules import FieldRefused
-from .media_client import LEASE_ORDERS, LEASE_SCOPES, SpineCallError, SpineMediaClient, Verdict
+from .media_client import LEASE_ORDERS, SpineCallError, SpineMediaClient, Verdict
 from .media_v1 import media_pb2
 
 EXIT_DONE = 0
@@ -83,6 +110,12 @@ KEY_RE = re.compile(r"^(?:[A-Za-z0-9._-]+/)*sha256/([0-9a-f]{2})/([0-9a-f]{64})(
 URL_MAX = 2048
 SITE_MAX = 50
 CLASS_MAX = 32
+#: PendingImage.first_seen_at as a 0.12.0 server spells it, and the only
+#: spelling a LeaseCursor may carry back: UTC, always six fractional digits.
+INSTANT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z")
+INSTANT_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+#: The longest hold the feed asks for (see THE HOLD).
+MAX_LEASE_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -90,7 +123,7 @@ class FeedConfig:
     order: str = "newest"
     scope: str = "showable"
     lease_items: int = 200
-    lease_seconds: int = 3600
+    lease_seconds: int = MAX_LEASE_SECONDS
     max_rounds: int = 200
     max_new: int = 20_000
     high_water: int = 20_000
@@ -103,12 +136,16 @@ class FeedConfig:
     def __post_init__(self) -> None:
         if self.order not in LEASE_ORDERS:
             raise ValueError(f"order must be one of {', '.join(LEASE_ORDERS)}")
-        if self.scope not in LEASE_SCOPES:
-            raise ValueError(f"scope must be one of {', '.join(LEASE_SCOPES)}")
+        if self.scope != "showable":
+            raise ValueError(
+                "scope must be showable: only a SHOWABLE lease carries origin_url (media.v1 0.12.0)"
+            )
         if not 1 <= self.lease_items <= 200:
             raise ValueError("lease_items must be 1-200")
-        if not 1 <= self.lease_seconds <= 3600:
-            raise ValueError("lease_seconds must be 1-3600")
+        if not 1 <= self.lease_seconds <= MAX_LEASE_SECONDS:
+            raise ValueError(
+                f"lease_seconds must be 1-{MAX_LEASE_SECONDS}: a hold ends only by lapsing"
+            )
         for name in ("max_rounds", "max_new", "high_water", "report_limit", "max_failed_reports"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative")
@@ -325,7 +362,7 @@ def _report_left_to_the_batch(
             )
         record = records[origin]
         if record is None:
-            continue  # nothing in media yet: the row stays the lane's, unreported
+            continue  # no live copy shows it (a takedown): the row stays the lane's, unreported
         try:
             built = msg.derivative_report(
                 depiction.product_image_id, record, pipeline_version=CLEAN_PIPELINE_VERSION
@@ -358,6 +395,7 @@ def _report_left_to_the_batch(
 
 
 def _uuid(value: str) -> bool:
+    """A uuid in its 36-character 8-4-4-4-12 form, either case."""
     try:
         return str(uuid.UUID(value)) == value.lower()
     except ValueError:
@@ -365,40 +403,76 @@ def _uuid(value: str) -> bool:
 
 
 def _instant(token: str) -> dt.datetime | None:
+    """A first_seen_at token as 0.12.0 spells it, as an instant; None for any
+    other spelling of it (an offset, three digits, none) or an instant that
+    does not exist (an hour 24, a second 60, a 30 February)."""
+    if not INSTANT_RE.fullmatch(token):
+        return None
     try:
-        return _utc(dt.datetime.fromisoformat(token.replace("Z", "+00:00")))
+        return dt.datetime.strptime(token, INSTANT_FORMAT).replace(tzinfo=dt.UTC)
     except ValueError:
         return None
 
 
-def _check_answer(images: list[media_pb2.PendingImage], order: str) -> list[dt.datetime]:
-    """Every row's first_seen_at, once the answer is a 0.12.0 server's in the
-    order asked; a _Stop otherwise."""
+@dataclass(frozen=True)
+class Place:
+    """A place in the lease's total order (media.v1 LeaseCursor): a row's
+    first_seen_at and product_image_id, VERBATIM as the spine sent them."""
+
+    first_seen_at: str
+    product_image_id: str
+
+    @classmethod
+    def of(cls, image: media_pb2.PendingImage) -> Place:
+        return cls(image.first_seen_at, image.product_image_id)
+
+    def comes_after(self, other: Place, order: str) -> bool:
+        """Whether this place is strictly after ``other`` in ``order``. The
+        tokens sort as text in time order; a uuid by value is its lowercase
+        spelling as text."""
+        mine = (self.first_seen_at, self.product_image_id.lower())
+        theirs = (other.first_seen_at, other.product_image_id.lower())
+        return mine < theirs if order == "newest" else mine > theirs
+
+
+def _check_answer(
+    images: list[media_pb2.PendingImage], order: str, after: Place | None
+) -> list[dt.datetime]:
+    """Every row's first_seen_at, once the answer is a 0.12.0 server's: every
+    row a place a cursor can carry back, in the total order asked, the first
+    after the cursor sent. A _Stop otherwise."""
     seen: list[dt.datetime] = []
+    previous = after
     for image in images:
-        instant = _instant(image.first_seen_at) if image.first_seen_at else None
-        if not image.product_id or instant is None:
+        if not image.product_id or not image.first_seen_at:
             raise _Stop(
                 EXIT_STOPPED,
                 "the lease answered without product_id or first_seen_at: a spine before media.v1 "
-                "0.12.0, which ignores order and scope; nothing queued",
+                "0.12.0, which ignores order, scope and the cursor; nothing queued",
             )
+        instant = _instant(image.first_seen_at)
+        if instant is None or not _uuid(image.product_image_id):
+            raise _Stop(
+                EXIT_STOPPED,
+                "the lease answered a first_seen_at or product_image_id a cursor cannot carry "
+                "back verbatim (media.v1 0.12.0 spells them exactly); nothing queued",
+            )
+        place = Place.of(image)
+        if previous is not None and not place.comes_after(previous, order):
+            what = (
+                "a row not after the cursor it was sent (a server that ignores the cursor)"
+                if previous is after
+                else f"rows out of the {order}-first order asked"
+            )
+            raise _Stop(EXIT_STOPPED, f"the lease answered {what}; nothing queued")
+        previous = place
         seen.append(instant)
-    ordered = sorted(seen, reverse=order == "newest")
-    if seen != ordered:
-        raise _Stop(
-            EXIT_STOPPED, f"the lease answered out of the {order}-first order asked; nothing queued"
-        )
     return seen
 
 
 def _skip_reason(image: media_pb2.PendingImage) -> str | None:
     origin = image.origin_sha256.hex()
-    if (
-        len(image.origin_sha256) != 32
-        or not _uuid(image.product_image_id)
-        or not _uuid(image.product_id)
-    ):
+    if len(image.origin_sha256) != 32 or not _uuid(image.product_id):
         return "bad_identity"
     if not image.HasField("origin_url") or not image.origin_url:
         return "no_origin_url"
@@ -457,17 +531,40 @@ def _pending(db: Session) -> int:
     return db.scalar(select(func.count()).where(DisplayOriginal.state == "pending")) or 0
 
 
+def _walk_place(walk: DisplayFeedWalk | None) -> Place | None:
+    return Place(walk.after_first_seen_at, walk.after_product_image_id) if walk else None
+
+
+def _move_walk(
+    db: Session, walk: DisplayFeedWalk | None, order: str, place: Place, now: dt.datetime
+) -> DisplayFeedWalk:
+    if walk is None:
+        walk = DisplayFeedWalk(lease_order=order, started_at=now)
+        db.add(walk)
+    walk.after_first_seen_at = place.first_seen_at
+    walk.after_product_image_id = place.product_image_id
+    walk.updated_at = now
+    return walk
+
+
 def enqueue(
     db: Session,
     client: SpineMediaClient,
     config: FeedConfig,
     emit: Callable[[dict[str, Any]], None],
     monotonic: Callable[[], float],
+    now: dt.datetime,
 ) -> Counter[str]:
     counts: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
     owner = config.owner or f"mm-display-sync/{os.environ.get('JOB_NAME') or socket.gethostname()}"
     start = monotonic()
+    walk = db.get(DisplayFeedWalk, config.order)
+    found = _walk_place(walk)  # where the last run left the walk
+    # A new walk starts at the order's end. A walk under way is gone on from
+    # once this run's pass from the end meets rows it has queued already.
+    walking = walk is None
+    after: Place | None = None  # where the next lease goes on after (None: the end)
     pending = _pending(db)
     why = "empty"
     while True:
@@ -490,30 +587,62 @@ def enqueue(
                 max_items=config.lease_items,
                 lease_owner=owner,
                 lease_seconds=config.lease_seconds,
+                after=(after.first_seen_at, after.product_image_id) if after else None,
             )
         except SpineCallError as exc:
             raise _stop_for(exc) from exc
         counts["rounds"] += 1
         images = list(outcome.response.images)
         if not images:
+            # nothing pending past this place, nor past the walk's (never
+            # before this one): the walk has reached the end of the queue
+            if walk is not None:
+                db.delete(walk)
+                walk = None
+                db.commit()
+            counts["walk_done"] = 1
             break
-        seen = _check_answer(images, config.order)
+        seen = _check_answer(images, config.order, after)
+        new = 0
         for image, instant in zip(images, seen, strict=True):
             reason = _skip_reason(image)
             if reason is not None:
                 skipped[reason] += 1
             elif _queue_one(db, image, instant):
-                counts["new_depictions"] += 1
+                new += 1
             else:
                 counts["already"] += 1
+        counts["new_depictions"] += new
+        last = Place.of(images[-1])
+        if not walking and found is not None and not found.comes_after(last, config.order):
+            walking = True  # this pass has reached the walk's place: it carries the walk on
+        if walking:
+            walk = _move_walk(db, walk, config.order, last, now)
+            after = last
+        elif new:
+            after = last  # new rows at this end: go on through them
+        else:
+            walking, after = True, found  # ground already covered: on from the walk's place
         db.commit()
         pending = _pending(db)
-    if why in ("rounds", "budget") and counts["new_depictions"] == 0 and counts["already"]:
-        # every leased row was one the lane holds already (held, stuck, still
-        # pending or unreportable): the newest-first window is full of them and
-        # nothing older is ever reached. A person must look (exit 1).
+    place = _walk_place(walk)
+    if (
+        why in ("rounds", "budget")
+        and counts["rounds"]
+        and not counts["new_depictions"]
+        and place == found
+    ):
+        # it queued nothing and its walk is where it found it: no later run
+        # with the same budget gets further (exit 1, a person looks)
         counts["stalled"] = 1
-        emit({"event": "stalled", "already": counts["already"], "rounds": counts["rounds"]})
+        emit(
+            {
+                "event": "stalled",
+                "rounds": counts["rounds"],
+                "already": counts["already"],
+                "walk_after": place.first_seen_at if place else None,
+            }
+        )
     emit(
         {
             "event": "enqueued",
@@ -523,6 +652,9 @@ def enqueue(
             "already": counts["already"],
             "skipped": dict(skipped),
             "pending_originals": pending,
+            "walk_after": place.first_seen_at if place else None,
+            "walk_started": _utc(walk.started_at).isoformat() if walk else None,
+            "walk_done": bool(counts["walk_done"]),
         }
     )
     counts.update({f"skipped_{k}": v for k, v in skipped.items()})
@@ -581,7 +713,7 @@ def run_sync(
     try:
         try:
             reported = report(db, client, config, emit, now())
-            queued = enqueue(db, client, config, emit, monotonic)
+            queued = enqueue(db, client, config, emit, monotonic, now())
         except (OperationalError, ProgrammingError) as exc:
             # the database down (resumable) or refusing the role (a grant, the schema): never a traceback
             db.rollback()

@@ -1,7 +1,7 @@
 """SHOW1: the cluster display-copy lane's command line.
 
     python -m app.cli.display_copy sync    [--spine-url URL] [--order newest|oldest]
-        [--scope showable|all] [--lease-items N] [--lease-seconds S] [--max-new N]
+        [--scope showable] [--lease-items N] [--lease-seconds S<=120] [--max-new N]
         [--high-water N] [--max-failed-reports N] [--purge-days D] [--budget-seconds S]
         [--deadline-seconds S] [--max-attempts N] [--sandbox DIR]
     python -m app.cli.display_copy seed    [--threads N] [--budget-seconds S]

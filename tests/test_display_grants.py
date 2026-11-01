@@ -3,7 +3,7 @@ its CronJob's role gets (fc-infra ``media-grants``):
 
   sync  (mm-display-sync, role media_report): the replay's grants as they
         stand -- column grants on images and image_versions -- plus DML on
-        the two queue tables;
+        the two queue tables and the feed's walk;
   seed  (mm-display-seed, role media_display): DML (no DELETE) on the five
         tables a seed writes and on the queue, SELECT on image_masks and
         mask_store_revocations (the held guard), USAGE on the three id
@@ -44,9 +44,10 @@ from test_migration_chain_replay import (  # noqa: F401  (fixtures)
 )
 from test_spine_report_grants import GRANTS as REPLAY_GRANTS
 
-#: media_report's additions (fc-infra media-grants, SHOW1): the queue, read and written.
+#: media_report's additions (fc-infra media-grants, SHOW1): the queue and the
+#: feed's walk (display_feed_walks: where its lease cursor goes on), read and written.
 SYNC_GRANTS = """
-GRANT SELECT, INSERT, UPDATE, DELETE ON display_originals, display_depictions TO media_report;
+GRANT SELECT, INSERT, UPDATE, DELETE ON display_originals, display_depictions, display_feed_walks TO media_report;
 """
 
 #: media_display's grants (fc-infra media-grants, SHOW1), by name, fail closed.

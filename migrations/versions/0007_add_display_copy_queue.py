@@ -1,6 +1,7 @@
 """SHOW1: the display-copy lane's queue -- the originals it owes a clean copy
-(display_originals) and the spine depictions it reports them for
-(display_depictions).
+(display_originals), the spine depictions it reports them for
+(display_depictions), and where the feed's walk of the spine's queue goes on
+(display_feed_walks).
 
 Revision ID: 0007_add_display_copy_queue
 Revises: 0006_add_gallery_source_class
@@ -70,9 +71,18 @@ def upgrade() -> None:
     )
     op.create_index("ix_display_depictions_origin", "display_depictions", ["origin_sha256"])
     op.create_index("ix_display_depictions_reported_at", "display_depictions", ["reported_at"])
+    op.create_table(
+        "display_feed_walks",
+        sa.Column("lease_order", sa.String(16), primary_key=True),
+        sa.Column("after_first_seen_at", sa.String(27), nullable=False),
+        sa.Column("after_product_image_id", sa.String(36), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("display_feed_walks")
     op.drop_index("ix_display_depictions_reported_at", table_name="display_depictions")
     op.drop_index("ix_display_depictions_origin", table_name="display_depictions")
     op.drop_table("display_depictions")

@@ -371,13 +371,13 @@ def test_downgrading_the_gallery_source_class_restores_the_ledgers_schema(
 def test_downgrading_the_display_copy_queue_restores_the_gallery_schema(
     empty_database_url: str, pg_admin_url: str
 ) -> None:
-    """0007's downgrade (SHOW1) drops exactly the two queue tables."""
+    """0007's downgrade (SHOW1) drops exactly the two queue tables and the feed's walk."""
     up = _run_alembic("upgrade", "head", database_url=empty_database_url)
     assert up.returncode == 0, up.stdout + up.stderr
     migrated = create_engine(empty_database_url)
     try:
         tables = set(inspect(migrated).get_table_names())
-        assert {"display_originals", "display_depictions"} <= tables
+        assert {"display_originals", "display_depictions", "display_feed_walks"} <= tables
         fks = inspect(migrated).get_foreign_keys("display_depictions")
         assert [(f["referred_table"], f["options"].get("ondelete")) for f in fks] == [
             ("display_originals", "CASCADE")
@@ -402,7 +402,7 @@ def test_downgrading_the_display_copy_queue_restores_the_gallery_schema(
         before_engine = create_engine(before_url)
         try:
             names = set(inspect(downgraded_engine).get_table_names())
-            assert not names & {"display_originals", "display_depictions"}
+            assert not names & {"display_originals", "display_depictions", "display_feed_walks"}
             assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
         finally:
             downgraded_engine.dispose()

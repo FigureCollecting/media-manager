@@ -145,6 +145,8 @@ def test_status_prints_the_queue_and_requeue_is_a_dry_run_by_default(
         (["sync", "--spine-url", "https://ingest-server.fc.svc:50063"], "https"),
         (["sync", "--spine-url", "http://h:1", "--lease-items", "201"], "lease_items"),
         (["sync", "--spine-url", "http://h:1", "--order", "sideways"], "order"),
+        (["sync", "--spine-url", "http://h:1", "--scope", "all"], "SHOWABLE"),
+        (["sync", "--spine-url", "http://h:1", "--lease-seconds", "3600"], "lease_seconds"),
         (["sync", "--spine-url", "http://h:1", "--max-attempts", "0"], "max_attempts"),
         (["seed", "--raw-dir", "/nonexistent-raw", "--threads", "-1"], "threads"),
         (["seed", "--media-dir", "/x"], "RAW_S3_"),

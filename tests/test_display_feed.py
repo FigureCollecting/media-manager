@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import re
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import grpc
@@ -38,12 +40,42 @@ def _key(origin: str) -> str:
     return f"raw-img/sha256/{origin[:2]}/{origin}.jpg"
 
 
+#: PendingImage.first_seen_at as a 0.12.0 server spells it (and a LeaseCursor must).
+INSTANT = "%Y-%m-%dT%H:%M:%S.%fZ"
+_TOKEN = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z")
+_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
+
+
+@dataclass
 class QueueSpine(FakeSpine):
-    """A FakeSpine that also leases the WHOLE queue (0.12.0): by order, in a
-    scope, with the four provenance fields -- or, ``old``, as a server before
-    0.12.0 answers (no new fields, the filter-less order ignored)."""
+    """A FakeSpine that also leases the WHOLE queue (media.v1 0.12.0): by
+    order, in a scope, after a cursor, with the four provenance fields, the
+    order total ((first_seen_at, product_image_id)) and origin_url on a
+    SHOWABLE lease only (A-3) -- or, ``old``, as a server before 0.12.0
+    answers (no new fields; order, scope and cursor ignored), or,
+    ``ignores_cursor``, as a 0.12.0 draft before the cursor did.
+
+    HOLDS LAPSE on the server's own clock (``lapse``): a lease holds what it
+    hands out for its lease_seconds (0: 300, at most 3600), and nothing else
+    ends a hold but a report (there is no release RPC)."""
 
     old: bool = False
+    ignores_cursor: bool = False
+    clock: float = 0.0
+    until: dict[str, float] = field(default_factory=dict)
+
+    def lapse(self, seconds: float) -> None:
+        """The server's clock moves on; every hold that has ended lapses."""
+        self.clock += seconds
+        for pid, end in list(self.until.items()):
+            if end <= self.clock:
+                self.held.discard(pid)
+                del self.until[pid]
+
+    def _hold(self, request: Any, images: Any) -> None:
+        seconds = min(request.lease_seconds or 300, 3600)
+        for image in images:
+            self.until[image.product_image_id] = self.clock + seconds
 
     def depict_full(
         self,
@@ -56,8 +88,13 @@ class QueueSpine(FakeSpine):
         product: str | None = None,
         codec: str = "identity",
         key: str | None = None,
+        pid: str | None = None,
     ) -> str:
-        pid = self.depict(origin)
+        pid = pid or self.depict(origin)
+        self.depictions[pid] = self.depictions.get(pid) or {
+            "origin": bytes.fromhex(origin),
+            "state": "captured",
+        }
         self.depictions[pid].update(
             seen=seen,
             showable=showable,
@@ -71,10 +108,20 @@ class QueueSpine(FakeSpine):
 
     def LeasePendingImages(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
         if request.origin_sha256:
-            return super().LeasePendingImages(request, context)
+            response = super().LeasePendingImages(request, context)
+            self._hold(request, response.images)
+            return response
         self._enter("LeasePendingImages", request, context)
         if request.order not in (0, 1, 2) or request.scope not in (0, 1, 2):
             context.abort(C.INVALID_ARGUMENT, "undeclared order or scope")
+        after: tuple[str, str] | None = None
+        if request.HasField("after") and not (self.old or self.ignores_cursor):
+            cursor = request.after
+            if not (
+                _TOKEN.fullmatch(cursor.first_seen_at) and _UUID.fullmatch(cursor.product_image_id)
+            ):
+                context.abort(C.INVALID_ARGUMENT, "a LeaseCursor the contract refuses")
+            after = (cursor.first_seen_at, cursor.product_image_id.lower())
         limit = min(request.max_items or 50, 200)
         rows = [
             (pid, d)
@@ -84,7 +131,13 @@ class QueueSpine(FakeSpine):
             and (self.old or request.scope != 2 or (d.get("showable") and d.get("url")))
         ]
         newest = request.order == 2 and not self.old
-        rows.sort(key=lambda r: (r[1]["seen"], r[0]), reverse=newest)
+
+        def place(row: tuple[str, dict[str, Any]]) -> tuple[str, str]:
+            return (row[1]["seen"].strftime(INSTANT), row[0].lower())
+
+        rows.sort(key=place, reverse=newest)
+        if after is not None:
+            rows = [r for r in rows if (place(r) < after if newest else place(r) > after)]
         out = []
         for pid, d in rows[:limit]:
             image = media_pb2.PendingImage(
@@ -97,11 +150,12 @@ class QueueSpine(FakeSpine):
             if not self.old:
                 image.product_id = d["product"]
                 image.codec = d["codec"]
-                image.first_seen_at = d["seen"].strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                if d["url"] is not None:
+                image.first_seen_at = d["seen"].strftime(INSTANT)
+                if request.scope == 2 and d["url"] is not None:
                     image.origin_url = d["url"]
             out.append(image)
         self.held.update(i.product_image_id for i in out)
+        self._hold(request, out)
         return media_pb2.LeasePendingImagesResponse(images=out, lease_expires_at="x")
 
     def ReportDerivative(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
@@ -171,7 +225,10 @@ def test_the_lease_asks_for_newest_first_showable_and_queues_each_depiction(
         media_pb2.LEASE_ORDER_NEWEST_FIRST,
         media_pb2.LEASE_SCOPE_SHOWABLE,
     )
-    assert list(first.origin_sha256) == [] and first.lease_seconds == 3600
+    # a short hold: the feed reports none of these rows under it, and only a
+    # lapse ends it (no release RPC), so another caller gets them back soon
+    assert list(first.origin_sha256) == [] and first.lease_seconds == 120
+    assert not first.HasField("after")  # a new walk starts at the newest end
     depictions = {
         d.product_image_id: d for d in db_session.execute(select(DisplayDepiction)).scalars()
     }
@@ -235,17 +292,16 @@ def test_rows_the_lane_cannot_seed_are_skipped_and_counted(
 ) -> None:
     fake, url = spine
     good = fake.depict_full(sha("a"), seen=T0)
-    no_url = fake.depict_full(sha("b"), seen=T0, url=None)
     long_url = fake.depict_full(sha("c"), seen=T0, url="https://x.example/" + "a" * 2100)
     bad_key = fake.depict_full(sha("d"), seen=T0, key="elsewhere/" + sha("d"))
     wrong_key = fake.depict_full(sha("e"), seen=T0, key=_key(sha("f")))
-    code, lines = _sync(db_session, url, scope="all")
+    code, lines = _sync(db_session, url)
     assert code == feed.EXIT_DONE
     queued = set(db_session.execute(select(DisplayDepiction.product_image_id)).scalars())
     assert queued == {good}
     skipped = _event(lines, "enqueued")["skipped"]
-    assert skipped == {"no_origin_url": 1, "url_too_long": 1, "bad_storage_key": 2}
-    assert {no_url, long_url, bad_key, wrong_key}.isdisjoint(queued)
+    assert skipped == {"url_too_long": 1, "bad_storage_key": 2}
+    assert {long_url, bad_key, wrong_key}.isdisjoint(queued)
 
 
 def test_enqueue_stops_at_the_high_water_mark(
@@ -573,7 +629,11 @@ def test_publicobject_rows_are_read_never_written(
     ("kwargs", "why"),
     [
         ({"scope": "some"}, "scope"),
+        # only a SHOWABLE lease carries origin_url (media.v1 0.12.0): under ALL
+        # the feed would hold every row and seed none
+        ({"scope": "all"}, "SHOWABLE"),
         ({"lease_seconds": 0}, "lease_seconds"),
+        ({"lease_seconds": 121}, "lease_seconds"),
         ({"max_new": -1}, "max_new"),
         ({"purge_days": 0}, "purge_days"),
     ],
@@ -620,13 +680,18 @@ def test_the_second_depiction_of_an_original_sent_back_is_left_for_the_seeder(
 
 
 class _Rows(QueueSpine):
-    """A spine whose lease answers exactly ``rows`` (then nothing)."""
+    """A spine whose lease answers exactly ``rows`` (then nothing), in the
+    total order asked (first_seen_at, then product_image_id)."""
 
     rows: list[media_pb2.PendingImage] = []
 
     def LeasePendingImages(self, request: Any, context: grpc.ServicerContext) -> Any:  # noqa: N802
         self._enter("LeasePendingImages", request, context)
         out, self.rows = self.rows, []
+        out.sort(
+            key=lambda i: (i.first_seen_at, i.product_image_id.lower()),
+            reverse=request.order == media_pb2.LEASE_ORDER_NEWEST_FIRST,
+        )
         return media_pb2.LeasePendingImagesResponse(images=out, lease_expires_at="x")
 
 
@@ -654,11 +719,15 @@ def test_every_unsafe_row_shape_is_skipped(db_session: Session) -> None:
         _row(sha("c"), source_site="s" * 51),
         _row(sha("d"), source_class="c" * 33),
         _row(sha("e"), source_class="manufacturer_press"),
+        # a SHOWABLE row carries origin_url (A-3); one without it is never
+        # seeded into an originless image
+        _row(sha("f"), origin_url=None),
     ]
     with serve(fake) as url:
         code, lines = _sync(db_session, url)
     assert code == feed.EXIT_DONE
     assert _event(lines, "enqueued")["skipped"] == {
+        "no_origin_url": 1,
         "bad_identity": 1,
         "no_codec": 1,
         "bad_site": 1,

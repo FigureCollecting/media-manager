@@ -578,6 +578,28 @@ class DisplayDepiction(Base):
     )
 
 
+class DisplayFeedWalk(Base):
+    """SHOW1: where the feed's WALK of the spine's queue goes on (media.v1
+    0.12.0 LeaseCursor), one row per lease order (``newest`` | ``oldest``).
+
+    The place is the last row a lease handed the walk, its first_seen_at and
+    product_image_id kept VERBATIM as the spine sent them (the contract
+    refuses any other spelling of the instant). A run looks at the newest end
+    first, then goes on from here (app.spine.display_feed), so rows it will
+    never report no longer stand between it and older ones. The row goes
+    when a walk reaches the end of the queue: the next run starts a new walk
+    at the order's end. Deleting it by hand does the same."""
+
+    __tablename__ = "display_feed_walks"
+
+    lease_order: Mapped[str] = mapped_column(String(16), primary_key=True)
+    after_first_seen_at: Mapped[str] = mapped_column(String(27), nullable=False)
+    after_product_image_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    #: When this walk began at the order's end: its age is the feed's lag over the whole queue.
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 # Useful indexes
 Index("ix_image_versions_image_id_visibility", ImageVersion.image_id, ImageVersion.visibility)
 Index("ix_album_title_trgm", Album.title)
