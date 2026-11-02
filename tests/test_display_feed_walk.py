@@ -475,7 +475,7 @@ def test_a_run_that_neither_queues_nor_moves_its_walk_is_stalled_and_ends_1(
     _sync(db_session, url, lease_items=2, max_new=2)  # the walk at k1
     fake.lapse(3600)
     lines: list[dict[str, Any]] = []
-    ticks = iter([0.0, 0.0, 10_000.0])  # its budget spent after one round
+    ticks = iter([0.0, 0.0, 0.0, 10_000.0])  # the run, its enqueue; spent after one round
     code = feed.run_sync(
         db_session,
         lambda: _client(url),

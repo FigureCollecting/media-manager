@@ -38,7 +38,7 @@ from test_display_copy import (
     _seed_all,
     lane,  # noqa: F401 -- fixture
 )
-from test_display_feed import T0, QueueSpine, _event, _sync, spine  # noqa: F401
+from test_display_feed import T0, QueueSpine, _event, _sync, _timed_sync, spine  # noqa: F401
 
 MFC_USER = "https://static.myfigurecollection.net/upload/pictures/2026/10/31/{n}.jpeg"
 
@@ -188,6 +188,22 @@ def test_a_row_left_to_the_batch_is_reported_once_the_batch_seeds_it(
     code, lines = _sync(db_session, url)
     assert _event(lines, "reported")["batch_copy"] == 1
     assert fake.depictions[pid]["state"] == "derived"
+
+
+def test_rows_left_to_the_batch_wait_too_once_the_reports_share_of_the_budget_is_spent(
+    db_session: Session, spine: tuple[QueueSpine, str], tmp_path: Path
+) -> None:
+    fake, url = spine
+    pid = _left_to_the_batch(db_session, fake, url, tmp_path / "m")
+    reads = iter([0.0])  # the run starts at 0; every later read is half its budget
+    code, lines = _timed_sync(db_session, url, lambda: next(reads, 750.0), max_new=0)
+    assert code == feed.EXIT_DONE
+    reported = _event(lines, "reported")
+    assert (reported["batch_copy"], reported["partial"], reported["remaining"]) == (0, "budget", 1)
+    assert fake.sent("ReportDerivative") == []
+    assert db_session.get(DisplayDepiction, pid).reported_at is None
+    code, lines = _sync(db_session, url, max_new=0)  # the next run reports it
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["batch_copy"] == 1
 
 
 def test_a_held_capture_of_bytes_the_media_db_holds_is_never_reported(

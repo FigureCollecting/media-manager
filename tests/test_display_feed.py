@@ -16,7 +16,7 @@ import datetime as dt
 import hashlib
 import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -193,6 +193,22 @@ def _sync(
         feed.FeedConfig(**config),
         emit=lines.append,
         now=lambda: T0,
+    )
+    return code, lines
+
+
+def _timed_sync(
+    db: Session, url: str, monotonic: Callable[[], float], **config: Any
+) -> tuple[int, list[dict[str, Any]]]:
+    """A run on a fake ``monotonic`` clock."""
+    lines: list[dict[str, Any]] = []
+    code = feed.run_sync(
+        db,
+        lambda: _client(url),
+        feed.FeedConfig(**config),
+        emit=lines.append,
+        now=lambda: T0,
+        monotonic=monotonic,
     )
     return code, lines
 
@@ -623,6 +639,103 @@ def test_publicobject_rows_are_read_never_written(
     assert hashlib.sha256(b"x").hexdigest()  # keeps the import honest
 
 
+#: The reported line of a run that reported every row it selected.
+REPORTED_KEYS = ("derived", "failed", "refused", "no_copy", "reseed", "relink", "batch_copy")
+
+
+def test_reports_stop_at_their_share_of_the_budget_and_the_run_still_enqueues_and_purges(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The REPORT may spend half the run's budget_seconds: past it no new
+    report starts, the line says how far it got and what is left, and ENQUEUE
+    and PURGE still run (no Job deadline cuts them off). Each row is committed
+    on its own, so those not reached wait, unreported, for the next run."""
+    fake, url = spine
+    pids = [_seeded(db_session, fake, tag)[1][0] for tag in ("a", "b", "c", "d")]
+    _origin, (old,), _ = _seeded(db_session, fake, "old")
+    d = db_session.get(DisplayDepiction, old)
+    d.reported_at, d.outcome = T0 - dt.timedelta(days=15), "derived"
+    db_session.commit()
+    new = fake.depict_full(sha("new"), seen=T0)
+
+    def clock() -> float:  # half the budget has passed once two reports are sent
+        return 750.0 if len(fake.sent("ReportDerivative")) >= 2 else 0.0
+
+    code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500)
+
+    assert code == feed.EXIT_DONE
+    assert _event(lines, "reported") == {
+        "event": "reported",
+        **dict.fromkeys(REPORTED_KEYS, 0),
+        "derived": 2,
+        "partial": "budget",
+        "remaining": 2,
+    }
+    sent = {r.product_image_id for r in fake.sent("ReportDerivative")}
+    assert len(sent) == 2 and sent < set(pids)
+    assert {db_session.get(DisplayDepiction, p).reported_at for p in set(pids) - sent} == {None}
+    assert _event(lines, "enqueued")["new_depictions"] == 1  # the enqueue still ran
+    assert db_session.get(DisplayDepiction, new) is not None
+    assert _event(lines, "done")["purged"] == 1  # and the purge
+    assert db_session.get(DisplayDepiction, old) is None
+    # the next run reports the rows this one did not reach
+    code, lines = _sync(db_session, url, max_new=0)
+    assert code == feed.EXIT_DONE and _event(lines, "reported")["derived"] == 2
+    assert {r.product_image_id for r in fake.sent("ReportDerivative")} == set(pids)
+
+
+def test_a_run_within_its_budget_reports_every_row_as_before(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """Under the report's share of the budget nothing changes: every row is
+    reported, the line carries no partial or remaining, and the run goes on
+    to the enqueue and the purge."""
+    fake, url = spine
+    pids = [_seeded(db_session, fake, tag)[1][0] for tag in ("a", "b", "c")]
+    fake.depict_full(sha("new"), seen=T0)
+
+    def clock() -> float:  # 249 s a report: 747 s for the three, under the 750
+        return 249.0 * len(fake.sent("ReportDerivative"))
+
+    code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500)
+
+    assert code == feed.EXIT_DONE
+    assert [line["event"] for line in lines] == ["reported", "enqueued", "done"]
+    assert _event(lines, "reported") == {
+        "event": "reported",
+        **dict.fromkeys(REPORTED_KEYS, 0),
+        "derived": 3,
+    }
+    assert {r.product_image_id for r in fake.sent("ReportDerivative")} == set(pids)
+    assert _event(lines, "enqueued")["new_depictions"] == 1
+
+
+def test_the_enqueue_gets_what_the_report_left_of_the_runs_budget(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """budget_seconds is the whole run's: a report phase that took 700 s of
+    1500 leaves the enqueue 800, so the run as a whole stays inside the Job's
+    deadline (budget_seconds and its margin)."""
+    fake, url = spine
+    _seeded(db_session, fake, "a")
+    for n in range(6):
+        fake.depict_full(sha(f"r{n}"), seen=T0 - dt.timedelta(minutes=n))
+
+    def clock() -> float:  # 700 s a report, 400 s a lease round
+        return 700.0 * len(fake.sent("ReportDerivative")) + 400.0 * len(
+            fake.sent("LeasePendingImages")
+        )
+
+    code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500, lease_items=1)
+
+    assert code == feed.EXIT_DONE
+    assert "partial" not in _event(lines, "reported")
+    enqueued = _event(lines, "enqueued")
+    # rounds at 700 and 1100 s; at 1500 the run's budget is spent (on its
+    # own 1500 s from 700 the enqueue would have leased until 2300)
+    assert (enqueued["why"], enqueued["rounds"], enqueued["new_depictions"]) == ("budget", 2, 2)
+
+
 # --------------------------------------------------------------------------
 # the remaining edges
 # --------------------------------------------------------------------------
@@ -775,7 +888,7 @@ def test_enqueue_stops_at_its_rounds_and_its_budget(
     code, lines = _sync(db_session, url, lease_items=1, max_rounds=2)
     assert _event(lines, "enqueued")["why"] == "rounds"
     out: list[dict[str, Any]] = []
-    ticks = iter([0.0, 10_000.0])
+    ticks = iter([0.0, 0.0, 10_000.0])  # the run, its enqueue, its spent budget
     feed.run_sync(
         db_session,
         lambda: _client(url),
