@@ -282,9 +282,10 @@ class PublicObject(Base):
     height: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     #: The version whose bytes these are (derivatives); NULL for masks, which
-    #: point back at their clean image from image_masks.
+    #: point back at their clean image from image_masks. Indexed: the copy
+    #: lookups read by it (migration 0008).
     image_version_id: Mapped[int | None] = mapped_column(
-        ForeignKey("image_versions.id", ondelete="CASCADE")
+        ForeignKey("image_versions.id", ondelete="CASCADE"), index=True
     )
     #: A clean copy's PIXEL DIGEST (``mask_seed.pixel_digest``) of the
     #: original it was minted from: a capture with those pixels, whatever its
@@ -333,8 +334,10 @@ class PublicObjectImage(Base):
     sha256: Mapped[str] = mapped_column(
         ForeignKey("public_objects.sha256", ondelete="CASCADE"), primary_key=True
     )
+    #: Indexed on its own: the primary key leads on sha256, and the copy
+    #: lookups read by image_id (migration 0008).
     image_id: Mapped[int] = mapped_column(
-        ForeignKey("images.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("images.id", ondelete="CASCADE"), primary_key=True, index=True
     )
 
 
