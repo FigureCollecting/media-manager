@@ -16,10 +16,13 @@ behind a long transaction fails instead of queueing every read of its table.
 A concurrent build takes a lock no read or write waits for, but it waits for
 every transaction that wrote its table to end (a seeder's runs 40-85 s), and
 that wait is a lock wait: under the Job's timeout it would fail. So the build
-waits with none (the Job's activeDeadlineSeconds still bounds it); RESET puts
-the Job's back for any later migration in the run.
+waits with none; RESET puts the Job's back for any later migration in the run.
+The Job's 300 s activeDeadlineSeconds does NOT bound the build: it ends the
+pod, not the build, which keeps running in postgres and can finish, leaving a
+valid index with the version still at 0007.
 
-A RE-RUN IS SAFE. A build cut short leaves an INVALID index of that name,
+A RE-RUN IS SAFE. IF NOT EXISTS keeps an index a killed Job's build finished.
+A build cut short leaves an INVALID index of that name,
 never read and still written on every insert, that IF NOT EXISTS would keep:
 it is dropped and built again. (Offline, `alembic upgrade --sql` cannot see
 one: drop it by hand before running that SQL.)

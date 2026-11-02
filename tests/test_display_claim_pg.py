@@ -299,6 +299,9 @@ def test_pg4_a_sync_racing_another_names_the_constraint_never_the_row(
 #: copies, each minted from its own image and linked behind it (the prod shape),
 #: so that a table walked whole is a real cost to the planner.
 _LOOKED_UP = ("public_objects", "public_object_images")
+#: The keys the lane looks a copy up by. An index that leads on any other
+#: column bounds nothing here: on kind, say, every copy matches 'sanitized'.
+_LOOKUP_KEYS = ("sha256", "image_version_id", "image_id")
 _FILLER = """
 INSERT INTO images (sha256, created_at)
   SELECT encode(sha256(convert_to('fill:' || g, 'UTF8')), 'hex'), now()
@@ -331,9 +334,10 @@ def _leading_column(conn: Any, index: str) -> str:
 
 def _walked_whole(conn: Any, node: dict[str, Any], read: set[str]) -> list[str]:
     """Each read of a _LOOKED_UP table in the plan ``node`` that no index
-    bounds by its leading column: a Seq Scan, or an index walked whole (a
-    condition on a later column of a primary key). ``read`` collects the
-    tables the plan reads."""
+    bounds by a _LOOKUP_KEYS column leading it: a Seq Scan, or an index walked
+    whole (a condition on a later column of a primary key, or on a leading
+    column that is no lookup key). ``read`` collects the tables the plan
+    reads."""
     found: list[str] = []
     table = node.get("Relation Name")
     if table in _LOOKED_UP:
@@ -344,9 +348,10 @@ def _walked_whole(conn: Any, node: dict[str, Any], read: set[str]) -> list[str]:
             child = stack.pop()
             probes += [child] if child["Node Type"] == "Bitmap Index Scan" else []
             stack += child.get("Plans", [])
-        bounded = bool(probes) and all(
-            re.search(rf"\(\(?{_leading_column(conn, p['Index Name'])}\b", p.get("Index Cond", ""))
-            for p in probes
+        leads = [(_leading_column(conn, p["Index Name"]), p.get("Index Cond", "")) for p in probes]
+        bounded = bool(leads) and all(
+            column in _LOOKUP_KEYS and re.search(rf"\(\(?{column}\b", cond)
+            for column, cond in leads
         )
         if not bounded:
             found.append(f"{node['Node Type']} on {table} {node.get('Index Name', '')}".strip())

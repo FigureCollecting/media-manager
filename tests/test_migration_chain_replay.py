@@ -583,6 +583,32 @@ def test_the_copy_lookup_indexes_render_as_offline_sql_outside_a_transaction(
     ]
 
 
+def test_the_copy_lookup_indexes_downgrade_as_offline_sql_outside_a_transaction(
+    pg_admin_url: str,
+) -> None:
+    """``alembic downgrade --sql`` prints 0008's rollback as the Job would run
+    it: both drops CONCURRENTLY outside a transaction, so a rollback never
+    takes ACCESS EXCLUSIVE on the tables the display lane reads and writes."""
+    out = _run_alembic(
+        "downgrade",
+        "0008_index_copy_lookups:0007_add_display_copy_queue",
+        "--sql",
+        database_url=pg_admin_url,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    sql = "\n".join(line for line in out.stdout.splitlines() if not line.startswith("--"))
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    drops = statements.index("SET lock_timeout = 0")
+    assert statements[drops - 1 : drops + 5] == [
+        "COMMIT",
+        "SET lock_timeout = 0",
+        "DROP INDEX CONCURRENTLY IF EXISTS ix_public_object_images_image_id",
+        "DROP INDEX CONCURRENTLY IF EXISTS ix_public_objects_image_version_id",
+        "RESET lock_timeout",
+        "BEGIN",
+    ]
+
+
 def test_the_display_seeders_threads_claim_each_original_once_on_postgres(
     empty_database_url: str, tmp_path: Path
 ) -> None:
