@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import OperationalError
 
 pytestmark = pytest.mark.skipif(
     shutil.which("docker") is None,
@@ -412,6 +413,200 @@ def test_downgrading_the_display_copy_queue_restores_the_gallery_schema(
         with admin_engine.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
         admin_engine.dispose()
+
+
+COPY_LOOKUP_INDEXES = {
+    ("public_objects", "ix_public_objects_image_version_id"),
+    ("public_object_images", "ix_public_object_images_image_id"),
+}
+
+
+def _copy_lookup_indexes(url: str) -> dict[tuple[str, str], bool]:
+    """The 0008 indexes present in ``url``'s database, each with whether it is
+    valid (a CONCURRENTLY build cut short leaves an invalid one behind)."""
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT t.relname, c.relname, i.indisvalid FROM pg_index i"
+                    " JOIN pg_class c ON c.oid = i.indexrelid"
+                    " JOIN pg_class t ON t.oid = i.indrelid"
+                    " WHERE c.relname IN ('ix_public_objects_image_version_id',"
+                    " 'ix_public_object_images_image_id')"
+                )
+            )
+            return {(table, name): valid for table, name, valid in rows}
+    finally:
+        engine.dispose()
+
+
+def test_downgrading_the_copy_lookup_indexes_restores_the_display_queues_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0008's downgrade (SHOW1-THROUGHPUT) drops exactly the two copy-lookup indexes."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    assert _copy_lookup_indexes(empty_database_url) == dict.fromkeys(COPY_LOOKUP_INDEXES, True)
+    down = _run_alembic("downgrade", "0007_add_display_copy_queue", database_url=empty_database_url)
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0007_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0007_add_display_copy_queue", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            assert _copy_lookup_indexes(empty_database_url) == {}
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_the_copy_lookup_indexes_build_behind_a_long_transaction_under_the_jobs_lock_timeout(
+    empty_database_url: str,
+) -> None:
+    """The migrate Job (fc-infra db/media-migrate-job.yaml) runs alembic with
+    PGOPTIONS=-c lock_timeout=5s. A CONCURRENTLY build waits for every
+    transaction that wrote its table to end (a seeder's runs 40-85 s), and
+    that wait is a lock wait: under the timeout the build would fail and
+    leave an invalid index. 0008 waits instead; its lock queues no reader or
+    writer behind it."""
+    up = _run_alembic("upgrade", "0007_add_display_copy_queue", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    watch = create_engine(empty_database_url, isolation_level="AUTOCOMMIT")
+    seeder = engine.connect()
+    seeder.execute(text("LOCK TABLE public_objects, public_object_images IN ROW EXCLUSIVE MODE"))
+    proc = subprocess.Popen(
+        ["alembic", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        env={**os.environ, "DATABASE_URL": empty_database_url, "PGOPTIONS": "-c lock_timeout=1s"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        with watch.connect() as conn:
+            while proc.poll() is None and time.monotonic() < deadline:
+                building = conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                        " AND query LIKE 'CREATE INDEX CONCURRENTLY%' AND wait_event_type = 'Lock'"
+                    )
+                ).scalar_one()
+                if building:
+                    break
+                time.sleep(0.1)
+        time.sleep(2)  # the seeder holds on for twice the lock timeout
+        seeder.commit()
+        output, _ = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        seeder.close()
+        engine.dispose()
+        watch.dispose()
+    assert proc.returncode == 0, output
+    assert _copy_lookup_indexes(empty_database_url) == dict.fromkeys(COPY_LOOKUP_INDEXES, True)
+
+
+def test_a_copy_lookup_index_a_cut_short_build_left_invalid_is_rebuilt(
+    empty_database_url: str,
+) -> None:
+    """A CONCURRENTLY build cut short (a lock timeout, the Job's deadline)
+    leaves an INVALID index of that name: never read, still written on every
+    insert. IF NOT EXISTS alone would keep it for good; 0008 rebuilds it."""
+    up = _run_alembic("upgrade", "0007_add_display_copy_queue", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    builder = create_engine(empty_database_url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as seeder, builder.connect() as conn:
+            seeder.execute(text("LOCK TABLE public_objects IN ROW EXCLUSIVE MODE"))
+            conn.execute(text("SET lock_timeout = '1s'"))
+            with pytest.raises(OperationalError, match="lock timeout"):
+                conn.execute(
+                    text(
+                        "CREATE INDEX CONCURRENTLY ix_public_objects_image_version_id"
+                        " ON public_objects (image_version_id)"
+                    )
+                )
+            seeder.rollback()
+    finally:
+        engine.dispose()
+        builder.dispose()
+    assert _copy_lookup_indexes(empty_database_url) == {
+        ("public_objects", "ix_public_objects_image_version_id"): False
+    }
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    assert _copy_lookup_indexes(empty_database_url) == dict.fromkeys(COPY_LOOKUP_INDEXES, True)
+
+
+def test_the_copy_lookup_indexes_render_as_offline_sql_outside_a_transaction(
+    pg_admin_url: str,
+) -> None:
+    """``alembic upgrade --sql`` (no database: the catalog is not read) prints
+    0008 as the Job would run it: the run so far committed, both builds
+    CONCURRENTLY with no lock timeout, then a new transaction for the stamp."""
+    out = _run_alembic(
+        "upgrade", "0007_add_display_copy_queue:head", "--sql", database_url=pg_admin_url
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    sql = "\n".join(line for line in out.stdout.splitlines() if not line.startswith("--"))
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    builds = statements.index("SET lock_timeout = 0")
+    assert statements[builds - 1 : builds + 5] == [
+        "COMMIT",
+        "SET lock_timeout = 0",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_public_objects_image_version_id"
+        " ON public_objects (image_version_id)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_public_object_images_image_id"
+        " ON public_object_images (image_id)",
+        "RESET lock_timeout",
+        "BEGIN",
+    ]
+
+
+def test_the_copy_lookup_indexes_downgrade_as_offline_sql_outside_a_transaction(
+    pg_admin_url: str,
+) -> None:
+    """``alembic downgrade --sql`` prints 0008's rollback as the Job would run
+    it: both drops CONCURRENTLY outside a transaction, so a rollback never
+    takes ACCESS EXCLUSIVE on the tables the display lane reads and writes."""
+    out = _run_alembic(
+        "downgrade",
+        "0008_index_copy_lookups:0007_add_display_copy_queue",
+        "--sql",
+        database_url=pg_admin_url,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    sql = "\n".join(line for line in out.stdout.splitlines() if not line.startswith("--"))
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    drops = statements.index("SET lock_timeout = 0")
+    assert statements[drops - 1 : drops + 5] == [
+        "COMMIT",
+        "SET lock_timeout = 0",
+        "DROP INDEX CONCURRENTLY IF EXISTS ix_public_object_images_image_id",
+        "DROP INDEX CONCURRENTLY IF EXISTS ix_public_objects_image_version_id",
+        "RESET lock_timeout",
+        "BEGIN",
+    ]
 
 
 def test_the_display_seeders_threads_claim_each_original_once_on_postgres(
