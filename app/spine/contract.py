@@ -15,9 +15,11 @@ import hashlib
 from pathlib import Path
 
 PROTO_PATH = "proto/media/v1/media.proto"
-PROTO_TAG = "v0.10.0"
-PROTO_COMMIT = "e06b1f61f941c1ac65f9876064ac4d6a8f71993d"
-PROTO_SHA256 = "1133c58037ff55460d18f4acd317debe317be4c95b08f71d285ec50d6006b2b0"
+PROTO_TAG = "v0.12.0"
+# fc-ingest-contract's develop squash merge of 0.12.0 (#20), the commit the tag
+# names; the bytes are its branch head's (3172712), so PROTO_SHA256 is unchanged.
+PROTO_COMMIT = "527308a75a83f4b46eec656ea622642d5b6af6e6"
+PROTO_SHA256 = "c5cc34de2d1f4d87d2d59350be6bf3bc86e12ecf5093cf817633da14c1ecfd5c"
 
 
 class ProtoMismatch(RuntimeError):

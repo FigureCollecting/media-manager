@@ -366,3 +366,185 @@ def test_downgrading_the_gallery_source_class_restores_the_ledgers_schema(
         with admin_engine.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
         admin_engine.dispose()
+
+
+def test_downgrading_the_display_copy_queue_restores_the_gallery_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0007's downgrade (SHOW1) drops exactly the two queue tables and the feed's walk."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    migrated = create_engine(empty_database_url)
+    try:
+        tables = set(inspect(migrated).get_table_names())
+        assert {"display_originals", "display_depictions", "display_feed_walks"} <= tables
+        fks = inspect(migrated).get_foreign_keys("display_depictions")
+        assert [(f["referred_table"], f["options"].get("ondelete")) for f in fks] == [
+            ("display_originals", "CASCADE")
+        ]
+    finally:
+        migrated.dispose()
+    down = _run_alembic(
+        "downgrade", "0006_add_gallery_source_class", database_url=empty_database_url
+    )
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0006_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0006_add_gallery_source_class", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            names = set(inspect(downgraded_engine).get_table_names())
+            assert not names & {"display_originals", "display_depictions", "display_feed_walks"}
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_the_display_seeders_threads_claim_each_original_once_on_postgres(
+    empty_database_url: str, tmp_path: Path
+) -> None:
+    """SHOW1: FOR UPDATE SKIP LOCKED is Postgres's; six threads, twelve
+    originals, each seeded exactly once and every claim settled."""
+    import datetime as dt
+    import hashlib
+    import io
+
+    from app.models import DisplayDepiction, DisplayOriginal, FigureGallery, PublicObject
+    from app.models import Image as ImageModel
+    from app.object_store import LocalObjectStore
+    from app.workers import display_copy as dc
+    from app.workers.raw_source import ReadOnlyStore
+    from PIL import Image
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import sessionmaker
+
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url, pool_size=8)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    raw = LocalObjectStore(tmp_path / "raw")
+    at = dt.datetime(2026, 10, 31, 12, 0, tzinfo=dt.UTC)
+    with factory() as db:
+        for n in range(12):
+            buf = io.BytesIO()
+            Image.new("RGB", (40, 60), (n * 20, 30, 90)).save(buf, format="PNG")
+            data = buf.getvalue()
+            sha = hashlib.sha256(data).hexdigest()
+            key = f"raw-img/sha256/{sha[:2]}/{sha}.png"
+            raw.put(key, data, "image/png")
+            db.add(
+                DisplayOriginal(
+                    origin_sha256=sha,
+                    storage_key=key,
+                    codec="identity",
+                    first_seen_at=at - dt.timedelta(minutes=n),
+                    state="pending",
+                )
+            )
+            db.flush()
+            db.add(
+                DisplayDepiction(
+                    product_image_id=str(uuid.UUID(int=n + 1)),
+                    origin_sha256=sha,
+                    product_id=str(uuid.UUID(int=100 + n)),
+                    origin_url=f"https://img.amiami.com/{n}.png",
+                    source_site="amiami",
+                    first_seen_at=at,
+                )
+            )
+        db.commit()
+    lines: list[dict[str, object]] = []
+    code = dc.run_seed(
+        factory,
+        ReadOnlyStore(raw),
+        LocalObjectStore(tmp_path / "media"),
+        dc.SeedConfig(threads=6, grants={"amiami": ["img.amiami.com"]}),
+        emit=lines.append,
+    )
+    try:
+        assert code == dc.EXIT_DONE, lines
+        with factory() as db:
+            rows = db.execute(select(DisplayOriginal)).scalars().all()
+            assert {(r.state, r.attempts, r.claimed_by) for r in rows} == {("seeded", 0, None)}
+            assert db.scalar(select(func.count()).select_from(FigureGallery)) == 12
+            assert db.scalar(select(func.count()).select_from(ImageModel)) == 12
+            assert db.scalar(select(func.count()).select_from(PublicObject)) == 12  # one copy each
+    finally:
+        engine.dispose()
+
+
+def test_the_display_feed_reports_enqueues_and_purges_on_postgres(empty_database_url: str) -> None:
+    """SHOW1: the feed's queries (the FAILED cap's count, the purge's
+    database-side delete, requeue's prefix) as Postgres runs them."""
+    import datetime as dt
+
+    from app.models import DisplayDepiction, DisplayOriginal
+    from app.spine import display_feed as feed
+    from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
+    from app.workers import display_copy as dc
+    from sqlalchemy import select
+    from sqlalchemy.orm import sessionmaker
+
+    from spine_fakes import serve, sha
+    from test_display_feed import QueueSpine
+
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    db = sessionmaker(bind=engine, expire_on_commit=False)()
+    at = dt.datetime(2026, 10, 31, 12, 0, tzinfo=dt.UTC)
+    fake = QueueSpine()
+    try:
+        with serve(fake) as url:
+            new = fake.depict_full(sha("a"), seen=at)
+            fake.depict_full(sha("b"), seen=at - dt.timedelta(days=1))
+
+            def connect() -> SpineMediaClient:
+                return SpineMediaClient(open_channel(url), policy=RetryPolicy(max_attempts=1))
+
+            lines: list[dict[str, object]] = []
+            code = feed.run_sync(db, connect, feed.FeedConfig(), emit=lines.append, now=lambda: at)
+            assert code == feed.EXIT_DONE, lines
+            assert db.get(DisplayOriginal, sha("a")).first_seen_at == at
+            failed = db.get(DisplayOriginal, sha("a"))
+            failed.state, failed.reason, failed.updated_at = "failed", "undecodable", at
+            db.commit()
+            later = at + dt.timedelta(days=20)
+            code = feed.run_sync(
+                db, connect, feed.FeedConfig(max_new=0), emit=lines.append, now=lambda: at
+            )
+            assert code == feed.EXIT_DONE
+            assert db.get(DisplayDepiction, new).outcome == "failed"
+            code = feed.run_sync(
+                db, connect, feed.FeedConfig(max_new=0), emit=lines.append, now=lambda: later
+            )
+            assert (
+                db.get(DisplayDepiction, new) is None and db.get(DisplayOriginal, sha("a")) is None
+            )
+            assert db.get(DisplayOriginal, sha("b")).state == "pending"
+            pending = db.get(DisplayOriginal, sha("b"))
+            pending.state, pending.reason = "stuck", "gave_up:missing_raw"
+            db.commit()
+            assert (
+                dc.requeue(db, state="stuck", reason_prefix="gave_up:", force=False, apply=True)
+                == 1
+            )
+            assert dc.status(db)["originals"] == {"pending": 1}
+            assert db.scalar(select(DisplayOriginal.attempts)) == 0
+    finally:
+        db.close()
+        engine.dispose()

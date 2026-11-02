@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import io
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import numpy as np
 from PIL import Image, ImageOps
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..hashing import compute_phash, detect_mime
@@ -452,3 +453,36 @@ def seed_clean_image(
             linked.source_class = origin.source_class
     db.commit()
     return obj
+
+
+#: Seeds of one original tried in all when a concurrent first seed of the
+#: same picture wins the race (``seed_with_retry``).
+SEED_ATTEMPTS = 2
+
+
+def seed_with_retry(
+    db: Session,
+    store: ObjectStore,
+    original: bytes,
+    *,
+    origins: Sequence[ImageOrigin],
+    figure_id: str,
+    seed: Callable[..., PublicObject] | None = None,
+) -> PublicObject:
+    """``seed`` (default ``seed_clean_image``), retried ONCE after an IntegrityError: two seeders
+    (the WSL mask batch and the cluster display-copy lane) seeding the same
+    picture at once both insert its first rows, and the one that loses the
+    unique key (``images.sha256``, ``public_objects.sha256`` or
+    ``pixel_sha256``) rolls back and seeds again, finding the winner's rows:
+    a no-op seed that only adds its gallery links. The objects it PUT are
+    content-addressed, the winner's bytes. A second IntegrityError is raised:
+    the caller treats it as an interruption, never as the image's fault."""
+    once = seed or seed_clean_image
+    for attempt in range(SEED_ATTEMPTS):
+        try:
+            return once(db, store, original, origins=origins, figure_id=figure_id)
+        except IntegrityError:
+            db.rollback()
+            if attempt == SEED_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover

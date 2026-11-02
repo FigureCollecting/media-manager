@@ -1,4 +1,4 @@
-"""The media.v1 SpineMedia client (fc-ingest-contract 0.10.0).
+"""The media.v1 SpineMedia client (fc-ingest-contract 0.12.0).
 
 PLAINTEXT TO THE LOCAL MESH. The client speaks gRPC over h2c to
 ``SPINE_MEDIA_URL`` (``http://ingest-server.fc.svc.cluster.local:50063``);
@@ -57,6 +57,13 @@ FATAL = frozenset(
 
 DEFAULT_DEADLINE_SECONDS = 10.0
 DEFAULT_LEASE_SECONDS = 120
+
+#: LeasePendingImagesRequest.order and .scope (0.12.0), by the names the CLI takes.
+LEASE_ORDERS = {
+    "oldest": media_pb2.LEASE_ORDER_OLDEST_FIRST,
+    "newest": media_pb2.LEASE_ORDER_NEWEST_FIRST,
+}
+LEASE_SCOPES = {"all": media_pb2.LEASE_SCOPE_ALL, "showable": media_pb2.LEASE_SCOPE_SHOWABLE}
 
 
 class Verdict(enum.Enum):
@@ -217,6 +224,47 @@ class SpineMediaClient:
             lease_seconds=lease_seconds,
             origin_sha256=unique,
         )
+        response, failed = self._call("LeasePendingImages", request)
+        return LeaseOutcome(response, failed, [f"lease_owner: {w}" for w in cleaned])
+
+    def lease_queue(
+        self,
+        *,
+        order: str,
+        scope: str,
+        max_items: int,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        after: tuple[str, str] | None = None,
+    ) -> LeaseOutcome:
+        """An UNFILTERED lease of the pending queue (media.v1 0.12.0): from its
+        ``order`` end (``oldest`` | ``newest``), in its ``scope`` (``all`` |
+        ``showable``, the spine's scheduling choice behind its own gate), or
+        only the rows strictly ``after`` a place in that order (a LeaseCursor:
+        a row's first_seen_at and product_image_id, sent back verbatim). A
+        server before 0.12.0 ignores all three and leases oldest first from
+        the whole queue, so the caller checks every row carries
+        ``product_id`` and ``first_seen_at``, in the order asked and after
+        its cursor (app.spine.display_feed), before it trusts the answer."""
+        if order not in LEASE_ORDERS:
+            raise ValueError(f"lease order must be one of {', '.join(LEASE_ORDERS)}, not {order!r}")
+        if scope not in LEASE_SCOPES:
+            raise ValueError(f"lease scope must be one of {', '.join(LEASE_SCOPES)}, not {scope!r}")
+        owner, cleaned = fr.lease_owner(lease_owner)
+        request = media_pb2.LeasePendingImagesRequest(
+            max_items=max_items,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+            order=LEASE_ORDERS[order],
+            scope=LEASE_SCOPES[scope],
+        )
+        if after is not None:
+            first_seen_at, product_image_id = after
+            request.after.CopyFrom(
+                media_pb2.LeaseCursor(
+                    first_seen_at=first_seen_at, product_image_id=product_image_id
+                )
+            )
         response, failed = self._call("LeasePendingImages", request)
         return LeaseOutcome(response, failed, [f"lease_owner: {w}" for w in cleaned])
 

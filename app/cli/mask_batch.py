@@ -12,6 +12,8 @@
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
     python -m app.cli.mask_batch sql official-gallery-worklist [--shard I/N]
+    python -m app.cli.mask_batch sql stores-worklist --since INSTANT [--scope showable|all]
+        [--sites a,b,...] [--rank N]
 
 THE WORK. A work list is JSON lines, one per ORIGINAL the spine captured
 (``blob_sha256``, its ``storage_key`` in the raw bucket, ``codec``, the origin
@@ -148,6 +150,7 @@ from typing import Any
 import httpx
 from PIL import Image as PILImage
 from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
@@ -158,7 +161,7 @@ from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
 from ..telemetry.events import EventLines
 from ..telemetry.tracing import NULL_ITEM, Item
-from ..workers.image_limits import ImageLimitError, current_limits, gunzip_capped
+from ..workers.image_limits import ImageLimitError
 from ..workers.mask_job import (
     finish_mask_batch,
     open_mask_batch,
@@ -167,8 +170,22 @@ from ..workers.mask_job import (
 )
 from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Slots, on_the_gpu
 from ..workers.mask_policy import ImageOrigin
-from ..workers.mask_seed import PictureKeys, picture_keys, seed_clean_image, seed_footprint
+from ..workers.mask_seed import (
+    PictureKeys,
+    picture_keys,
+    seed_clean_image,
+    seed_footprint,
+    seed_with_retry,
+)
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
+from ..workers.raw_source import (
+    RawStoreConfigError,
+    ReadOnlyStore,
+    is_outage,
+    is_outage_reason,
+    raw_store_from_env,
+)
+from ..workers.raw_source import decode_stored as _decode
 from ..workers.stage_timing import STAGES, DatabaseSeconds, StageTimings, timed
 
 #: The scraper's roll windows (minutes of the hour): no chunk runs in them.
@@ -727,19 +744,6 @@ class VramSampler:
         self._thread.join(timeout=10)
 
 
-class ReadOnlyStore:
-    """The raw bucket as the batch sees it: it reads originals, never writes."""
-
-    def __init__(self, store: ObjectStore) -> None:
-        self._store = store
-
-    def get(self, key: str) -> bytes:
-        return self._store.get(key)
-
-    def put(self, key: str, data: bytes, content_type: str) -> None:
-        raise PermissionError("the raw bucket is read only to the mask batch")
-
-
 class RecentWrites:
     """The media bucket with its last few writes kept in memory: the lane
     re-reads the clean copy it has just stored (to hash it before the mask),
@@ -898,39 +902,6 @@ class _Chunk:
         }
 
 
-#: The exception classes (by name, anywhere in the class's ancestry) of an
-#: OUTAGE -- the network, the database or the bucket -- not of the image: the
-#: builtin and botocore ConnectionError, timeouts, SQLAlchemy's
-#: OperationalError and InterfaceError (a dropped connection), botocore's
-#: HTTPClientError (a connection closed mid-response).
-_OUTAGE_CLASSES = frozenset(
-    {"ConnectionError", "TimeoutError", "Timeout", "OperationalError", "InterfaceError",
-     "HTTPClientError"}
-)  # fmt: skip
-#: The same, as the mask lane records a failure: its class name alone.
-_OUTAGE_REASONS = _OUTAGE_CLASSES | {
-    "ConnectionResetError", "ConnectionRefusedError", "ConnectionAbortedError",
-    "BrokenPipeError", "EndpointConnectionError", "ConnectionClosedError",
-    "ConnectTimeoutError", "ReadTimeoutError", "ProxyConnectionError",
-}  # fmt: skip
-
-
-def is_outage(exc: BaseException) -> bool:
-    """An outage-class failure (``_OUTAGE_CLASSES``, or the bucket answering
-    5xx): the image is not at fault, a rerun should try it again."""
-    if any(cls.__name__ in _OUTAGE_CLASSES for cls in type(exc).__mro__):
-        return True
-    response = getattr(exc, "response", None)  # botocore's ClientError
-    if isinstance(response, dict):
-        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        return isinstance(status, int) and status >= 500
-    return False
-
-
-def is_outage_reason(reason: str | None) -> bool:
-    return reason in _OUTAGE_REASONS
-
-
 class _Witness:
     """The media bucket as one image's lane sees it, keeping the last error
     it raised (the lane records only its class: a 503 and a 403 are both
@@ -1003,17 +974,6 @@ class _WorkerSession(Session):
         if witness is not None:
             witness.flush()
         super().commit()
-
-
-def _decode(stored: bytes, codec: str) -> bytes:
-    """An original's bytes from the raw bucket's object: the stored object under the byte cap (a refusal before
-    anything opens it) and a gzip one inflated only up to that cap (MM-CAPS-1: a bomb stops at the ceiling)."""
-    cap = current_limits().max_bytes
-    if codec == "gzip":
-        return gunzip_capped(stored, cap)
-    if len(stored) > cap:
-        raise ImageLimitError("too_large_bytes", f"{len(stored)} bytes exceeds the {cap}-byte cap")
-    return stored
 
 
 def _mint(
@@ -1095,7 +1055,9 @@ def _mint(
     try:
         # pipelined, its original's and its copy's PUTs run beside its SQL
         with timed(timings, "seed"), media.beside(lane.uploads if lane is not None else None):
-            clean = seed_clean_image(
+            # SHOW1: retried once when a concurrent first seed of the same
+            # picture (the cluster display-copy lane) wins the unique key
+            clean = seed_with_retry(
                 db,
                 media,
                 data,
@@ -1103,6 +1065,7 @@ def _mint(
                     ImageOrigin(url=item.url, source=item.source, source_class=item.source_class)
                 ],
                 figure_id=item.product_id,
+                seed=seed_clean_image,
             )
         clean_sha = clean.sha256
     except Exception as exc:
@@ -1111,6 +1074,11 @@ def _mint(
             media.flush()  # a PUT made before the error failed first: it is the cause
         except Exception as put_failed:
             cause = put_failed
+        if isinstance(cause, IntegrityError):
+            # still racing after the retry: never the image's fault, a rerun takes it
+            with timed(timings, "db"):
+                db.rollback()
+            return failed("seed:IntegrityError", outage=True)
         return rolled_back("seed", cause)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
@@ -1941,6 +1909,9 @@ JOIN raw.url u ON u.id = c.url_id
 WHERE s.site = 'mfc'
   AND pi.state <> 'suppressed' AND pi.suppressed_at IS NULL
   AND b.visibility = 'visible'"""
+#: SHOW1: the same joins and liveness, every site (the store work list).
+_ANY_SITE_JOINS = _IMAGE_JOINS.replace("WHERE s.site = 'mfc'\n  AND ", "WHERE ")
+_SITE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,49}")
 
 
 def _uuid(value: object, what: str) -> str:
@@ -2041,6 +2012,52 @@ ORDER BY pi.product_id, pi.position NULLS LAST, pi.blob_sha256;
     )
 
 
+def stores_worklist_sql(
+    since: str, *, scope: str = "showable", sites: str | None = None, rank: int = 8
+) -> str:
+    """SHOW1 step 3: every site's live images first seen since ``since`` (an
+    ISO instant with its zone), newest first -- ONE cumulative list rebuilt
+    daily (a row already done is skipped in memory, a duplicate kept once).
+    ``scope`` ``showable`` keeps the sources the spine lets derive
+    (derive_permitted silent or granted), ``all`` every source; ``sites`` (a
+    comma list) keeps only those sites -- pass MASK_STORE_GRANTS' stores: a
+    capture from any other store, seeded behind a picture's published mask,
+    takes that mask offline (mask eligibility is pooled). ``rank`` 8 puts the
+    list ahead of every rank-9 list whatever the file order; Ross's heads
+    (0-3) still go first. The join on the capture's URL keeps out a row with
+    no origin (F3: an originless seed takes masks offline too)."""
+    try:
+        instant = dt.datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"bad --since {since!r}: want an ISO instant") from exc
+    if instant.tzinfo is None:
+        raise ValueError(f"--since {since!r} needs a time zone (Z or +00:00)")
+    if scope not in ("showable", "all"):
+        raise ValueError(f"bad scope {scope!r}: showable or all")
+    if isinstance(rank, bool) or not 0 <= rank <= 9:
+        raise ValueError(f"a rank must be an integer 0-9, got {rank!r}")
+    where = f"\n  AND pi.first_seen_at >= '{instant.astimezone(dt.UTC).isoformat()}'::timestamptz"
+    if scope == "showable":
+        where += "\n  AND s.derive_permitted IN ('silent', 'granted')"
+    if sites is not None:
+        names = [n.strip() for n in sites.split(",") if n.strip()]
+        bad = [n for n in names if not _SITE.fullmatch(n)]
+        if not names or bad:
+            raise ValueError(f"bad site list {sites!r}: want site names, comma separated")
+        where += "\n  AND s.site IN (" + ", ".join(f"'{n}'" for n in names) + ")"
+    columns = _IMAGE_COLUMNS.format(head="NULL", rank=str(rank))
+    return (
+        _SQL_HEAD
+        + f"""-- SHOW1: every site's images first seen since {instant.isoformat()} (spine db).
+SELECT {columns}
+FROM product_image pi
+{_ANY_SITE_JOINS}{where}
+ORDER BY pi.first_seen_at DESC, pi.product_id, pi.position NULLS LAST, pi.blob_sha256;
+"""
+        + _SQL_TAIL
+    )
+
+
 def official_gallery_worklist_sql(shard: str | None = None) -> str:
     """GAL3: the live MFC images the gallery-capture lane took from MFC's
     official gallery list (spine db: source_class ``manufacturer_press``),
@@ -2117,22 +2134,10 @@ def _raw_store(args: argparse.Namespace, connections: int = 10) -> ObjectStore:
         from ..object_store import LocalObjectStore
 
         return ReadOnlyStore(LocalObjectStore(args.raw_dir))
-    names = ("RAW_S3_ENDPOINT_URL", "RAW_S3_BUCKET", "RAW_S3_ACCESS_KEY", "RAW_S3_SECRET_KEY")
-    missing = [n for n in names if not os.environ.get(n)]
-    if missing:
-        raise Refused(f"the raw bucket needs {', '.join(missing)} (or --raw-dir)")
-    import boto3
-    from botocore.config import Config
-
-    client = boto3.client(
-        "s3",
-        endpoint_url=os.environ["RAW_S3_ENDPOINT_URL"],
-        region_name=os.environ.get("RAW_S3_REGION", "us-east-1"),
-        aws_access_key_id=os.environ["RAW_S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["RAW_S3_SECRET_KEY"],
-        config=Config(max_pool_connections=connections, **BUCKET_CONFIG),
-    )
-    return ReadOnlyStore(S3ObjectStore(client=client, bucket=os.environ["RAW_S3_BUCKET"]))
+    try:
+        return raw_store_from_env(connections, BUCKET_CONFIG)
+    except RawStoreConfigError as exc:
+        raise Refused(f"{exc} (or --raw-dir)") from exc
 
 
 SERVICE = "mask-batch"
@@ -2254,6 +2259,10 @@ def _sql(args: argparse.Namespace) -> int:
             sql = ross_worklist_sql(Path(args.heads).read_text().splitlines())
         elif args.query == "official-gallery-worklist":
             sql = official_gallery_worklist_sql(args.shard)
+        elif args.query == "stores-worklist":
+            sql = stores_worklist_sql(
+                args.since, scope=args.scope, sites=args.sites, rank=args.rank
+            )
         else:
             sql = catalog_worklist_sql(args.shard)
     except (OSError, ValueError) as exc:
@@ -2375,6 +2384,13 @@ def _parser() -> argparse.ArgumentParser:
         "official-gallery-worklist", help="spine db: MFC's official gallery list (GAL3)"
     )
     gallery.add_argument("--shard")
+    stores = queries.add_parser(
+        "stores-worklist", help="spine db: every site's images since an instant (SHOW1)"
+    )
+    stores.add_argument("--since", required=True, help="an ISO instant, e.g. 2026-10-23T21:21Z")
+    stores.add_argument("--scope", default="showable", help="showable (default) or all")
+    stores.add_argument("--sites", help="only these sites, comma separated (MASK_STORE_GRANTS')")
+    stores.add_argument("--rank", type=int, default=8)
     return p
 
 
