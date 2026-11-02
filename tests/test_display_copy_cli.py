@@ -7,7 +7,9 @@ import datetime as dt
 import hashlib
 import io
 import json
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +20,8 @@ from PIL import Image
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from spine_fakes import serve
-from test_display_feed import QueueSpine
+from spine_fakes import serve, sha
+from test_display_feed import QueueSpine, _seeded
 
 T0 = dt.datetime(2026, 10, 31, 12, 0, tzinfo=dt.UTC)
 
@@ -101,6 +103,42 @@ def test_sync_then_seed_then_sync_reports_the_new_copy(
         (link,) = db.execute(select(FigureGallery)).scalars()
         assert (link.figure_id, link.source_url) == (product, "https://img.amiami.example/a.png")
         assert db.get(DisplayDepiction, pid).outcome == "derived"
+
+
+@dataclass
+class _SlowReports(QueueSpine):
+    """A spine whose ReportDerivative takes 0.4 s."""
+
+    def ReportDerivative(self, request: Any, context: Any) -> Any:  # noqa: N802
+        time.sleep(0.4)
+        return super().ReportDerivative(request, context)
+
+
+def test_a_sync_on_the_real_clock_stops_its_reports_at_their_share_and_still_enqueues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--budget-seconds 4 on time.monotonic: eight reports of 0.4 s would
+    take 3.2 s, so the REPORT stops once its 2 s are spent (by the sixth row
+    at the latest), and the enqueue, the purge and job.end follow in the
+    2 s or so left."""
+    sandbox = _sandbox(tmp_path / "db")
+    fake = _SlowReports()
+    with _db(sandbox) as db:
+        for tag in "abcdefgh":
+            _seeded(db, fake, tag)
+    fake.depict_full(sha("new"), seen=T0)
+    with serve(fake) as url:
+        monkeypatch.setenv("SPINE_MEDIA_URL", url)
+        assert cli.main(["sync", "--sandbox", str(sandbox), "--budget-seconds", "4"]) == 0
+    lines = _lines(capsys.readouterr().out)
+    reported = _event(lines, "app.reported")
+    assert reported["partial"] == "budget" and 1 <= reported["derived"] <= 5
+    assert reported["derived"] + reported["remaining"] == 8
+    assert len(fake.sent("ReportDerivative")) == reported["derived"]
+    assert _event(lines, "app.enqueued")["new_depictions"] == 1
+    assert _event(lines, "app.done")
+    end = _event(lines, "job.end")
+    assert (end["exit"], end["partial"], end["remaining"]) == (0, "budget", reported["remaining"])
 
 
 def test_status_prints_the_queue_and_requeue_is_a_dry_run_by_default(

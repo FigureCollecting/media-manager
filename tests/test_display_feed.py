@@ -689,12 +689,13 @@ def test_a_run_within_its_budget_reports_every_row_as_before(
 ) -> None:
     """Under the report's share of the budget nothing changes: every row is
     reported, the line carries no partial or remaining, and the run goes on
-    to the enqueue and the purge."""
+    to the enqueue and the purge. The share is half, not less: the fourth
+    row starts at 747 s of 1500."""
     fake, url = spine
-    pids = [_seeded(db_session, fake, tag)[1][0] for tag in ("a", "b", "c")]
+    pids = [_seeded(db_session, fake, tag)[1][0] for tag in ("a", "b", "c", "d")]
     fake.depict_full(sha("new"), seen=T0)
 
-    def clock() -> float:  # 249 s a report: 747 s for the three, under the 750
+    def clock() -> float:  # 249 s a report: the rows start at 0, 249, 498 and 747, under 750
         return 249.0 * len(fake.sent("ReportDerivative"))
 
     code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500)
@@ -704,7 +705,7 @@ def test_a_run_within_its_budget_reports_every_row_as_before(
     assert _event(lines, "reported") == {
         "event": "reported",
         **dict.fromkeys(REPORTED_KEYS, 0),
-        "derived": 3,
+        "derived": 4,
     }
     assert {r.product_image_id for r in fake.sent("ReportDerivative")} == set(pids)
     assert _event(lines, "enqueued")["new_depictions"] == 1
@@ -734,6 +735,108 @@ def test_the_enqueue_gets_what_the_report_left_of_the_runs_budget(
     # rounds at 700 and 1100 s; at 1500 the run's budget is spent (on its
     # own 1500 s from 700 the enqueue would have leased until 2300)
     assert (enqueued["why"], enqueued["rounds"], enqueued["new_depictions"]) == ("budget", 2, 2)
+
+
+def test_a_share_spent_before_the_first_row_sends_no_report(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The clock is read before each row, never after a report: a run whose
+    share went on starting up (the connect, the counts) sends none."""
+    fake, url = spine
+    pids = [_seeded(db_session, fake, tag)[1][0] for tag in ("a", "b", "c", "d")]
+    fake.depict_full(sha("new"), seen=T0)
+    reads = iter([0.0])  # the run starts at 0; every later read is half its budget
+    code, lines = _timed_sync(db_session, url, lambda: next(reads, 750.0), budget_seconds=1500)
+    assert code == feed.EXIT_DONE
+    assert fake.sent("ReportDerivative") == []
+    reported = _event(lines, "reported")
+    assert (reported["derived"], reported["partial"], reported["remaining"]) == (0, "budget", 4)
+    assert {db_session.get(DisplayDepiction, p).reported_at for p in pids} == {None}
+    assert [line["event"] for line in lines] == ["reported", "enqueued", "done"]
+    assert _event(lines, "enqueued")["new_depictions"] == 1
+
+
+def test_rows_that_send_no_report_stop_at_the_share_too(
+    db_session: Session, spine: tuple[QueueSpine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_copy row sends nothing but costs a reported_copy (the ~2 s scan
+    in a drain), so it is held to the share like a row that reports: here
+    the clock moves with reported_copy, not with the spine's calls."""
+    from app.models import Image
+
+    fake, url = spine
+    for tag in ("a", "b", "c", "d"):
+        origin = _seeded(db_session, fake, tag)[0]
+        db_session.execute(select(Image).where(Image.sha256 == origin)).scalar_one().deleted_at = AT
+    db_session.commit()
+    looked = {"n": 0}
+    real = feed.reported_copy
+
+    def counting(db: Session, origin: str) -> str | None:
+        looked["n"] += 1
+        return real(db, origin)
+
+    monkeypatch.setattr(feed, "reported_copy", counting)
+    code, lines = _timed_sync(
+        db_session, url, lambda: 750.0 if looked["n"] >= 2 else 0.0, budget_seconds=1500, max_new=0
+    )
+    assert code == feed.EXIT_DONE
+    reported = _event(lines, "reported")
+    assert (reported["no_copy"], reported["partial"], reported["remaining"]) == (2, "budget", 2)
+    assert looked["n"] == 2 and fake.sent("ReportDerivative") == []
+
+
+def test_a_report_that_fails_as_the_share_runs_out_is_never_marked(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The share runs out during the third report, whose call then fails
+    (UNAVAILABLE twice): the run stops 3, only the two rows the spine took
+    are marked, and the fourth is never sent."""
+    fake, url = spine
+    for tag in ("a", "b", "c", "d"):
+        _seeded(db_session, fake, tag)
+    fake.fail("ReportDerivative", None, None, C.UNAVAILABLE, C.UNAVAILABLE)
+
+    def clock() -> float:  # half the budget has passed once the third report is sent
+        return 750.0 if len(fake.sent("ReportDerivative")) >= 3 else 0.0
+
+    code, _lines = _timed_sync(db_session, url, clock, budget_seconds=1500, max_new=0)
+    assert code == feed.EXIT_STOPPED
+    sent = [r.product_image_id for r in fake.sent("ReportDerivative")]
+    assert len(sent) == 4 and sent[2] == sent[3]  # two taken, then the third's two attempts
+    marked = db_session.execute(
+        select(DisplayDepiction.product_image_id, DisplayDepiction.outcome).where(
+            DisplayDepiction.reported_at.is_not(None)
+        )
+    ).all()
+    assert sorted(marked) == sorted((pid, "derived") for pid in sent[:2])
+
+
+def test_a_report_sent_as_the_share_runs_out_is_marked_and_the_rest_wait(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The same, but the third report goes through: it is marked, and the
+    fourth waits for the next run."""
+    fake, url = spine
+    for tag in ("a", "b", "c", "d"):
+        _seeded(db_session, fake, tag)
+
+    def clock() -> float:  # half the budget has passed once the third report is sent
+        return 750.0 if len(fake.sent("ReportDerivative")) >= 3 else 0.0
+
+    code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500, max_new=0)
+    assert code == feed.EXIT_DONE
+    sent = {r.product_image_id for r in fake.sent("ReportDerivative")}
+    marked = set(
+        db_session.execute(
+            select(DisplayDepiction.product_image_id).where(
+                DisplayDepiction.reported_at.is_not(None)
+            )
+        ).scalars()
+    )
+    assert len(sent) == 3 and marked == sent
+    reported = _event(lines, "reported")
+    assert (reported["derived"], reported["partial"], reported["remaining"]) == (3, "budget", 1)
 
 
 # --------------------------------------------------------------------------
