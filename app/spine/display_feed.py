@@ -88,6 +88,21 @@ answer and stops the run (exit 3); the holds lapse.
 PURGE. Depictions reported more than ``purge_days`` ago, and the seeded or
 failed originals left with none.
 
+THE BUDGET. ``budget_seconds`` is the whole run's, counted from its start.
+The REPORT starts no new report once ``REPORT_SHARE`` of it is spent; the
+rows it did not reach (the batch's too) stay unreported for the next run,
+and its line says ``partial: budget`` and how many are ``remaining``.
+ENQUEUE gets what is left (THE WALK's half of its time is half of that), and
+PURGE runs after it. Half: the mm-display-sync Job's activeDeadlineSeconds
+is 1680 to a budget of 1500 (fc-infra media-display-sync-cronjob.yaml), and
+those 180 s are for starting up, the one call in flight when time runs out
+(57.5 s at most with its retries) and the purge, never for a phase. An
+enqueue of all its 200 rounds takes ~410 s at the ~2 s a round measured (100
+in 206 s, 2026-11-02), so the 750 s left holds them with room for a slower
+database; a REPORT at the ~2.2 s a report measured in a drain (450 in 995 s)
+still sends ~340 a run. Without the share, a REPORT past the deadline was
+killed with the Job, and ENQUEUE and PURGE never ran.
+
 Exit status: 0 done; 1 done, but a report was refused, FAILED reports were
 held or the enqueue stalled; 2 a configuration fault (the mesh refused the
 identity, the spine refused the lease or its cursor, the database refused the
@@ -98,6 +113,7 @@ deployment fault, or another sync writing the same rows at the same time).
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import re
 import socket
@@ -141,6 +157,9 @@ INSTANT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", re.ASCII)
 INSTANT_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 #: The longest hold the feed asks for (see THE HOLD).
 MAX_LEASE_SECONDS = 120
+#: The part of the run's ``budget_seconds`` the REPORT may spend before it
+#: starts no new report; ENQUEUE gets the rest (see THE BUDGET).
+REPORT_SHARE = 0.5
 
 
 @dataclass(frozen=True)
@@ -227,6 +246,8 @@ def report(
     config: FeedConfig,
     emit: Callable[[dict[str, Any]], None],
     now: dt.datetime,
+    monotonic: Callable[[], float] = time.monotonic,
+    until: float = math.inf,
 ) -> Counter[str]:
     counts: Counter[str] = Counter()
     waiting_failed = (
@@ -273,7 +294,10 @@ def report(
         .limit(config.report_limit)
     ).all()
     current: dict[str, str | None] = {}
-    for depiction, original in rows:
+    for n, (depiction, original) in enumerate(rows):
+        if monotonic() >= until:  # its share of the run's budget spent: the rest wait
+            counts["remaining"] = len(rows) - n
+            break
         if original.state == "pending":  # sent back to the seeder earlier in this run
             continue
         pid = depiction.product_image_id
@@ -328,24 +352,17 @@ def report(
         counts["warnings"] += len(warnings)
         db.commit()
     counts["relink"] = _relink(db, now)
-    _report_left_to_the_batch(db, client, config, counts, now)
-    emit(
-        {
-            "event": "reported",
-            **{
-                k: counts[k]
-                for k in (
-                    "derived",
-                    "failed",
-                    "refused",
-                    "no_copy",
-                    "reseed",
-                    "relink",
-                    "batch_copy",
-                )
-            },
-        }
-    )
+    _report_left_to_the_batch(db, client, config, counts, now, monotonic, until)
+    line: dict[str, Any] = {
+        "event": "reported",
+        **{
+            k: counts[k]
+            for k in ("derived", "failed", "refused", "no_copy", "reseed", "relink", "batch_copy")
+        },
+    }
+    if counts["remaining"]:
+        line.update(partial="budget", remaining=counts["remaining"])
+    emit(line)
     return counts
 
 
@@ -380,6 +397,8 @@ def _report_left_to_the_batch(
     config: FeedConfig,
     counts: Counter[str],
     now: dt.datetime,
+    monotonic: Callable[[], float],
+    until: float,
 ) -> None:
     """Depictions of ``stuck`` originals (left to the GPU batch) whose bytes
     the media DB now holds an image of -- the batch's seed of them, or any
@@ -407,7 +426,10 @@ def _report_left_to_the_batch(
         .limit(config.report_limit)
     ).all()
     records: dict[str, msg.CopyRecord | None] = {}
-    for depiction, original in rows:
+    for n, (depiction, original) in enumerate(rows):
+        if monotonic() >= until:  # the REPORT's share spent, here or before the batch
+            counts["remaining"] += len(rows) - n
+            return
         origin = original.origin_sha256
         if origin not in records:
             copy = reported_copy(db, origin)
@@ -621,11 +643,13 @@ def enqueue(
     emit: Callable[[dict[str, Any]], None],
     monotonic: Callable[[], float],
     now: dt.datetime,
+    until: float,
 ) -> Counter[str]:
     counts: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
     owner = config.owner or f"mm-display-sync/{os.environ.get('JOB_NAME') or socket.gethostname()}"
     start = monotonic()
+    budget = until - start  # what the REPORT left of the run's budget_seconds
     walk = db.get(DisplayFeedWalk, config.order)
     found = _walk_place(walk)  # where the last run left the walk
     # A new walk starts at the order's end. A walk under way is gone on from
@@ -644,7 +668,7 @@ def enqueue(
         if counts["rounds"] >= config.max_rounds:
             why = "rounds"
             break
-        if monotonic() - start >= config.budget_seconds:
+        if monotonic() - start >= budget:
             why = "budget"
             break
         try:
@@ -694,7 +718,7 @@ def enqueue(
         elif (
             not already
             and counts["rounds"] * 2 <= config.max_rounds
-            and (monotonic() - start) * 2 <= config.budget_seconds
+            and (monotonic() - start) * 2 <= budget
         ):
             # rows all skipped: never queued, so no sign of ground covered, nor
             # a place to keep (the next run's pass goes on past them the same
@@ -797,11 +821,16 @@ def run_sync(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     """REPORT, then ENQUEUE, then PURGE; the exit status."""
+    start = monotonic()
     client = connect()
     try:
         try:
-            reported = report(db, client, config, emit, now())
-            queued = enqueue(db, client, config, emit, monotonic, now())
+            # the REPORT's share of the run's budget, then the ENQUEUE what is left
+            reports_until = start + config.budget_seconds * REPORT_SHARE
+            reported = report(db, client, config, emit, now(), monotonic, reports_until)
+            queued = enqueue(
+                db, client, config, emit, monotonic, now(), start + config.budget_seconds
+            )
         except (OperationalError, ProgrammingError) as exc:
             # the database down (resumable) or refusing the role (a grant, the schema): never a traceback
             db.rollback()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import grpc
@@ -371,14 +372,25 @@ def test_skipped_rows_before_the_walk_beyond_a_runs_rounds_never_starve_it(
     assert _walk(db_session) == _place(fake, backlog[17])
 
 
+def _leases_after_a_report(fake: QueueSpine, report_seconds: int) -> Callable[[], float]:
+    """A run's clock: 4 s a lease, and every read after the run's start
+    ``report_seconds`` later, the time its REPORT took."""
+    reads = iter([0.0])
+    return lambda: 4.0 * len(fake.sent("LeasePendingImages")) + next(reads, report_seconds)
+
+
+@pytest.mark.parametrize("report_seconds", [0, 8])
 @pytest.mark.parametrize("arrivals", [True, False])
 def test_skipped_rows_before_the_walk_beyond_a_runs_time_never_starve_it(
-    db_session: Session, spine: tuple[QueueSpine, str], arrivals: bool
+    db_session: Session, spine: tuple[QueueSpine, str], arrivals: bool, report_seconds: int
 ) -> None:
     """The same wall, the run's time spent before its rounds: a lease takes
-    4 s of a 16 s budget, four leases a run, the 200 rounds never near. Past
-    half its time (half spent goes on, as with rounds) the pass goes back to
-    the walk: a round of backlog a run. (Bounded by rounds alone, every run
+    4 s of the enqueue's 16, four leases a run, the 200 rounds never near.
+    Past half that time (half spent goes on, as with rounds) the pass goes
+    back to the walk: a round of backlog a run. The enqueue's time is what
+    the REPORT left of the run's budget: a REPORT of 8 s in a budget of 24
+    leaves the same 16, so the pass goes back to the walk once 8 s of them
+    are spent, not 12 (half the run's). (Bounded by rounds alone, every run
     with arrivals ends 0 with its walk in the wall, the backlog never
     reached; with none every run is STALLED.)"""
     fake, url = spine
@@ -391,10 +403,10 @@ def test_skipped_rows_before_the_walk_beyond_a_runs_time_never_starve_it(
             feed.run_sync(
                 db_session,
                 lambda: _client(url),
-                feed.FeedConfig(lease_items=3, budget_seconds=16),
+                feed.FeedConfig(lease_items=3, budget_seconds=16 + report_seconds),
                 emit=lines.append,
                 now=lambda: T0,
-                monotonic=lambda: 4.0 * len(fake.sent("LeasePendingImages")),
+                monotonic=_leases_after_a_report(fake, report_seconds),
             )
         )
         assert _event(lines, "enqueued")["why"] == "budget"
@@ -475,7 +487,7 @@ def test_a_run_that_neither_queues_nor_moves_its_walk_is_stalled_and_ends_1(
     _sync(db_session, url, lease_items=2, max_new=2)  # the walk at k1
     fake.lapse(3600)
     lines: list[dict[str, Any]] = []
-    ticks = iter([0.0, 0.0, 10_000.0])  # its budget spent after one round
+    ticks = iter([0.0, 0.0, 0.0, 10_000.0])  # the run, its enqueue; spent after one round
     code = feed.run_sync(
         db_session,
         lambda: _client(url),
