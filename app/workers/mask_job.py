@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import Select, func, select, union
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ..models import (
     FigureGallery,
@@ -142,16 +142,29 @@ def _candidates(
     source: str | None = None,
     only: Sequence[str] | None = None,
 ) -> list[PublicObject]:
-    settled = select(ImageMask.source_sha256).where(
-        ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
-        ImageMask.status.not_in(redrive),
+    # NOT EXISTS, never NOT IN (subquery) (MASKRATE): Postgres cannot make a NOT
+    # IN an anti-join (a NULL in the subquery would change its answer), so it
+    # reads the whole subquery -- every mask row of the version, every dead
+    # capture -- on every call, for one copy as for a page. Every key compared
+    # here is NOT NULL, so the two answer alike. Each EXISTS names a column,
+    # never ``*``: a role with column grants is checked on every column named.
+    settled = (
+        select(ImageMask.source_sha256)
+        .where(
+            ImageMask.source_sha256 == PublicObject.sha256,
+            ImageMask.pipeline_version == MASK_PIPELINE_VERSION,
+            ImageMask.status.not_in(redrive),
+        )
+        .exists()
     )
     # A clean copy shared by several captures of a picture waits while ANY of them
     # is soft-deleted (app.publication would not serve it).
+    dead = aliased(ImageModel)
     dead_capture = (
         select(PublicObjectImage.sha256)
-        .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
-        .where(ImageModel.deleted_at.is_not(None))
+        .join(dead, dead.id == PublicObjectImage.image_id)
+        .where(PublicObjectImage.sha256 == PublicObject.sha256, dead.deleted_at.is_not(None))
+        .exists()
     )
     query = (
         select(PublicObject)
@@ -161,8 +174,8 @@ def _candidates(
             PublicObject.kind == "sanitized",
             ImageVersion.deleted_at.is_(None),
             ImageModel.deleted_at.is_(None),
-            PublicObject.sha256.not_in(settled),
-            PublicObject.sha256.not_in(dead_capture),
+            ~settled,
+            ~dead_capture,
         )
         .order_by(PublicObject.sha256)
         .limit(page_size)

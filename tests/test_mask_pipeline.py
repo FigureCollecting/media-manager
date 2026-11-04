@@ -1648,7 +1648,9 @@ def test_each_stage_is_the_images_own_wall_and_the_chunk_tells_the_throughput(
         assert 0.05 <= seconds["fetch"] < slowest_get + 0.1
         assert 0.08 <= seconds["inference"] < slowest_model + 0.1
         assert seconds["gpu_wait"] >= 0.0
-        assert {"claim", "seed", "readback", "upload", "db", "turn_wait"} <= set(seconds)
+        assert {"claim_keys", "claim_footprint", "claim_register"} <= set(seconds)
+        assert {"seed", "readback", "upload", "db", "turn_wait"} <= set(seconds)
+        assert "claim" not in seconds  # told apart (MASKRATE)
     for record in records.values():
         assert record["seconds"] >= 0.05 + 0.08
     staged = sorted(round(sum(t.seconds.values()), 2) for t in captured)
@@ -1665,6 +1667,96 @@ def test_each_stage_is_the_images_own_wall_and_the_chunk_tells_the_throughput(
         chunk["elapsed_seconds"] / 6, abs=0.001
     )
     assert chunk["throughput_seconds_per_image"] < chunk["seconds_per_image"]  # overlapped
+    main.close()
+    engine.dispose()
+
+
+def test_the_claim_tells_its_keys_its_footprint_and_its_wait_for_earlier_images_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MASKRATE: the claim is three stages. ``claim_keys``: the picture keys
+    its read-ahead computed; ``claim_footprint``: its footprint read but for
+    the read's SQL ("db"): the pool's checkout, the ORM; ``claim_register``:
+    its wait to register behind every earlier image, which waits for THEIR
+    footprint reads. An earlier image's slow footprint is a later image's
+    claim_register, never its claim_footprint, and the chunk line tells the
+    three apart."""
+    by_thread: dict[str, StageTimings] = {}
+
+    class Capturing(StageTimings):
+        def __init__(self, clock: Callable[[], float]) -> None:
+            super().__init__(clock)
+            by_thread[threading.current_thread().name] = self
+
+    monkeypatch.setattr(mb, "StageTimings", Capturing)
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, n) for n in range(1, 4)]
+    real = mb.seed_footprint
+
+    def footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str]:
+        if items[0].blob_sha256 in shas:
+            time.sleep(0.6)  # the first image's read, slow
+        return real(db, shas=shas, digests=digests)
+
+    monkeypatch.setattr(mb, "seed_footprint", footprint)
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, _Shapes(cost=0.01), events)
+    assert mb.run_batch(items, mb.BatchConfig(chunk_size=3, writers=3), rt) == 0
+    first, *later = (by_thread[f"mask-image-{n}"].seconds for n in range(3))
+    assert first["claim_footprint"] >= 0.6
+    for seconds in later:
+        assert seconds["claim_register"] >= 0.3  # behind the first image's read
+        assert seconds["claim_footprint"] < 0.3
+    for seconds in (first, *later):
+        assert seconds["claim_keys"] > 0  # the read-ahead's keys, added
+        assert "claim" not in seconds
+    chunk = next(e for e in events if e["event"] == "chunk")
+    assert {"claim_keys", "claim_footprint", "claim_register"} <= set(
+        chunk["stage_seconds_per_image"]
+    )
+    assert chunk["stage_seconds_per_image"]["claim_register"] >= 0.2
+    main.close()
+    engine.dispose()
+
+
+def test_an_images_connection_checkout_is_its_db_never_its_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MASKRATE: the footprint read is a worker's first query of its image,
+    so the pool's checkout (its pre-ping a round trip over the tunnel, no
+    statement event around it) lands there. It is the image's "db", as
+    unpipelined, never its claim_footprint."""
+    by_thread: dict[str, StageTimings] = {}
+
+    class Capturing(StageTimings):
+        def __init__(self, clock: Callable[[], float]) -> None:
+            super().__init__(clock)
+            by_thread[threading.current_thread().name] = self
+
+    def slow_checkout(*_: Any) -> None:
+        if threading.current_thread().name.startswith("mask-image-"):
+            time.sleep(0.3)
+
+    monkeypatch.setattr(mb, "StageTimings", Capturing)
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, n) for n in range(1, 3)]
+    root = tmp_path / "run"
+    engine = _engine(tmp_path / "media.db")
+    main = Session(engine, expire_on_commit=False)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(main, root, raw, _Shapes(cost=0.01), events)
+    sa_event.listen(QueuePool, "checkout", slow_checkout)  # the run's own sized pool too
+    try:
+        assert mb.run_batch(items, mb.BatchConfig(chunk_size=2, writers=2), rt) == 0
+    finally:
+        sa_event.remove(QueuePool, "checkout", slow_checkout)
+    for n in range(2):
+        seconds = by_thread[f"mask-image-{n}"].seconds
+        assert seconds["claim_footprint"] < 0.25
+        assert seconds["db"] >= 0.3
     main.close()
     engine.dispose()
 

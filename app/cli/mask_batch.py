@@ -66,7 +66,8 @@ every line carries run_id. Per chunk one ``app.chunk`` line: count, statuses, se
 share, and per MASKED image -- ok or held -- apart from the cheap ineligible ones), peak GPU memory used (whole card, sampled), the failures,
 and where the seconds went: each stage's mean and median per image over the
 images that ran it (``stage_seconds_per_image``, ``stage_median_seconds``;
-app.workers.stage_timing: fetch, claim, seed, readback, gpu_wait, inference,
+app.workers.stage_timing: fetch, claim_keys, claim_footprint, claim_register,
+seed, readback, gpu_wait, inference,
 base_keep, analysis, encode, upload, turn_wait, db; a stage no image ran is
 absent) and how many
 did (``stage_images``): each mean is over those images only, so the means
@@ -98,7 +99,7 @@ worker and no other. A stop, a scraper window, a failing gate or the
 circuit lets no further image start or onto the GPU: the images past the
 GPU finish, the others are let go unrecorded and come back first. Each
 image's stages are its own wall time, the pipeline's waits among them
-(``claim``, ``gpu_wait``, ``turn_wait``); the chunk's
+(``claim_register``, ``gpu_wait``, ``turn_wait``); the chunk's
 ``throughput_seconds_per_image`` is its wall time over the images it minted
 (an 'already' one, a lookup, is left out, as in the seconds per image). At
 most ``--decode-slots`` copies (default three) are decoded for the model at
@@ -1282,16 +1283,18 @@ class _ImageLane:
         self._claim: Claim | None = None
         self._registered = False
         self._turned = False
-        timings.add("claim", fetched.keys_seconds)  # its picture keys, read ahead
+        timings.add("claim_keys", fetched.keys_seconds)  # its picture keys, read ahead
         self.ahead = fetched.keys_seconds
         self.fetch_seconds = fetched.fetch_seconds
         self.uploads = run.flow.uploads
 
     def claim(self, db: Session) -> None:
-        """Before the image's first query: read its footprint, register it in
-        work-list order and wait for every earlier image it meets."""
+        """Before the image's first query: read its footprint
+        (``claim_footprint``, its SQL "db"), register it in work-list order
+        (``claim_register``: the wait for every earlier image to have read
+        its own) and wait for every earlier image it meets (``turn_wait``)."""
         self.before_seed()  # held before it began: not even a query
-        with self._timings.stage("claim"):
+        with self._timings.stage("claim_footprint"):
             since = self._run.flow.claims.snapshot()
             shas, digests = {self._item.blob_sha256}, set()
             keys = self._fetched.keys
@@ -1299,6 +1302,10 @@ class _ImageLane:
                 shas.add(keys.clean_sha256)
                 digests = {keys.digest, keys.own_digest}
             try:
+                # the image's first query: the pool's checkout (its pre-ping a
+                # round trip no statement event spans) is its "db", as unpipelined
+                with timed(self._timings, "db"):
+                    db.connection()
                 footprint = seed_footprint(db, shas=shas, digests=digests)
             except BaseException:
                 self._registered = True
@@ -1306,6 +1313,7 @@ class _ImageLane:
                 raise
             # the seed reads its gallery link by the product and the URL
             footprint.add(f"gallery {self._item.product_id} {self._item.url or ''}")
+        with self._timings.stage("claim_register"):
             self._claim, waits = self._run.flow.claims.register(self._index, footprint, since)
             self._registered = True
         with self._timings.stage("turn_wait"):

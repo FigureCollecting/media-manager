@@ -254,6 +254,9 @@ class FigureGallery(Base):
     __table_args__ = (
         UniqueConstraint("figure_id", "source_url", name="uq_figure_source_url"),
         Index("ix_figure_galleries_figure_id", "figure_id"),
+        #: An image's origins are read by image_id for every copy judged
+        #: (app.publication.gallery_origins; migration 0009).
+        Index("ix_figure_galleries_image_id", "image_id"),
     )
 
 
