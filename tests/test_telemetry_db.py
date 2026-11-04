@@ -12,13 +12,19 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import subprocess
+import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from app import db as configured_db
 from app.cli import display_copy as cli
+from app.cli import mask_batch as mb
+from app.cli import mask_report
+from app.cli import masks as masks_cli
 from app.object_store import LocalObjectStore
 from app.telemetry import db as tdb
 from app.workers import display_copy as dc
@@ -31,6 +37,10 @@ from test_display_copy import STORE, T0, _photo, _pid, _queue, _Raw
 from test_display_copy_cli import _sandbox
 from test_display_feed import QueueSpine, _sync
 from test_display_feed import _event as feed_event
+from test_mask_batch import _line as worklist_line
+from test_mask_report_cli import _sandbox as report_sandbox
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +136,89 @@ def test_the_display_cli_names_its_connections_with_its_command_and_run(
     lines = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.strip()]
     run_id = next(x for x in lines if x["event"] == "job.start")["run_id"]
     assert tdb.connection_name() == f"mm-display/display-status/{run_id}"
+
+
+def _replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.delenv("SPINE_MEDIA_URL", raising=False)
+    sandbox, _ = report_sandbox(tmp_path)
+    return mask_report.main(["--sandbox", sandbox, "--dry-run"])
+
+
+def _batch(tmp_path: Path, _monkeypatch: pytest.MonkeyPatch) -> int:
+    worklist = tmp_path / "bad.jsonl"
+    worklist.write_text(worklist_line("Z" * 64, 0) + "\n")  # refused once the run is named
+    return mb.main(["run", "--worklist", str(worklist), "--no-residential-check", "--dry-run"])
+
+
+def _masks(tmp_path: Path, _monkeypatch: pytest.MonkeyPatch) -> int:
+    sandbox = str(tmp_path / "sandbox")
+    return masks_cli.main(["--sandbox", sandbox, "revoke-store", " ", "--apply"])  # refused
+
+
+@pytest.mark.parametrize(
+    ("run", "named"),
+    [
+        (_replay, "mm-report/replay"),
+        (_batch, "mask-batch/batch"),
+        (_masks, "media-masks/revoke-store"),
+    ],
+    ids=["mm-report", "mask-batch", "media-masks"],
+)
+def test_each_job_names_its_connections_with_its_service_job_and_run(
+    run: Callable[[Path, pytest.MonkeyPatch], int],
+    named: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The replay, the WSL batch and the masks commands: pg_stat_activity
+    tells them apart by name (the replay shares media_report with the sync;
+    the batch shares media with the API and the worker)."""
+    run(tmp_path, monkeypatch)
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.strip()]
+    run_id = next(x for x in lines if x["event"] == "job.start")["run_id"]
+    assert tdb.connection_name() == f"{named}/{run_id}"
+
+
+@pytest.mark.parametrize(
+    ("starts", "service", "job"),
+    [
+        ("import app.main", "media-api", "http"),
+        ("import app.derivative_main", "media-origin", "http"),
+        (
+            "from app.telemetry.celery import setup_logging; setup_logging()",
+            "media-worker",
+            "celery",
+        ),
+    ],
+    ids=["media-api", "media-origin", "media-worker"],
+)
+def test_each_server_names_its_connections_with_its_service_and_host(
+    starts: str, service: str, job: str
+) -> None:
+    """The API and the origin (named as their module loads) and the celery
+    worker (its setup_logging signal), each started in a process of its own:
+    the name APPLY.md's read-back looks for, the pod's host for its run."""
+    probe = f"{starts}\nfrom app.telemetry import db\nprint('NAME', db.connection_name())"
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=REPO_ROOT, capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    names = [line[5:] for line in out.stdout.splitlines() if line.startswith("NAME ")]
+    assert names == [tdb.application_name(service, job)]
+
+
+def test_the_mask_batchs_own_pool_names_its_connections(tmp_path: Path) -> None:
+    """The batch's run opens a pool sized for its writers: named as app.db's."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}", pool_size=2)
+    sized = mb._sized(Session(engine), 4)  # noqa: SLF001
+    try:
+        assert sized.get_bind() is not engine
+        assert event.contains(sized.get_bind(), "do_connect", tdb._named)  # noqa: SLF001
+    finally:
+        sized.close()
+        sized.get_bind().engine.dispose()
+        engine.dispose()
 
 
 # --------------------------------------------------------------------------
