@@ -26,9 +26,6 @@ coverage.xml
 # Env
 .env
 
-# Poetry
-poetry.lock
-
 # Local data
 data/
 uploads/
