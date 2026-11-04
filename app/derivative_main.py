@@ -65,6 +65,7 @@ from .db import get_db
 from .models import PublicObject
 from .object_store import ObjectStore, S3ObjectStore
 from .publication import servable, store_revocations
+from .telemetry.db import name_connections
 from .telemetry.http import AccessLogMiddleware
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ def _bare(status: int) -> Response:
 
 SERVICE = "media-origin"
 telemetry.start_tracing(SERVICE)
+name_connections(SERVICE, "http")  # MEDIADB (U8): pg_stat_activity names the pod
 #: The http.in lines' logger: one line per request, the template as call (never the sha a client sent).
 LOG = telemetry.Logger(service=telemetry.service_name(SERVICE))
 

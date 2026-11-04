@@ -27,6 +27,7 @@ from app.spine import display_feed as feed
 from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
 from app.spine.media_v1 import media_pb2
 from app.workers.mask_seed import CLEAN_PIPELINE_VERSION
+from sqlalchemy import event as sa_event
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -217,6 +218,15 @@ def _event(lines: list[dict[str, Any]], name: str) -> dict[str, Any]:
     return next(line for line in lines if line["event"] == name)
 
 
+#: the SQL a phase's line carries (MEDIADB U8: tests/test_telemetry_db.py)
+SQL_KEYS = ("db_seconds", "db_statements", "db_rows")
+
+
+def _counts(lines: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    """The ``name`` line's own counts, its SQL's left out."""
+    return {k: v for k, v in _event(lines, name).items() if k not in SQL_KEYS}
+
+
 # --------------------------------------------------------------------------
 # enqueue
 # --------------------------------------------------------------------------
@@ -359,6 +369,96 @@ def test_a_new_depiction_of_a_seeded_original_puts_it_back_to_pending(
     assert _event(lines, "reported")["relink"] == 0  # the enqueue sent it back, not the report
     assert db_session.get(DisplayOriginal, origin).state == "pending"
     assert db_session.scalar(select(func.count()).select_from(DisplayDepiction)) == 2
+
+
+#: The feed's count of the pending originals, as SQLAlchemy sends it.
+PENDING_COUNT = re.compile(
+    r"^SELECT count\(\*\) AS \w+ FROM display_originals WHERE display_originals\.state = \?$"
+)
+
+
+def _pending_counts(db: Session, run: Callable[[], Any]) -> int:
+    seen: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_: Any) -> None:
+        seen.append(" ".join(statement.split()))
+
+    engine = db.get_bind()
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        run()
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+    return sum(1 for s in seen if PENDING_COUNT.match(s))
+
+
+def test_the_enqueue_counts_the_pending_originals_once_not_every_round(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """MEDIADB (M-3): the count is read once, before the first lease, and
+    kept by the rounds themselves; the done line reads it once more (the
+    queue's lag). It was read again after every round (up to 200 a run)."""
+    fake, url = spine
+    for n in range(5):
+        fake.depict_full(sha(f"c{n}"), seen=T0 - dt.timedelta(minutes=n))
+    out: list[tuple[int, list[dict[str, Any]]]] = []
+
+    counts = _pending_counts(db_session, lambda: out.append(_sync(db_session, url, lease_items=1)))
+
+    code, lines = out[0]
+    assert code == feed.EXIT_DONE
+    assert _event(lines, "enqueued")["rounds"] == 6  # five rows, one a round, then the end
+    assert counts == 2
+    assert _event(lines, "enqueued")["pending_originals"] == 5
+    assert _event(lines, "done")["pending_originals"] == 5
+
+
+def test_the_high_water_counts_originals_made_pending_never_depictions(
+    db_session: Session, spine: tuple[QueueSpine, str]
+) -> None:
+    """The rounds count what they make pending: a new original once however
+    many of its depictions come, a seeded one sent back by a new depiction,
+    and nothing for a depiction of one pending already. So the run stops
+    at the high water exactly where a fresh count stops it (the audit's
+    ``pending += new`` counted depictions and stopped a round early)."""
+    fake, url = spine
+    x, y, seeded, z = sha("x"), sha("y"), sha("s"), sha("z")
+    db_session.add(
+        DisplayOriginal(
+            origin_sha256=seeded,
+            storage_key=_key(seeded),
+            codec="identity",
+            first_seen_at=T0 - dt.timedelta(days=1),
+            state="seeded",
+        )
+    )
+    db_session.flush()
+    db_session.add(
+        DisplayDepiction(
+            product_image_id=str(uuid.uuid4()),
+            origin_sha256=seeded,
+            product_id=str(uuid.uuid4()),
+            origin_url="https://img.store.example/s.jpg",
+            source_site="amiami",
+            first_seen_at=T0 - dt.timedelta(days=1),
+            linked_at=T0 - dt.timedelta(days=1),
+            reported_at=T0 - dt.timedelta(days=1),
+            outcome="derived",
+        )
+    )
+    db_session.commit()
+    # two a round, newest first: (x, x), (y, x), (seeded, z)
+    for minutes, origin in enumerate((x, x, y, x, seeded, z)):
+        fake.depict_full(origin, seen=T0 - dt.timedelta(minutes=minutes))
+
+    code, lines = _sync(db_session, url, lease_items=2, high_water=3)
+
+    assert code == feed.EXIT_DONE
+    enqueued = _event(lines, "enqueued")
+    assert (enqueued["why"], enqueued["rounds"], enqueued["new_depictions"]) == ("high_water", 3, 6)
+    assert enqueued["pending_originals"] == 4
+    pending = select(func.count()).where(DisplayOriginal.state == "pending")
+    assert db_session.scalar(pending) == 4
 
 
 def test_an_undeclared_order_is_refused_by_the_spine(spine: tuple[QueueSpine, str]) -> None:
@@ -664,7 +764,7 @@ def test_reports_stop_at_their_share_of_the_budget_and_the_run_still_enqueues_an
     code, lines = _timed_sync(db_session, url, clock, budget_seconds=1500)
 
     assert code == feed.EXIT_DONE
-    assert _event(lines, "reported") == {
+    assert _counts(lines, "reported") == {
         "event": "reported",
         **dict.fromkeys(REPORTED_KEYS, 0),
         "derived": 2,
@@ -702,7 +802,7 @@ def test_a_run_within_its_budget_reports_every_row_as_before(
 
     assert code == feed.EXIT_DONE
     assert [line["event"] for line in lines] == ["reported", "enqueued", "done"]
-    assert _event(lines, "reported") == {
+    assert _counts(lines, "reported") == {
         "event": "reported",
         **dict.fromkeys(REPORTED_KEYS, 0),
         "derived": 4,

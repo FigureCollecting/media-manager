@@ -130,6 +130,7 @@ from sqlalchemy.orm import Session
 
 from ..models import DisplayDepiction, DisplayFeedWalk, DisplayOriginal, PublicObject
 from ..models import Image as ImageModel
+from ..telemetry.db import DbTally
 from ..workers.mask_seed import CLEAN_PIPELINE_VERSION
 from . import messages as msg
 from .copies import measured_appearance, reported_copy
@@ -579,12 +580,15 @@ def _skip_reason(image: media_pb2.PendingImage) -> str | None:
     return None
 
 
-def _queue_one(db: Session, image: media_pb2.PendingImage, seen: dt.datetime) -> bool:
-    """Queue one leased row; False when it was queued already."""
+def _queue_one(db: Session, image: media_pb2.PendingImage, seen: dt.datetime) -> bool | None:
+    """Queue one leased row: None when it was queued already, else whether
+    its ORIGINAL became pending by it (new, or seeded with this depiction's
+    link still to write) -- what the high water counts, never depictions."""
     if db.get(DisplayDepiction, image.product_image_id) is not None:
-        return False
+        return None
     origin = image.origin_sha256.hex()
     original = db.get(DisplayOriginal, origin)
+    became_pending = original is None
     if original is None:
         db.add(
             DisplayOriginal(
@@ -600,6 +604,7 @@ def _queue_one(db: Session, image: media_pb2.PendingImage, seen: dt.datetime) ->
     else:
         if original.state == "seeded":  # its new depiction's gallery link is still to write
             original.state = "pending"
+            became_pending = True
         if seen > _utc(original.first_seen_at):
             original.first_seen_at = seen
     db.add(
@@ -613,7 +618,7 @@ def _queue_one(db: Session, image: media_pb2.PendingImage, seen: dt.datetime) ->
             first_seen_at=seen,
         )
     )
-    return True
+    return became_pending
 
 
 def _pending(db: Session) -> int:
@@ -656,6 +661,13 @@ def enqueue(
     # once this run's pass from the end meets rows it has queued already.
     walking = walk is None
     after: Place | None = None  # where the next lease goes on after (None: the end)
+    # MEDIADB (M-3): counted once, then kept by the rounds, each adding the
+    # originals it made pending. While it runs nothing else makes one pending
+    # but an operator's requeue (the report's reseed and relink ran before
+    # the count; the seeder's settle only keeps a claimed one pending, and
+    # takes the others out), so the count is never low, at most high by what
+    # the seeder settled meanwhile. A fresh count after every round re-read
+    # the pages each claim and settle had just made not all-visible.
     pending = _pending(db)
     why = "empty"
     while True:
@@ -699,10 +711,13 @@ def enqueue(
             reason = _skip_reason(image)
             if reason is not None:
                 skipped[reason] += 1
-            elif _queue_one(db, image, instant):
-                new += 1
-            else:
+                continue
+            queued = _queue_one(db, image, instant)
+            if queued is None:
                 already += 1
+            else:
+                new += 1
+                pending += queued
         counts["new_depictions"] += new
         counts["already"] += already
         last = Place.of(images[-1])
@@ -736,7 +751,6 @@ def enqueue(
             walk = _move_walk(db, walk, config.order, found, now)
             walking, after = True, found
         db.commit()
-        pending = _pending(db)
     place = _walk_place(walk)
     if (
         why in ("rounds", "budget")
@@ -820,16 +834,38 @@ def run_sync(
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
-    """REPORT, then ENQUEUE, then PURGE; the exit status."""
+    """REPORT, then ENQUEUE, then PURGE; the exit status. Each phase's line
+    carries its SQL's seconds, statements and rows; the run's last line the
+    run's (MEDIADB, U8)."""
     start = monotonic()
+    tally = DbTally(db.get_bind().engine)
+    try:
+        return _run_sync(db, connect, config, emit, now, monotonic, start, tally)
+    finally:
+        tally.close()
+
+
+def _run_sync(
+    db: Session,
+    connect: Callable[[], SpineMediaClient],
+    config: FeedConfig,
+    emit: Callable[[dict[str, Any]], None],
+    now: Callable[[], dt.datetime],
+    monotonic: Callable[[], float],
+    start: float,
+    tally: DbTally,
+) -> int:
+    def phase(line: dict[str, Any]) -> None:
+        emit({**line, **tally.take()} if line.get("event") in ("reported", "enqueued") else line)
+
     client = connect()
     try:
         try:
             # the REPORT's share of the run's budget, then the ENQUEUE what is left
             reports_until = start + config.budget_seconds * REPORT_SHARE
-            reported = report(db, client, config, emit, now(), monotonic, reports_until)
+            reported = report(db, client, config, phase, now(), monotonic, reports_until)
             queued = enqueue(
-                db, client, config, emit, monotonic, now(), start + config.budget_seconds
+                db, client, config, phase, monotonic, now(), start + config.budget_seconds
             )
         except (OperationalError, ProgrammingError) as exc:
             # the database down (resumable) or refusing the role (a grant, the schema): never a traceback
@@ -849,10 +885,10 @@ def run_sync(
                 f"database: IntegrityError: another sync wrote the row first (two at once?): {said}",
             ) from exc
     except _Stop as stop:
-        emit({"event": "stopped", "why": stop.why})
+        emit({"event": "stopped", "why": stop.why, **tally.totals()})
         return stop.code
     purged = purge(db, config, now())
-    emit({"event": "done", "purged": purged, **_lag(db)})
+    emit({"event": "done", "purged": purged, **_lag(db), **tally.totals()})
     if reported["refused"] or reported["failed_held"] or queued["stalled"]:
         return EXIT_REFUSED
     return EXIT_DONE

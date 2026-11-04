@@ -21,11 +21,13 @@ from .routes.image_routes import router as image_router
 from .routes.search_routes import router as search_router
 from .routes.serve_routes import router as serve_router
 from .routes.tag_routes import router as tag_router
+from .telemetry.db import name_connections
 from .telemetry.http import AccessLogMiddleware
 
 SERVICE = "media-api"
 # Tracing first, before any request: every line under a request carries its trace_id.
 telemetry.start_tracing(SERVICE)
+name_connections(SERVICE, "http")  # MEDIADB (U8): pg_stat_activity names the pod
 #: The http.in lines' logger; configure() routes Python's logging to the same shape.
 LOG = telemetry.Logger(service=telemetry.service_name(SERVICE))
 

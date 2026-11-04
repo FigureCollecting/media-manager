@@ -362,6 +362,9 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
 
             data = resp.content
             sha = sha256_bytes(data)
+            # MEDIADB (M-2): the digest goes in with the image's INSERT; set
+            # after it, it was an UPDATE of an indexed column, never HOT
+            digest = pixel_digest(data)
 
             # Content-addressable dedup: check if Image with this hash exists
             existing_img = db.execute(
@@ -393,6 +396,7 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
 
                 new_img = ImageModel(
                     sha256=sha,
+                    pixel_sha256=digest,
                     phash=p_hash,
                     mime=mime,
                     width=width,
@@ -434,7 +438,7 @@ def ingest_gallery_images(*, figure_id: str, images: list[dict[str, Any]]) -> No
             # Every capture -- a new image or one another route recorded --
             # is linked behind every clean copy of its picture, whichever
             # came first (MASK-1: its masks are judged over all of them).
-            link_capture(db, image, pixel_digest(data))
+            link_capture(db, image, digest)
 
             # Create FigureGallery record
             gallery_entry = FigureGallery(

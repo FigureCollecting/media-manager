@@ -55,6 +55,7 @@ from ..spine.media_client import (
     open_channel,
     target_from_url,
 )
+from ..telemetry.db import name_connections
 from ..telemetry.events import EventLines
 from ..workers import display_copy as seeder
 from ..workers.raw_source import RawStoreConfigError, ReadOnlyStore, raw_store_from_env
@@ -266,10 +267,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     log = telemetry.configure(SERVICE)
     telemetry.start_tracing(SERVICE)
     lines = EventLines(log, summarize=_SUMMARIZED)
+
+    def body(run: telemetry.JobRun) -> int:
+        # MEDIADB (U8): pg_stat_activity names this command and run
+        name_connections(SERVICE, f"display-{args.command}", run.run_id)
+        return _COMMANDS[args.command](args, lines)
+
     try:
         return telemetry.run_job(
             f"display-{args.command}",
-            lambda run: _COMMANDS[args.command](args, lines),
+            body,
             logger=log,
             counts=lambda code: {**lines.summary, "exit": code},
             ok=lambda code: code == 0,

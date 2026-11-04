@@ -160,6 +160,7 @@ from .. import telemetry
 from ..config import get_settings
 from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
+from ..telemetry.db import name_connections, name_engine
 from ..telemetry.events import EventLines
 from ..telemetry.tracing import NULL_ITEM, Item
 from ..workers.image_limits import ImageLimitError
@@ -1603,6 +1604,7 @@ def _sized(db: Session, writers: int) -> Session:
         pool_pre_ping=True,  # as app.db's engine
         pool_recycle=-1,
     )
+    name_engine(sized)  # its connections named as app.db's are
     db.close()
     return Session(sized, autoflush=db.autoflush, expire_on_commit=db.expire_on_commit)
 
@@ -2156,6 +2158,7 @@ _SUMMARIZED = ("plan", "start", "done", "stopped", "gave_up", "circuit_open")
 def _run(
     args: argparse.Namespace, emit: Callable[[dict[str, Any]], None], run: telemetry.JobRun
 ) -> int:
+    name_connections(SERVICE, "batch", run.run_id)  # MEDIADB (U8): pg_stat_activity's name
     try:
         items, skipped = read_worklists(args.worklist)
         windows = parse_windows(args.busy_windows)

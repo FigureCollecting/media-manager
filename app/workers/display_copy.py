@@ -110,6 +110,7 @@ from ..models import Image as ImageModel
 from ..object_store import ObjectStore
 from ..publication import gallery_origins, judged_origins, mask_refusal, store_revocations
 from ..spine.copies import measured_appearance, reported_copy
+from ..telemetry.db import DbTally
 from .grounding import AlphaGrounding
 from .image_limits import ImageLimitError, check_image
 from .mask import plain_appearance
@@ -429,6 +430,9 @@ def seed_one(
             .order_by(DisplayDepiction.product_id, DisplayDepiction.product_image_id)
         ).scalars()
     )
+    # MEDIADB (M-1): no transaction open across the bucket's GET, the decode
+    # and the wait for decode units (the session keeps what it loaded)
+    db.commit()
     if not depictions:
         return SeedResult("stuck", "no_depictions")
     try:
@@ -474,6 +478,7 @@ def _seed_and_measure(
             withdrawing = _withdraws_a_mask(db, data, origin, unlinked, config.grants)
             if withdrawing is not None:
                 return SeedResult("held", f"would_withdraw_mask:{withdrawing}")
+            db.commit()  # the check only read: none open across the seed's encode and PUTs
         recording = _Recording(media)
         by_product: dict[str, list[DisplayDepiction]] = {}
         for d in unlinked:
@@ -499,6 +504,7 @@ def _seed_and_measure(
                     own_grounding=row.own_alpha_grounding,
                 )
             else:
+                db.commit()  # read only since the seed: none open across a GET and the measure
                 appearance, grounding = plain_appearance(recording.get(obj.storage_key))
                 look.update(
                     thumbhash=appearance.thumbhash,
@@ -585,6 +591,21 @@ class _Run:
         self.units = _Units(config.decode_units)
         self.owner = config.owner or f"display-seed/{socket.gethostname()}/{os.getpid()}"
         self.hold_until = now() + dt.timedelta(seconds=config.budget_seconds + config.claim_seconds)
+        #: MEDIADB (U8): each original's SQL on its item line, the run's on its last
+        self.tally: DbTally | None = None
+
+    def _tally(self, db: Session) -> DbTally:
+        with self.lock:  # one tally for the run: every worker's session is on one engine
+            if self.tally is None:
+                self.tally = DbTally(db.get_bind().engine)
+            return self.tally
+
+    def sql(self) -> dict[str, float | int]:
+        return (
+            self.tally.totals()
+            if self.tally is not None
+            else {"db_seconds": 0.0, "db_statements": 0, "db_rows": 0}
+        )
 
     def over_budget(self) -> bool:
         return self.monotonic() - self.start >= self.config.budget_seconds
@@ -593,7 +614,7 @@ class _Run:
         with self.lock:
             return self.stop is not None
 
-    def record(self, result: SeedResult) -> None:
+    def record(self, result: SeedResult, sql: Mapping[str, float | int] | None = None) -> None:
         c = self.config
         with self.lock:
             self.counts[result.kind] += 1
@@ -616,10 +637,13 @@ class _Run:
             ):
                 self.stop = (EXIT_BREAKER, "failed_rate")
         if result.kind in ("failed", "held", "stuck", "error", "config"):
-            self.emit({"event": "item", "kind": result.kind, "reason": result.reason})
+            self.emit(
+                {"event": "item", "kind": result.kind, "reason": result.reason, **(sql or {})}
+            )
 
     def worker(self, sessions: Callable[[], Session], raw: ObjectStore, media: ObjectStore) -> None:
         db = sessions()
+        tally = self._tally(db)
         try:
             while not self.stopping():
                 if self.over_budget():
@@ -662,7 +686,7 @@ class _Run:
                     max_attempts=self.config.max_attempts,
                     hold_until=self.hold_until,
                 )
-                self.record(result)
+                self.record(result, tally.take())  # its claim, seed and settle
         except Exception as exc:  # noqa: BLE001 -- the claim or the settle: the run stops, never ends "done"
             with contextlib.suppress(Exception):  # the connection may be gone; the stop says so
                 db.rollback()
@@ -704,10 +728,13 @@ def run_seed(
             t.start()
         for t in threads:
             t.join()
-    summary = {
+    summary: dict[str, Any] = {
         k: run.counts[k]
         for k in ("seeded", "failed", "held", "stuck", "error", "outage", "interrupted")
     }
+    summary.update(run.sql())
+    if run.tally is not None:
+        run.tally.close()
     if run.stop is not None:
         code, why = run.stop
         emit({"event": "stopped", "why": why, **summary})

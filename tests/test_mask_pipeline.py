@@ -585,7 +585,8 @@ def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_co
     main.close()
     engine.dispose()
     assert media.most == 2  # an image's original and clean copy at once
-    assert len(at_commit) == 6 and set(at_commit) == {0}  # its seed's and its mask's
+    # its seed's two (its read's, before any PUT: MEDIADB; its rows') and its mask's
+    assert len(at_commit) == 9 and set(at_commit) == {0}
     (chunk,) = (e for e in events if e["event"] == "chunk")
     assert chunk["counts"] == {"ok": 3}
 

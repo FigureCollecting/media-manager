@@ -340,6 +340,43 @@ def _original_key(sha256: str, mime: str) -> str:
     return f"{sha256[:2]}/{sha256[2:4]}/{sha256}.{ext}"
 
 
+class _Stored(NamedTuple):
+    """An original PUT to the media bucket, as its image row records it."""
+
+    key: str
+    mime: str
+    width: int
+    height: int
+    phash: str
+
+
+def _store_original(store: ObjectStore, original: bytes, sha256: str) -> _Stored:
+    mime = detect_mime(original)
+    with Image.open(io.BytesIO(original)) as probe:
+        width, height = probe.size
+    key = _original_key(sha256, mime)
+    store.put(key, original, mime)
+    return _Stored(key, mime, width, height, compute_phash(original))
+
+
+class _Clean(NamedTuple):
+    """A clean copy PUT to the media bucket, not yet registered."""
+
+    data: bytes
+    mime: str
+    sha256: str
+    own_digest: str
+    key: str
+
+
+def _store_clean(store: ObjectStore, picture: Image.Image, original: bytes) -> _Clean:
+    data, mime = _encode(picture, original)
+    sha = hashlib.sha256(data).hexdigest()
+    key = derived_key(sha, mime)
+    store.put(key, data, mime)
+    return _Clean(data, mime, sha, pixel_digest(data), key)
+
+
 def seed_clean_image(
     db: Session,
     store: ObjectStore,
@@ -366,24 +403,43 @@ def seed_clean_image(
     every clean copy of it (``public_object_images``), in whichever order
     they arrive, so each copy and its mask are judged over all of them: a
     soft delete or an ineligible origin under any capture -- the one whose
-    bytes ARE the copy included -- reaches every copy (app.publication)."""
+    bytes ARE the copy included -- reaches every copy (app.publication).
+
+    A TWIN. Pixels no registered copy shows, whose clean copy is
+    byte-identical to another original's (a bit the JPEG rounds away): that
+    copy exists, so the original is linked behind it as a capture of it, and
+    no second version names the copy's key (its unique key refused one).
+
+    SHORT TRANSACTIONS (MEDIADB, M-1). What the media DB holds of the
+    picture is read first and committed (with any read the caller left
+    open); the original and, when the picture has no copy, its clean copy
+    are encoded and PUT with no transaction open; then the rows are written
+    in one transaction, committed before it returns. Every PUT comes before
+    the row that names it; an object no row names is left only when another
+    seeder mints the picture's copy meanwhile (``seed_with_retry``'s race).
+    The image is inserted with its pixel digest (M-2: the column is
+    indexed, so an UPDATE after the INSERT was never HOT)."""
     check_image(original)  # MM-CAPS-1: refused before anything is hashed, stored or decoded
     orig_sha = hashlib.sha256(original).hexdigest()
+    picture = _picture(original)
+    digest = _digest(picture)
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
-    if image is None:
-        mime = detect_mime(original)
-        with Image.open(io.BytesIO(original)) as probe:
-            width, height = probe.size
-        key = _original_key(orig_sha, mime)
-        store.put(key, original, mime)
+    shown = bool(_copies_showing(db, digest, orig_sha))
+    db.commit()
+
+    stored = _store_original(store, original, orig_sha) if image is None else None
+    clean = None if shown else _store_clean(store, picture, original)
+
+    if stored is not None:
         image = ImageModel(
             sha256=orig_sha,
-            phash=compute_phash(original),
-            mime=mime,
-            width=width,
-            height=height,
+            pixel_sha256=digest,
+            phash=stored.phash,
+            mime=stored.mime,
+            width=stored.width,
+            height=stored.height,
             bytes=len(original),
-            storage_key=key,
+            storage_key=stored.key,
         )
         db.add(image)
         db.flush()
@@ -392,39 +448,39 @@ def seed_clean_image(
                 image_id=image.id,
                 version_no=1,
                 transform_spec={},
-                mime=mime,
-                width=width,
-                height=height,
+                mime=stored.mime,
+                width=stored.width,
+                height=stored.height,
                 bytes=len(original),
-                storage_key=key,
+                storage_key=stored.key,
                 visibility="private",
                 age_rating=0,
             )
         )
         db.flush()
-
-    picture = _picture(original)
-    digest = _digest(picture)
+    assert image is not None  # read above, or inserted now
     copies = link_capture(db, image, digest)
+    if not copies:
+        # none when it was read, or gone since: the copy these pixels mint
+        clean = clean or _store_clean(store, picture, original)
+        twin = db.get(PublicObject, clean.sha256)
+        if twin is not None and twin.kind == "sanitized":
+            copies = [twin]
+            _join_picture(db, {twin.sha256}, {image.id, *_captures_showing(db, digest)})
     if copies:
         obj = copies[0]
     else:
-        clean, clean_mime = _encode(picture, original)
-        clean_sha = hashlib.sha256(clean).hexdigest()
-        own = pixel_digest(clean)
-        cw, ch = picture.width, picture.height
-        key = derived_key(clean_sha, clean_mime)
-        store.put(key, clean, clean_mime)
+        assert clean is not None
         version = ImageVersion(
             image_id=image.id,
             version_no=2,
             derived_from_version=1,
             transform_spec={"derive_kind": "sanitized"},
-            mime=clean_mime,
-            width=cw,
-            height=ch,
-            bytes=len(clean),
-            storage_key=key,
+            mime=clean.mime,
+            width=picture.width,
+            height=picture.height,
+            bytes=len(clean.data),
+            storage_key=clean.key,
             visibility="public",
             age_rating=0,
         )
@@ -432,20 +488,22 @@ def seed_clean_image(
         db.flush()
         obj = register_public_object(
             db,
-            sha256=clean_sha,
+            sha256=clean.sha256,
             kind="sanitized",
-            mime=clean_mime,
-            size=len(clean),
-            width=cw,
-            height=ch,
-            storage_key=key,
+            mime=clean.mime,
+            size=len(clean.data),
+            width=picture.width,
+            height=picture.height,
+            storage_key=clean.key,
             image_version_id=version.id,
             pixel_sha256=digest,
-            own_pixel_sha256=own,
+            own_pixel_sha256=clean.own_digest,
         )
         # Photo first: every capture recorded earlier with these pixels or
         # the copy's own, whatever route recorded it, joins the new copy.
-        _join_picture(db, {obj.sha256}, {image.id, *_captures_showing(db, digest, own)})
+        _join_picture(
+            db, {obj.sha256}, {image.id, *_captures_showing(db, digest, clean.own_digest)}
+        )
 
     for origin in origins:
         url = origin.url or ""
