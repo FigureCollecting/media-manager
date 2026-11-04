@@ -347,6 +347,7 @@ def _withdraws_a_mask(
     added = _seeded_origins(db, origin_sha256, depictions)
     if all(classify_origin(o, grants, revoked) in MASKABLE for o in added):
         return None  # every origin it adds is maskable: no verdict can turn (and no decode)
+    db.commit()  # MEDIADB (M-1): its reads so far, none open across the decode and encode
     keys = picture_keys(data)
     shown = {c.sha256 for c in _copies_showing(db, keys.digest, origin_sha256)}
     shown |= {c.sha256 for c in _copies_showing(db, keys.own_digest, keys.clean_sha256)}

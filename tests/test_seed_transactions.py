@@ -40,6 +40,7 @@ from app.models import (
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore, ObjectStore
 from app.workers import display_copy as dc
+from app.workers import mask_seed
 from app.workers.mask_policy import ImageOrigin
 from app.workers.mask_seed import make_clean_copy, pixel_digest, seed_clean_image
 from app.workers.raw_source import ReadOnlyStore
@@ -47,8 +48,12 @@ from PIL import Image
 from sqlalchemy import event, func, select, text
 from sqlalchemy.orm import Session
 
-from test_display_copy import GRANTS, MFC_ITEM, STORE, T0, _photo, _pid, _queue, _Raw
+from test_display_copy import GRANTS, STORE, T0, _photo, _pid, _queue, _Raw
 from test_mask_ingest_capture import _ingest
+
+#: A store outside GRANTS: its origin is not maskable, so the withdraw check
+#: decodes the picture to judge it (an item photo of MFC's needs no decode).
+UNGRANTED = "https://cdn.unlisted.example/p/{n}.jpg"
 
 
 class _Watched:
@@ -169,13 +174,13 @@ def test_a_new_picture_is_read_and_written_with_no_transaction_open(
 def test_the_withdraw_check_commits_its_reads_before_the_seed_writes(
     db_session: Session, bucket: dict[str, Any]
 ) -> None:
-    """An MFC capture (not granted: the withdraw check judges the picture,
+    """A store outside the grants (the withdraw check judges the picture,
     reading the revocations, the origins and the copies): the seed's PUTs
     still come with no transaction open (the verifier's V1 left the check's
     reads open across them)."""
     db = db_session
     sha, key = bucket["raw"].put(_photo(2))
-    _queue(db, sha, key, depictions=[(_pid(2), _pid(102), MFC_ITEM.format(n=2), "mfc")])
+    _queue(db, sha, key, depictions=[(_pid(2), _pid(102), UNGRANTED.format(n=2), "unlisted")])
     raw, media = _stores(db, bucket)
 
     code, lines = _run(db, raw, media)
@@ -183,6 +188,34 @@ def test_the_withdraw_check_commits_its_reads_before_the_seed_writes(
     assert code == dc.EXIT_DONE and _done(lines)["seeded"] == 1
     assert len(media.calls) == 2
     assert raw.in_transaction() == [] and media.in_transaction() == []
+
+
+def test_no_decode_of_the_picture_runs_with_a_transaction_open(
+    db_session: Session, bucket: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store outside the grants: the withdraw check decodes the picture and
+    encodes its clean copy to judge it (picture_keys: 1.5 s at 24 MP), and
+    the seed decodes it again. Each decode comes with the session's reads committed:
+    the check's own reads (the revocations, the origins it would add) and,
+    for the seed's, the check's reads of the copies."""
+    db = db_session
+    decodes: list[bool] = []
+    decode = mask_seed._picture
+
+    def watched(original: bytes) -> Any:
+        decodes.append(db.in_transaction())
+        return decode(original)
+
+    monkeypatch.setattr(mask_seed, "_picture", watched)
+    sha, key = bucket["raw"].put(_photo(6))
+    _queue(db, sha, key, depictions=[(_pid(6), _pid(106), UNGRANTED.format(n=6), "unlisted")])
+    raw, media = _stores(db, bucket)
+
+    code, lines = _run(db, raw, media)
+
+    assert code == dc.EXIT_DONE and _done(lines)["seeded"] == 1
+    assert len(decodes) >= 2  # the withdraw check's and the seed's
+    assert decodes == [False] * len(decodes)
 
 
 def test_a_copy_read_back_for_its_appearance_is_read_with_no_transaction_open(
