@@ -2656,14 +2656,15 @@ def test_the_chunk_reports_where_each_images_seconds_go(
     minted = _item_records(tmp_path / "progress.jsonl")
     assert [set(r) for r in minted] == [_ITEM_KEYS] * 3
     assert [r["status"] for r in minted] == ["ok", "ok", "ok"]
-    # 5.5 s around the model (raw 1, seed 1, settle 3.5), plus BiRefNet's 2, 3, 7
-    assert [r["seconds"] for r in minted] == [7.5, 8.5, 12.5]
+    # 6 s around the model (raw 1, seed 1.5: its read's commit and its rows',
+    # MEDIADB; settle 3.5), plus BiRefNet's 2, 3, 7
+    assert [r["seconds"] for r in minted] == [8.0, 9.0, 13.0]
     assert [r["mask_seconds"] for r in minted] == [5.5, 6.5, 10.5]
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"ok": 3}
-    assert chunk["seconds_per_image"] == 9.5
-    assert chunk["median_seconds"] == 8.5
-    assert chunk["seconds_per_masked_image"] == 9.5
+    assert chunk["seconds_per_image"] == 10.0
+    assert chunk["median_seconds"] == 9.0
+    assert chunk["seconds_per_masked_image"] == 10.0
     assert chunk["mask_seconds_per_image"] == 7.5
     assert chunk["provider"] == "FakeExecutionProvider"
 
@@ -2678,7 +2679,7 @@ def test_the_chunk_reports_where_each_images_seconds_go(
         "analysis": 0.75,  # the appearances, unmasked and masked
         "encode": 0.625,  # the mask PNG
         "upload": 0.75,  # three PUTs: the original, its clean copy, the mask
-        "db": 1.0,  # the seed's commit and the mask row's
+        "db": 1.5,  # the seed's two commits (its read's, its rows') and the mask row's
     }
     assert chunk["stage_seconds_per_image"] == means
     assert list(chunk["stage_seconds_per_image"]) == list(means)
@@ -2763,15 +2764,17 @@ def test_no_database_second_escapes_the_stages(
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
     # every PUT is an upload (the seed's two, the mask's held or not), nothing else is
     assert [t.seconds["upload"] for t in made] == [0.75, 0.75, 0.5, 0.5]
-    # the seed keeps its own work alone (its clean copy's encode): none of its SQL
-    assert [t.seconds["seed"] for t in made] == [0.125] * 4
+    # the seed keeps its own work (its clean copy's encode) and the checkout
+    # of its write transaction (MEDIADB: its read committed before its PUTs,
+    # the pool's pre-ping no SQL event spans): none of its SQL
+    assert [t.seconds["seed"] for t in made] == [0.125 + 0.03125] * 4
     # the failed judgment's rollback and row (statements, commit) are the database's
     assert made[2].seconds["db"] > 0.875
     assert set(made[2].seconds) == {"fetch", "seed", "upload", "db"}
     (chunk,) = _events(events, "chunk")
     stages = chunk["stage_seconds_per_image"]
     assert stages["upload"] == 0.625
-    assert stages["seed"] == 0.125
+    assert stages["seed"] == round(0.125 + 0.03125, 3)  # the chunk's means are rounded
     assert stages["db"] > 1.0  # the statements and checkouts, beyond the two commits
     # each mean is over the images that ran its stage, and says how many did
     assert chunk["stage_images"] == {
@@ -2809,12 +2812,14 @@ def test_the_seed_keeps_its_own_work_and_its_sql_is_the_databases(
     assert record["status"] == "ok"
     (timings,) = made
     assert timings.seconds == {
-        # 34 statements (the lookup, the seed's 21, the lane's 12), two commits
-        # (the seed's, the mask row's) and two checkouts (the lookup's, the lane's)
-        "db": 34 * 0.0625 + 2 * 0.5 + 2 * 0.03125,
+        # 35 statements (the lookup, the seed's 22, the lane's 12), three
+        # commits (the seed's read's and rows', the mask row's) and two
+        # checkouts (the lookup's, the lane's)
+        "db": 35 * 0.0625 + 3 * 0.5 + 2 * 0.03125,
         "fetch": 1.0,
         "upload": 0.75,
-        "seed": 0.125,
+        # its clean copy's encode, and its write transaction's checkout
+        "seed": 0.125 + 0.03125,
         "readback": 0.125,
         "base_keep": 1.25,
         "inference": 2.0,
@@ -2875,8 +2880,8 @@ def test_a_stage_that_never_ran_is_omitted_not_zero(
     assert mb.run_batch([raw.add(4, url=PICTURE)], mb.BatchConfig(), rt) == 0
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"ineligible": 1}
-    # the seed ran (its own work free here); db: its commit and the row's
-    staged = {"fetch": 1.0, "seed": 0.0, "upload": 0.5, "db": 1.0}
+    # the seed ran (its own work free here); db: its two commits and the row's
+    staged = {"fetch": 1.0, "seed": 0.0, "upload": 0.5, "db": 1.5}
     assert chunk["stage_seconds_per_image"] == staged
     assert chunk["stage_median_seconds"] == staged
     assert chunk["stage_images"] == dict.fromkeys(staged, 1)
@@ -2930,7 +2935,7 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
     assert mb.run_batch(items, mb.BatchConfig(), rt) == 1  # done, with failures
     (chunk,) = _events(events, "chunk")
     assert chunk["counts"] == {"interrupted": 1, "failed": 1}
-    assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 6.5]
+    assert [r["seconds"] for r in _item_records(tmp_path / "progress.jsonl")] == [4.0, 7.0]
     assert chunk["stage_seconds_per_image"] == {
         "fetch": 2.5,  # (4 + 1) / 2
         "seed": 0.0,
@@ -2939,7 +2944,8 @@ def test_a_failed_images_seconds_are_staged_up_to_its_failure(
         "base_keep": 1.25,  # the donors ran first
         "analysis": 0.375,  # the unmasked appearance only
         "upload": 0.5,  # the seed's two PUTs
-        "db": 0.625,  # (0 + the seed's commit, the rollback and the failed row's commit) / 2
+        # (0 + the seed's two commits, the rollback and the failed row's commit) / 2
+        "db": 0.875,
     }
     assert chunk["stage_images"] == {
         "fetch": 2, "seed": 1, "readback": 1, "inference": 1, "base_keep": 1, "analysis": 1,
@@ -2973,8 +2979,9 @@ def test_the_rollback_after_a_failure_is_a_database_second(
     (record,) = _item_records(tmp_path / "progress.jsonl")
     assert record["reason"] == f"{where}:ConnectionError"
     (timings,) = made
-    # the rollback (the lookup costing nothing here), after a lane's the seed's commit too
-    assert timings.seconds["db"] == 0.375 + (0.5 if where == "settle" else 0.0)
+    # the rollback (the lookup costing nothing here), after a lane's the seed's
+    # two commits too (its read's and its rows')
+    assert timings.seconds["db"] == 0.375 + (2 * 0.5 if where == "settle" else 0.0)
     assert sum(timings.seconds.values()) == record["seconds"]
 
 
@@ -3008,13 +3015,13 @@ def test_the_batch_row_read_again_after_a_rollback_is_a_database_second(
     assert [r["status"] for r in records] == ["interrupted", "ok"]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
     # the read again is the database's, with the checkout of the transaction
-    # it opens: 35 statements (the batch row, the lookup, the seed's 21, the
-    # lane's 12), two commits (the seed's, the mask row's) and two checkouts
-    # (this read's, the lane's); the raw GET alone is the fetch, and the seed
-    # keeps none of it
-    assert made[1].seconds["db"] == 35 * 0.0625 + 2 * 0.5 + 2 * 0.03125
+    # it opens: 36 statements (the batch row, the lookup, the seed's 22, the
+    # lane's 12), three commits (the seed's read's and rows', the mask row's)
+    # and two checkouts (this read's, the lane's); the raw GET alone is the
+    # fetch, and the seed keeps only its write transaction's checkout
+    assert made[1].seconds["db"] == 36 * 0.0625 + 3 * 0.5 + 2 * 0.03125
     assert made[1].seconds["fetch"] == 1.0
-    assert made[1].seconds["seed"] == 0.0
+    assert made[1].seconds["seed"] == 0.03125
 
 
 def _recaptured(raw: _Raw, n: int) -> mb.WorkItem:
@@ -3051,10 +3058,11 @@ def test_the_lookup_after_a_copy_settled_by_another_original_is_a_database_secon
     ]
     assert [round(sum(t.seconds.values()), 3) for t in made] == [r["seconds"] for r in records]
     # the database holds 18 statements (the lookup, the seed's 15, the lane's
-    # candidate query, the late lookup) and the seed's commit; the seed keeps
-    # none; the original's PUT is the upload (its picture needs no clean copy)
+    # candidate query, the late lookup) and the seed's two commits (its
+    # read's, its rows'); the seed keeps none; the original's PUT is the
+    # upload (its picture needs no clean copy)
     assert made[1].seconds == {
-        "db": 18 * 0.0625 + 0.5,
+        "db": 18 * 0.0625 + 2 * 0.5,
         "fetch": 1.0,
         "upload": 0.25,
         "seed": 0.0,

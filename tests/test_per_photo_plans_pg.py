@@ -16,6 +16,15 @@ code runs is captured as it reaches the driver and EXPLAINed with its own
 parameters: a read of a media table must be an index probe bounded on the
 index's leading column (a Seq Scan, a hashed subquery over the whole table,
 or an index walked end to end fails). Hosts without docker skip.
+
+MEDIADB (U12a): the PLAN GUARD for the display lane and the replay as well
+-- the seeder's whole seed of one original, the sync's report, enqueue and
+purge, the replay's plan and its per-chunk reads -- at prod's planner cost
+(random_page_cost 4) and at U5's (1.1). A whole read is allowed only where
+REGISTRY names it (a per-run read, with why, and until when: an entry past
+its date warns in every run until someone looks again), never in the checker.
+And the seeder's transactions are short: no session of it sits idle inside
+one across its bucket calls (M-1).
 """
 
 from __future__ import annotations
@@ -29,14 +38,21 @@ import re
 import shutil
 import string
 import subprocess
+import sys
+import threading
 import time
+import uuid
+import warnings
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from app.models import (
     DisplayDepiction,
+    DisplayOriginal,
     FigureGallery,
     ImageMask,
     ImageVersion,
@@ -47,6 +63,10 @@ from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore
 from app.publication import gallery_origins, mask_refusal
 from app.spine import copies
+from app.spine import display_feed as feed
+from app.spine.media_client import RetryPolicy, SpineMediaClient, open_channel
+from app.spine.replay import _dead_copies, load_plan, make_batches
+from app.telemetry import db as tdb
 from app.workers import display_copy as dc
 from app.workers.mask import MASK_PIPELINE_VERSION
 from app.workers.mask_job import (
@@ -63,11 +83,15 @@ from app.workers.mask_seed import (
     seed_with_retry,
 )
 from app.workers.matting import StubMattingBackend
+from app.workers.raw_source import ReadOnlyStore
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from sqlalchemy import Engine, Select, create_engine, event, func, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from spine_fakes import serve
+from test_display_copy import GRANTS
+from test_display_feed import QueueSpine
 from test_migration_chain_replay import _run_alembic
 
 pytestmark = [
@@ -83,6 +107,12 @@ THROWAWAY = [
     *("-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"),
     *("-c", "shared_buffers=512MB", "-c", "max_wal_size=8GB"),
 ]
+#: the shared VM's bound on a test's container (as every measurement here)
+LIMITS = ["--memory=2g", "--memory-swap=2g", "--pids-limit=512"]
+#: the harness's sessions run with no statement or idle limit of their own
+UNBOUNDED = "-c statement_timeout=0 -c idle_in_transaction_session_timeout=0"
+#: each filled engine's URL (a second engine on the same server, as the code's own)
+URLS: dict[Engine, str] = {}
 #: rows per media table (images, image_versions, public_objects' copies,
 #: figure_galleries; image_masks 19 in 20 of them; public_object_images more)
 ROWS = 320_000
@@ -177,7 +207,7 @@ def filled_postgres() -> Iterator[sessionmaker[Session]]:
     a run killed before its teardown (pytest-timeout exits the process)
     leaves no container behind (--rm removes it once it stops)."""
     started = subprocess.run(
-        ["docker", "run", "-d", "--rm", "-e", "POSTGRES_PASSWORD=postgres"]
+        ["docker", "run", "-d", "--rm", "-e", "POSTGRES_PASSWORD=postgres", *LIMITS]
         + ["-p", "127.0.0.1::5432", "--entrypoint", "timeout", IMAGE]
         + ["-s", "INT", str(LIFETIME), "docker-entrypoint.sh", "postgres", *THROWAWAY],
         capture_output=True,
@@ -201,7 +231,9 @@ def filled_postgres() -> Iterator[sessionmaker[Session]]:
             .rsplit(":", 1)[-1]
         )
         url = f"postgresql+psycopg2://postgres:postgres@127.0.0.1:{port}/postgres"
-        engine = create_engine(url, pool_size=4)
+        # the harness's own sessions: a limit the database sets (U5, later)
+        # bounds the code under test, never the fill or the EXPLAINs
+        engine = create_engine(url, pool_size=4, connect_args={"options": UNBOUNDED})
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -214,6 +246,7 @@ def filled_postgres() -> Iterator[sessionmaker[Session]]:
                 time.sleep(0.5)
         up = _run_alembic("upgrade", "head", database_url=url)
         assert up.returncode == 0, up.stdout + up.stderr
+        URLS[engine] = url
         with engine.begin() as conn:
             conn.exec_driver_sql("SET LOCAL session_replication_role = replica")  # no FK checks
             # no parameters: the driver passes the SQL's % (modulo) through as it is
@@ -222,6 +255,7 @@ def filled_postgres() -> Iterator[sessionmaker[Session]]:
             )
         yield sessionmaker(bind=engine, expire_on_commit=False)
         engine.dispose()
+        URLS.pop(engine, None)
     finally:
         subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
 
@@ -263,12 +297,13 @@ def _leading_column(conn: Any, index: str) -> str:
     )
 
 
-def _whole_reads(conn: Any, node: dict[str, Any], used: set[str]) -> list[str]:
+def _whole_reads(conn: Any, node: dict[str, Any], used: set[str]) -> list[tuple[str, str]]:
     """Each read of a MEDIA_TABLES table in the plan ``node`` that is no index
     probe bounded on the index's leading column: a Seq Scan (parallel or
     not), or an index walked whole (no Index Cond, or one on a later
-    column). ``used`` collects the indexes probed, as ``table.index``."""
-    found: list[str] = []
+    column), as (the read, its table). ``used`` collects the indexes
+    probed, as ``table.index``."""
+    found: list[tuple[str, str]] = []
     table = node.get("Relation Name")
     if table in MEDIA_TABLES and node["Node Type"] != "ModifyTable":  # an UPDATE's target
         probes = [node] if "Index Name" in node else []
@@ -283,10 +318,39 @@ def _whole_reads(conn: Any, node: dict[str, Any], used: set[str]) -> list[str]:
             bounded &= bool(re.search(rf"\(\(?{column}\b", probe.get("Index Cond", "")))
             used.add(f"{table}.{probe['Index Name']}")
         if not bounded:
-            found.append(f"{node['Node Type']} on {table} {node.get('Index Name', '')}".strip())
+            read = f"{node['Node Type']} on {table} {node.get('Index Name', '')}".strip()
+            found.append((read, table))
     for child in node.get("Plans", []):
         found += _whole_reads(conn, child, used)
     return found
+
+
+def _reads(
+    factory: sessionmaker[Session],
+    statements: list[tuple[str, Any]],
+    used: set[str],
+    cost: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """(the read, its table, its statement) for each whole-table read of
+    every SELECT, UPDATE and DELETE among ``statements``, planned at
+    random_page_cost ``cost`` (None: the server's, prod's 4)."""
+    walked: list[tuple[str, str, str]] = []
+    with factory() as db:
+        conn = db.connection()
+        if cost is not None:
+            conn.exec_driver_sql(f"SET LOCAL random_page_cost = {float(cost)}")
+        for statement, parameters in statements:
+            if not statement.lstrip().upper().startswith(("SELECT", "UPDATE", "DELETE")):
+                continue
+            explained = conn.exec_driver_sql(
+                "EXPLAIN (FORMAT JSON) " + statement, parameters
+            ).scalar_one()
+            flat = " ".join(statement.split())
+            walked += [
+                (read, table, flat)
+                for read, table in _whole_reads(conn, explained[0]["Plan"], used)
+            ]
+    return walked
 
 
 def _walks(
@@ -294,20 +358,125 @@ def _walks(
 ) -> list[str]:
     """The whole-table reads of every SELECT, UPDATE and DELETE among
     ``statements``, each named with its statement."""
-    walked: list[str] = []
-    with factory() as db:
-        conn = db.connection()
-        for statement, parameters in statements:
-            if not statement.lstrip().upper().startswith(("SELECT", "UPDATE", "DELETE")):
-                continue
-            explained = conn.exec_driver_sql(
-                "EXPLAIN (FORMAT JSON) " + statement, parameters
-            ).scalar_one()
-            walked += [
-                f"{w}: {' '.join(statement.split())}"
-                for w in _whole_reads(conn, explained[0]["Plan"], used)
-            ]
-    return walked
+    return [f"{read}: {statement}" for read, _table, statement in _reads(factory, statements, used)]
+
+
+# --------------------------------------------------------------------------
+# U12a: the registry of whole reads the guard allows, and the guard
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Allowed:
+    """A whole read one statement may make: PER RUN, never per photo."""
+
+    #: the statement, whitespace collapsed, as re.search finds it
+    statement: str
+    #: the tables it may read whole
+    tables: frozenset[str]
+    why: str
+    #: looked at again by then: past it, every run warns until someone does
+    until: dt.date
+
+
+class RegistryOverdue(UserWarning):
+    """A REGISTRY entry past its date: look at its whole read again."""
+
+
+#: Prod scale, Nov 2026: display_originals 233 k rows (143 MB), display_depictions
+#: 238 k (138 MB), cached; the whole media DB a few GB. Each entry is ONE read
+#: per run (a sync every 15 minutes, a replay by hand), never one per photo.
+_LOOK_AGAIN = dt.date(2027, 2, 4)
+_QUEUE = frozenset({"display_originals", "display_depictions"})
+REGISTRY: tuple[Allowed, ...] = (
+    Allowed(
+        r"^SELECT count\(distinct\(display_depictions\.origin_sha256\)\) .*"
+        r"display_depictions\.outcome = .* display_depictions\.reported_at >= ",
+        frozenset({"display_depictions"}),
+        "the REPORT's daily cap on FAILED reports: once per sync; no index on outcome",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT display_depictions\.product_image_id, .* FROM display_depictions"
+        r" JOIN display_originals .* WHERE display_depictions\.reported_at IS NULL",
+        frozenset({"display_originals"}),
+        "the REPORT's read of what is ready (LIMIT report_limit): once per sync, a hash"
+        " join over the queue's originals",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^UPDATE display_originals SET state=.* WHERE display_originals\.state = .*"
+        r"EXISTS \(SELECT display_depictions\.product_image_id .*\.linked_at IS NULL",
+        _QUEUE,
+        "_relink: seeded originals with an unlinked depiction, once per sync",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^DELETE FROM display_originals WHERE display_originals\.state IN .* NOT \(EXISTS",
+        _QUEUE,
+        "the PURGE of originals no depiction names, once per sync",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT public_objects\.sha256 FROM public_objects LEFT OUTER JOIN image_versions",
+        frozenset({"public_objects", "image_versions", "images", "public_object_images"}),
+        "the replay's _dead_copies: one query per run (2.2 s at prod scale)",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT public_objects\.sha256, image_versions\.image_id FROM public_objects"
+        r" JOIN image_versions",
+        frozenset({"public_objects", "image_versions"}),
+        "the replay's index (load_plan): every clean copy, streamed, once per run",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT public_object_images\.sha256, public_object_images\.image_id"
+        r" FROM public_object_images JOIN public_objects",
+        frozenset({"public_object_images", "public_objects"}),
+        "the replay's index (load_plan): every capture link, streamed, once per run",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT images\.id, images\.sha256 FROM images$",
+        frozenset({"images"}),
+        "the replay's index (load_plan): every original, streamed, once per run",
+        _LOOK_AGAIN,
+    ),
+    Allowed(
+        r"^SELECT image_masks\.id, image_masks\.source_sha256, image_masks\.status,"
+        r" image_masks\.mask_sha256 FROM image_masks",
+        frozenset({"image_masks"}),
+        "the replay's index (load_plan): every mask row, streamed, once per run",
+        _LOOK_AGAIN,
+    ),
+)
+
+
+def _allowed(read: tuple[str, str, str]) -> bool:
+    _read, table, statement = read
+    return any(
+        table in entry.tables and re.search(entry.statement, statement) for entry in REGISTRY
+    )
+
+
+#: The planner costs the guard plans at: prod's today and U5's (NVMe).
+COSTS = ("4", "1.1")
+
+
+def _guarded(
+    factory: sessionmaker[Session], statements: list[tuple[str, Any]], used: set[str]
+) -> list[str]:
+    """Every whole read among ``statements`` at either planner cost that no
+    REGISTRY entry allows, named with its cost and statement."""
+    return sorted(
+        {
+            f"rpc {cost}: {read}: {statement}"
+            for cost in COSTS
+            for read, table, statement in _reads(factory, statements, used, cost)
+            if not _allowed((read, table, statement))
+        }
+    )
 
 
 def _png(label: str, note: str | None = None) -> bytes:
@@ -718,3 +887,239 @@ def test_the_footprint_query_is_one_round_trip_a_turn(pg: sessionmaker[Session])
     links = [s for s, _p in statements if "public_object_images" in s]
     assert links and all("UNION ALL" in s for s in links)
     assert len(statements) == 2 + len(links)
+
+
+# --------------------------------------------------------------------------
+# U12a: the seeder, the sync and the replay, at both planner costs
+# --------------------------------------------------------------------------
+
+
+def _queued(db: Session, raw: LocalObjectStore, data: bytes, n: str) -> str:
+    """A pending original, newer than any FILL queued, its raw object stored
+    and one depiction on a granted store; its sha."""
+    sha = hashlib.sha256(data).hexdigest()
+    key = f"raw-img/sha256/{sha[:2]}/{sha}.png"
+    raw.put(key, data, "image/png")
+    seen = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
+    db.add(
+        DisplayOriginal(
+            origin_sha256=sha, storage_key=key, codec="identity", first_seen_at=seen,
+            state="pending",
+        )
+    )  # fmt: skip
+    db.flush()
+    db.add(
+        DisplayDepiction(
+            product_image_id=str(uuid.UUID(_sha(f"pi:{n}")[:32])),
+            origin_sha256=sha,
+            product_id=str(uuid.UUID(_sha(f"prod:{n}")[:32])),
+            origin_url=f"https://img.amiami.example/images/product/main/plan-{n}.jpg",
+            source_site="amiami",
+            first_seen_at=seen,
+        )
+    )
+    db.commit()
+    return sha
+
+
+def _one_seed(
+    sessions: Callable[[], Session], raw: LocalObjectStore, media: Any, lines: list[Any]
+) -> int:
+    """run_seed as the CronJob runs it, budgeted to the one original it claims
+    first (its start and its first claim read the clock; the next, spent)."""
+    ticks = iter([0.0, 0.0])
+    return dc.run_seed(
+        sessions,
+        ReadOnlyStore(raw),
+        media,
+        dc.SeedConfig(threads=0, grants=GRANTS),
+        emit=lines.append,
+        monotonic=lambda: next(ticks, 1e9),
+    )
+
+
+def test_the_registry_is_current() -> None:
+    """Each allowed whole read says why; past its date it warns."""
+    today = dt.date.today()
+    for entry in REGISTRY:
+        assert entry.why.strip() and entry.tables <= set(MEDIA_TABLES), entry
+        if entry.until < today:
+            warnings.warn(
+                f"look again (due {entry.until}): {entry.statement}", RegistryOverdue, stacklevel=1
+            )
+
+
+def test_an_overdue_registry_entry_warns_and_fails_no_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The day after an entry's date: every PR's CI runs this module, so an
+    entry past its date asks for a look by a warning in the run's summary,
+    never by failing a build whatever the build changes (an unregistered
+    whole read still fails the guard)."""
+    later = _LOOK_AGAIN + dt.timedelta(days=1)
+
+    class _Later(dt.date):
+        @classmethod
+        def today(cls) -> dt.date:
+            return later
+
+    monkeypatch.setattr(sys.modules[__name__], "dt", SimpleNamespace(date=_Later))
+    with pytest.warns(UserWarning, match="look again") as warned:
+        test_the_registry_is_current()
+    assert len(warned) == len(REGISTRY)
+
+
+def test_the_seeders_whole_run_reads_probe_at_both_costs(
+    pg: sessionmaker[Session], tmp_path: Path
+) -> None:
+    """One original through run_seed, end to end: the claim, the depictions,
+    the withdraw judgment, the seed of a new picture (its image, versions,
+    copy, links and gallery rows), the copy's appearance, the settle and
+    the run's own lines. No statement reads a media table whole at prod's
+    planner cost or at U5's."""
+    raw, media = LocalObjectStore(tmp_path / "raw"), LocalObjectStore(tmp_path / "media")
+    lines: list[dict[str, Any]] = []
+    with pg() as db:
+        _queued(db, raw, _png("guard-seed"), "seed")
+        statements = _captured(db.get_bind(), lambda: _one_seed(lambda: db, raw, media, lines))
+    assert lines[-1]["event"] == "done" and lines[-1]["seeded"] == 1, lines  # no line of its own
+    used: set[str] = set()
+    assert _guarded(pg, statements, used) == []
+    assert "display_originals.ix_display_originals_state_seen" in used
+
+
+def test_the_syncs_report_enqueue_and_purge_probe_at_both_costs(
+    pg: sessionmaker[Session],
+) -> None:
+    """A sync against the filled queue: the REPORT of what the seeder
+    settled, the ENQUEUE of the spine's new depictions (new originals and a
+    second depiction of one queued), the PURGE and the lag on its last line."""
+    spine = QueueSpine()
+    for n in range(3):
+        spine.depict_full(_sha(f"sync-new:{n}"), seen=dt.datetime.now(dt.UTC), pid=None)
+    spine.depict_full(_sha("img:40"), seen=dt.datetime.now(dt.UTC))  # already queued
+    lines: list[dict[str, Any]] = []
+    with pg() as db, serve(spine) as url:
+
+        def sync() -> int:
+            return feed.run_sync(
+                db,
+                lambda: SpineMediaClient(open_channel(url), policy=RetryPolicy(max_attempts=1)),
+                feed.FeedConfig(),
+                emit=lines.append,
+            )
+
+        statements = _captured(db.get_bind(), sync)
+    assert lines[-1]["event"] == "done", lines
+    used: set[str] = set()
+    assert _guarded(pg, statements, used) == []
+
+
+def test_the_replays_per_batch_reads_probe_and_its_plan_reads_are_registered(
+    pg: sessionmaker[Session],
+) -> None:
+    """The replay's index (load_plan without details, _dead_copies): ONE
+    read of the media DB per run, streamed, each whole read REGISTRY names.
+    Its per-batch reads (Plan.load: the copies' masks, mask objects and
+    records, 200 originals at a time) probe."""
+    with pg() as db:
+        engine = db.get_bind()
+        plans: list[Any] = []
+        index = _captured(engine, lambda: plans.append(load_plan(db, details=False)))
+        assert _sha("copy:1") not in _dead_copies(db)
+        batches = make_batches(plans[0], size=200)
+        batch = batches[len(batches) // 2]
+        copies_due = {plans[0].copy_of[o] for o in batch.origins}.union(batch.copies_due)
+        per_batch = _captured(engine, lambda: plans[0].load(db, copies_due))
+        db.rollback()
+    assert len(copies_due) > 100 and plans[0].copies
+    used: set[str] = set()
+    assert _guarded(pg, per_batch, used) == []
+    assert "image_masks.uq_image_mask_source_version" in used
+    assert _reads(pg, index, set())  # the index does read whole tables: the registry's
+    assert _guarded(pg, index, set()) == []
+
+
+class _Slow:
+    """An object store whose every call takes ``seconds`` (a slow bucket)."""
+
+    def __init__(self, store: LocalObjectStore, seconds: float) -> None:
+        self._store, self._seconds = store, seconds
+
+    def __getattr__(self, name: str) -> Any:
+        call = getattr(self._store, name)
+        if not callable(call):
+            return call
+
+        def slow(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(self._seconds)
+            return call(*args, **kwargs)
+
+        return slow
+
+
+def test_no_seeder_session_sits_idle_in_a_transaction_across_its_bucket(
+    pg: sessionmaker[Session], tmp_path: Path
+) -> None:
+    """M-1 on a real server: the seeder's sessions, named (U8), sampled in
+    pg_stat_activity ten times a second while one original is seeded through
+    a bucket whose every call takes 1.5 s. None is ever idle inside a
+    transaction for a second (before MEDIADB: across every GET and PUT)."""
+    url = URLS[pg.kw["bind"]]  # the code's own engine on the same server
+    seeder = create_engine(url, pool_size=2, max_overflow=0, connect_args={"options": UNBOUNDED})
+    tdb.name_engine(seeder)
+    before = tdb.connection_name()
+    name = tdb.name_connections("plan-guard", "seed", uuid.uuid4().hex)
+    raw, media = LocalObjectStore(tmp_path / "raw"), LocalObjectStore(tmp_path / "media")
+    with pg() as db:
+        _queued(db, raw, _png("guard-idle"), "idle")
+    longest: list[float] = [0.0]
+    seen: list[int] = [0]
+    failed: list[BaseException] = []
+    stop = threading.Event()
+
+    def sample() -> None:
+        with pg() as db:
+            while not stop.is_set():
+                for state, idle in db.execute(
+                    text(
+                        "SELECT state, extract(epoch FROM clock_timestamp() - state_change)"
+                        " FROM pg_stat_activity WHERE application_name = :name"
+                        " AND pid <> pg_backend_pid()"
+                    ),
+                    {"name": name},
+                ):
+                    seen[0] += 1
+                    if state == "idle in transaction":
+                        longest[0] = max(longest[0], float(idle))
+                db.commit()
+                time.sleep(0.1)
+
+    def sampling() -> None:
+        try:
+            sample()
+        except BaseException as exc:  # the test's, never the thread's
+            failed.append(exc)
+
+    sampler = threading.Thread(target=sampling)
+    sampler.start()
+    lines: list[dict[str, Any]] = []
+    try:
+        factory = sessionmaker(bind=seeder, expire_on_commit=False)
+        session = factory()
+        try:
+            code = _one_seed(
+                lambda: session, _Slow(raw, 1.5), _Slow(media, 1.5), lines
+            )  # fmt: skip
+        finally:
+            session.close()
+    finally:
+        stop.set()
+        sampler.join()
+        seeder.dispose()
+        tdb._name = before  # noqa: SLF001 -- the process-wide name, as the test found it
+    assert code == dc.EXIT_DONE, lines
+    assert lines[-1]["event"] == "done" and lines[-1]["seeded"] == 1, lines  # no line of its own
+    assert failed == []
+    assert seen[0] > 10  # the sampler did see the seeder's session
+    assert longest[0] < 1.0, f"idle in a transaction for {longest[0]:.1f} s"

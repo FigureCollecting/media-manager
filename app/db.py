@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
+from .telemetry.db import name_engine
 
 _settings = get_settings()
 _engine_kwargs: dict[str, Any] = {
@@ -17,6 +18,9 @@ if not _settings.database_url.startswith("sqlite"):
     _engine_kwargs["pool_size"] = _settings.db_pool_size
     _engine_kwargs["max_overflow"] = _settings.db_max_overflow
 engine = create_engine(_settings.database_url, **_engine_kwargs)
+# MEDIADB (U8): each connection's application_name is the process's workload
+# and run, once its entry point names them (app.telemetry.db)
+name_engine(engine)
 SessionLocal: sessionmaker[Session] = sessionmaker(
     bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True
 )

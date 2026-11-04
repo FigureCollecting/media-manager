@@ -26,6 +26,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
+from .db import name_connections
 from .log import configure, process_logger
 from .tracing import context_from_traceparent, current_traceparent, elapsed_ms, start_tracing
 
@@ -39,6 +40,7 @@ def setup_logging(loglevel: int | str | None = None, **_: Any) -> None:
     level = logging.getLevelName(loglevel) if isinstance(loglevel, int) else loglevel
     configure(SERVICE, level=level)
     start_tracing(SERVICE)
+    name_connections(SERVICE, "celery")  # MEDIADB (U8): pg_stat_activity names the worker
 
 
 def before_publish(headers: dict[str, Any] | None = None, **_: Any) -> None:

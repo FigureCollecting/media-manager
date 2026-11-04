@@ -899,3 +899,202 @@ def test_the_display_feed_reports_enqueues_and_purges_on_postgres(empty_database
     finally:
         db.close()
         engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# MEDIADB: 0010 drops two prefix indexes
+# --------------------------------------------------------------------------
+
+#: The two indexes 0010 drops: each is the leading column of a UNIQUE index
+#: its readers move to (uq_image_version_no (image_id, version_no),
+#: uq_figure_source_url (figure_id, source_url)) at the same buffer counts.
+PREFIX_INDEXES = {
+    ("image_versions", "ix_image_versions_image_id_visibility"),
+    ("figure_galleries", "ix_figure_galleries_figure_id"),
+}
+#: What they leave the readers (never dropped: integrity, and the readers' index).
+WIDER_INDEXES = {
+    ("image_versions", "uq_image_version_no"),
+    ("figure_galleries", "uq_figure_source_url"),
+}
+
+
+def _indexes(url: str, names: set[tuple[str, str]]) -> dict[tuple[str, str], bool]:
+    """Those of ``names`` present in ``url``'s database, each with whether it is valid."""
+    wanted = sorted(name for _table, name in names)
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT t.relname, c.relname, i.indisvalid FROM pg_index i"
+                    " JOIN pg_class c ON c.oid = i.indexrelid"
+                    " JOIN pg_class t ON t.oid = i.indrelid WHERE c.relname = ANY(:names)"
+                ),
+                {"names": wanted},
+            )
+            return {(table, name): valid for table, name, valid in rows}
+    finally:
+        engine.dispose()
+
+
+def test_the_prefix_indexes_are_dropped_and_their_readers_keep_the_wider_ones(
+    empty_database_url: str,
+) -> None:
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    assert _indexes(empty_database_url, PREFIX_INDEXES) == {}
+    assert _indexes(empty_database_url, WIDER_INDEXES) == dict.fromkeys(WIDER_INDEXES, True)
+
+
+def test_downgrading_the_prefix_index_drops_restores_the_gallery_image_indexs_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0010's downgrade builds exactly the two indexes again."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    down = _run_alembic("downgrade", "0009_index_gallery_image_id", database_url=empty_database_url)
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0009_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0009_index_gallery_image_id", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            assert _indexes(empty_database_url, PREFIX_INDEXES) == dict.fromkeys(
+                PREFIX_INDEXES, True
+            )
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_the_prefix_index_drops_wait_behind_a_reading_transaction_under_the_jobs_lock_timeout(
+    empty_database_url: str,
+) -> None:
+    """The verifier's probe: a transaction that only READ the tables, left
+    idle (the seeder's before MEDIADB), blocks DROP INDEX CONCURRENTLY, and
+    under the migrate Job's lock_timeout the drop would fail. 0010 waits for
+    it with no lock timeout instead (its lock queues no read or write) and
+    drops both once the reader commits."""
+    up = _run_alembic("upgrade", "0009_index_gallery_image_id", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    watch = create_engine(empty_database_url, isolation_level="AUTOCOMMIT")
+    reader = engine.connect()
+    reader.execute(text("SELECT count(*) FROM image_versions"))
+    reader.execute(text("SELECT count(*) FROM figure_galleries"))
+    proc = subprocess.Popen(
+        ["alembic", "upgrade", "0010_drop_prefix_indexes"],
+        cwd=REPO_ROOT,
+        env={**os.environ, "DATABASE_URL": empty_database_url, "PGOPTIONS": "-c lock_timeout=1s"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        waited = 0
+        with watch.connect() as conn:
+            while proc.poll() is None and time.monotonic() < deadline:
+                waited = conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                        " AND ltrim(query, E' \\n') LIKE 'DROP INDEX CONCURRENTLY%'"
+                        " AND wait_event_type = 'Lock'"
+                    )
+                ).scalar_one()
+                if waited:
+                    break
+                time.sleep(0.1)
+        time.sleep(2)  # the reader holds on for twice the lock timeout
+        reader.commit()
+        output, _ = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        reader.close()
+        engine.dispose()
+        watch.dispose()
+    assert waited, output  # it did wait behind the reader
+    assert proc.returncode == 0, output
+    assert _indexes(empty_database_url, PREFIX_INDEXES) == {}
+
+
+def test_the_prefix_index_drops_render_as_offline_sql_outside_a_transaction(
+    pg_admin_url: str,
+) -> None:
+    """``alembic upgrade --sql`` prints 0010 as the Job would run it: the run
+    so far committed, both drops CONCURRENTLY with no lock or statement
+    timeout, then a new transaction; its downgrade builds them the same way."""
+    for args, ddl in (
+        (
+            ("upgrade", "0009_index_gallery_image_id:0010_drop_prefix_indexes"),
+            [
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_image_versions_image_id_visibility",
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_figure_galleries_figure_id",
+            ],
+        ),
+        (
+            ("downgrade", "0010_drop_prefix_indexes:0009_index_gallery_image_id"),
+            [
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_figure_galleries_figure_id"
+                " ON figure_galleries (figure_id)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_image_versions_image_id_visibility"
+                " ON image_versions (image_id, visibility)",
+            ],
+        ),
+    ):
+        out = _run_alembic(*args, "--sql", database_url=pg_admin_url)
+        assert out.returncode == 0, out.stdout + out.stderr
+        sql = "\n".join(line for line in out.stdout.splitlines() if not line.startswith("--"))
+        statements = [s.strip() for s in sql.split(";") if s.strip()]
+        at = statements.index("SET lock_timeout = 0")
+        assert statements[at - 1 : at + 6] == [
+            "COMMIT",
+            "SET lock_timeout = 0",
+            "SET statement_timeout = 0",
+            *ddl,
+            "RESET statement_timeout",
+            "RESET lock_timeout",
+        ]
+        assert statements[at + 6] == "BEGIN"
+
+
+def test_the_chain_head_sets_no_session_limit_on_the_database(empty_database_url: str) -> None:
+    """fc-infra's migrate Job runs ``alembic upgrade head`` and nothing else
+    (validate-media.sh pins that argv), so every revision in the chain
+    reaches prod with the next routine migration. A database-wide
+    idle-in-transaction or statement limit would end the WSL mask batch's
+    reads, which wait on its GPU queue and its turn inside a transaction (a
+    run so ended can report done with nothing done). The media limits (U5)
+    land with the batch's own transaction fix, which removes this test."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.connect() as conn:
+            settings = conn.execute(
+                text(
+                    "SELECT s.setconfig FROM pg_db_role_setting s"
+                    " JOIN pg_database d ON d.oid = s.setdatabase"
+                    " WHERE d.datname = current_database()"
+                )
+            ).all()
+    finally:
+        engine.dispose()
+    assert settings == []

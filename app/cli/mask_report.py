@@ -58,6 +58,7 @@ from ..spine.media_client import (
     target_from_url,
 )
 from ..spine.replay import ReplayConfig, run_replay
+from ..telemetry.db import name_connections
 from ..telemetry.events import EventLines
 
 EXIT_USAGE = 2
@@ -95,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, emit: EventLines, run: telemetry.JobRun) -> int:
+    name_connections(SERVICE, "replay", run.run_id)  # MEDIADB (U8): pg_stat_activity's name
     url = args.spine_url or os.environ.get("SPINE_MEDIA_URL", "")
     try:
         config = ReplayConfig(

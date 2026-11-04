@@ -497,14 +497,35 @@ def test_a_rerun_after_the_pipeline_is_idempotent_and_reads_no_original_again(
 # --------------------------------------------------------------------------
 
 
+class _HeldUntil(LocalObjectStore):
+    """A raw bucket whose GET of one key waits until ``released`` is set
+    (5 s at most)."""
+
+    def __init__(self, root: Path, held: str, released: threading.Event) -> None:
+        super().__init__(root)
+        self.held, self.released = held, released
+
+    def get(self, key: str) -> bytes:
+        if key == self.held:
+            self.released.wait(5.0)
+        return super().get(key)
+
+
 def test_the_next_images_io_overlaps_the_model(tmp_path: Path) -> None:
     """While the first image is on the GPU, another image's seed stores its
-    original in the media bucket (one image at a time, nothing else runs)."""
+    original in the media bucket (one image at a time, nothing else runs).
+    The last image's original is read from the raw bucket only once the
+    first image is on the model, so its seed's PUTs come after the model
+    started whatever the seeds' own work costs (since MEDIADB each seed
+    decodes before its PUTs, and the four seeds' I/O can all end before a
+    model call); a pipeline that ran no seed beside the model would make
+    them before it, or not at all while it waits, and fail."""
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(103 + n, n) for n in range(1, 5)]
+    on_gpu = threading.Event()
+    raw.store = _HeldUntil(tmp_path / "raw", items[3].storage_key, on_gpu)
     root = tmp_path / "run"
     media = _Counted(root / "media")
-    media.slow[items[3].blob_sha256] = 0.5  # the last image's original: still uploading
     overlapped = threading.Event()
     first: list[int] = []
 
@@ -513,6 +534,7 @@ def test_the_next_images_io_overlaps_the_model(tmp_path: Path) -> None:
             return
         first.append(width)
         before = len(media.puts)
+        on_gpu.set()
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and len(media.puts) == before:
             time.sleep(0.01)
@@ -585,7 +607,8 @@ def test_an_images_uploads_overlap_each_other_and_its_sql_and_land_before_its_co
     main.close()
     engine.dispose()
     assert media.most == 2  # an image's original and clean copy at once
-    assert len(at_commit) == 6 and set(at_commit) == {0}  # its seed's and its mask's
+    # its seed's two (its read's, before any PUT: MEDIADB; its rows') and its mask's
+    assert len(at_commit) == 9 and set(at_commit) == {0}
     (chunk,) = (e for e in events if e["event"] == "chunk")
     assert chunk["counts"] == {"ok": 3}
 

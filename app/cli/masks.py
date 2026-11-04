@@ -61,6 +61,7 @@ from sqlalchemy.orm import Session
 from .. import telemetry
 from ..models import Base, FigureGallery, ImageVersion, MaskBatch, PublicObject
 from ..object_store import LocalObjectStore, ObjectStore
+from ..telemetry.db import name_connections
 from ..telemetry.events import report_lines
 from ..workers.basekept import BaseKeptMattingBackend
 from ..workers.gallery_rejudge import GalleryCapture, rejudge_official_gallery
@@ -384,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary: dict[str, Any] = {}
 
     def body(run: telemetry.JobRun) -> int:
+        name_connections(SERVICE, args.command, run.run_id)  # MEDIADB (U8)
         summary.update(report_lines(log, _command(args, run, log)))
         return 0
 
