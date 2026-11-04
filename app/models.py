@@ -252,8 +252,9 @@ class FigureGallery(Base):
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
+        #: Also the index the gallery's figure_id reads take (MEDIADB, migration 0010:
+        #: an index on figure_id alone was its prefix, written on every link for nothing).
         UniqueConstraint("figure_id", "source_url", name="uq_figure_source_url"),
-        Index("ix_figure_galleries_figure_id", "figure_id"),
         #: An image's origins are read by image_id for every copy judged
         #: (app.publication.gallery_origins; migration 0009).
         Index("ix_figure_galleries_image_id", "image_id"),
@@ -607,7 +608,8 @@ class DisplayFeedWalk(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-# Useful indexes
-Index("ix_image_versions_image_id_visibility", ImageVersion.image_id, ImageVersion.visibility)
+# Useful indexes. image_versions is read by image_id through uq_image_version_no
+# (image_id, version_no): no statement filters visibility with image_id, so an
+# (image_id, visibility) index was its prefix (MEDIADB, migration 0010).
 Index("ix_album_title_trgm", Album.title)
 Index("ix_album_desc_trgm", Album.description)
