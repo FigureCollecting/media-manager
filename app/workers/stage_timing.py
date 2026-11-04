@@ -14,7 +14,7 @@ it, counted once under "db" by the same rule.
 
 Pipelined (MASK-PERF-2), each image runs on a worker thread of its own with
 a session of its own, and its stages are its own wall time: the waits the
-pipeline adds are stages too ("claim", "gpu_wait", "turn_wait"), and what a
+pipeline adds are stages too ("claim_register", "gpu_wait", "turn_wait"), and what a
 read-ahead thread measured for it is added (``StageTimings.add``).
 """
 
@@ -35,9 +35,13 @@ if TYPE_CHECKING:
 #: database (reached all along the way) last.
 STAGES = (
     "fetch",  # the original from the raw bucket, and its decode
-    # pipelined: the image's picture keys, its footprint read (its SQL is "db")
-    # and its place among the images in flight (app.workers.mask_pipeline)
-    "claim",
+    # pipelined, the claim (app.workers.mask_pipeline), told apart (MASKRATE):
+    # the image's picture keys (read ahead: decode, clean-copy encode, its decode),
+    "claim_keys",
+    # its footprint read but for the read's SQL ("db"): the ORM's own work,
+    "claim_footprint",
+    # and its wait to register behind every earlier image's footprint read
+    "claim_register",
     # the clean copy minted and registered (app.workers.mask_seed), but for its
     # PUTs and its SQL: its decode, encode and phash, and the ORM's own work
     "seed",
