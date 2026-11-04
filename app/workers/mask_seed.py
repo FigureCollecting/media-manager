@@ -19,9 +19,9 @@ from typing import NamedTuple
 
 import numpy as np
 from PIL import Image, ImageOps
-from sqlalchemy import or_, select
+from sqlalchemy import CompoundSelect, Select, or_, select, union_all
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ..hashing import compute_phash, detect_mime
 from ..models import FigureGallery, ImageVersion, PublicObject, PublicObjectImage
@@ -285,30 +285,18 @@ def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str
     footprints do not meet cannot see each other's rows; read now, it may
     miss what an image still in flight is about to link (the pipeline joins
     those by their own footprints)."""
-    images = set(
-        db.execute(
-            select(ImageModel.sha256).where(
-                or_(ImageModel.sha256.in_(shas), ImageModel.pixel_sha256.in_(digests))
-            )
-        ).scalars()
+    images = _shas_matching(
+        ImageModel.sha256, (ImageModel.sha256, shas), (ImageModel.pixel_sha256, digests), db=db
     )
-    objects = set(
-        db.execute(
-            select(PublicObject.sha256).where(
-                or_(
-                    PublicObject.sha256.in_(shas),
-                    PublicObject.pixel_sha256.in_(digests),
-                    PublicObject.own_pixel_sha256.in_(digests),
-                )
-            )
-        ).scalars()
+    objects = _shas_matching(
+        PublicObject.sha256,
+        (PublicObject.sha256, shas),
+        (PublicObject.pixel_sha256, digests),
+        (PublicObject.own_pixel_sha256, digests),
+        db=db,
     )
     while images or objects:
-        links = db.execute(
-            select(PublicObjectImage.sha256, ImageModel.sha256)
-            .join(ImageModel, ImageModel.id == PublicObjectImage.image_id)
-            .where(or_(PublicObjectImage.sha256.in_(objects), ImageModel.sha256.in_(images)))
-        ).all()
+        links = db.execute(_links(objects, images)).all()
         more_objects = {obj for obj, _image in links} - objects
         more_images = {image for _obj, image in links} - images
         if not more_objects and not more_images:
@@ -316,6 +304,35 @@ def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str
         objects |= more_objects
         images |= more_images
     return shas | digests | images | objects
+
+
+def _shas_matching(
+    sha: InstrumentedAttribute[str],
+    *keys: tuple[InstrumentedAttribute[str | None], set[str]],
+    db: Session,
+) -> set[str]:
+    """The ``sha`` of every row with one of its ``keys`` (a column, the values
+    it may hold): one index probe per column given values, OR'd (a BitmapOr).
+    A column given none is left out -- its empty IN would be a subquery the
+    OR cannot probe by index -- and none at all reads nothing."""
+    probes = [column.in_(values) for column, values in keys if values]
+    if not probes:
+        return set()
+    return set(db.execute(select(sha).where(or_(*probes))).scalars())
+
+
+def _links(objects: set[str], images: set[str]) -> Select[str, str] | CompoundSelect[str, str]:
+    """The capture-to-copy links of ``objects`` (by the copy's sha) and of
+    ``images`` (by the image's), as (copy, image) shas: one index probe each,
+    in ONE statement (a round trip a turn). Never one select with an OR
+    across the join (MASKRATE): no index serves it, and Postgres hashes both
+    whole tables on every call."""
+    linked = select(PublicObjectImage.sha256, ImageModel.sha256).join(
+        ImageModel, ImageModel.id == PublicObjectImage.image_id
+    )
+    probes = [linked.where(PublicObjectImage.sha256.in_(objects))] if objects else []
+    probes += [linked.where(ImageModel.sha256.in_(images))] if images else []
+    return probes[0] if len(probes) == 1 else union_all(*probes)
 
 
 def _original_key(sha256: str, mime: str) -> str:
