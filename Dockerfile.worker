@@ -53,9 +53,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY pyproject.toml /app/
+COPY pyproject.toml poetry.lock /app/
 
 RUN pip install --no-cache-dir poetry==1.8.3 && \
+    poetry check --lock && \
     poetry export -f requirements.txt --only main -o /tmp/requirements.txt --without-hashes && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
