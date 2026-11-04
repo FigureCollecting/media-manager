@@ -609,6 +609,162 @@ def test_the_copy_lookup_indexes_downgrade_as_offline_sql_outside_a_transaction(
     ]
 
 
+#: The index prod's figure_galleries got by hand on 2026-11-03 (MASKRATE), as
+#: pg_indexes.indexdef reads it back; 0009 carries it.
+GALLERY_IMAGE_INDEXDEF = (
+    "CREATE INDEX ix_figure_galleries_image_id ON public.figure_galleries USING btree (image_id)"
+)
+
+
+def _gallery_image_index(url: str) -> tuple[int, bool, str] | None:
+    """0009's index in ``url``'s database: its oid, whether it is valid and
+    its definition; None while there is none."""
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT i.indexrelid::int, i.indisvalid, pg_get_indexdef(i.indexrelid)"
+                    " FROM pg_index i WHERE i.indexrelid ="
+                    " to_regclass('public.ix_figure_galleries_image_id')"
+                )
+            ).one_or_none()
+            return None if row is None else (row[0], row[1], row[2])
+    finally:
+        engine.dispose()
+
+
+def test_the_gallery_image_index_is_a_no_op_where_it_was_built_by_hand(
+    empty_database_url: str,
+) -> None:
+    """MASKRATE: prod's index was built by hand, CONCURRENTLY, before 0009
+    shipped. 0009 keeps that very index (same oid, valid, same definition)
+    and only moves the version."""
+    up = _run_alembic("upgrade", "0008_index_copy_lookups", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    builder = create_engine(empty_database_url, isolation_level="AUTOCOMMIT")
+    try:
+        with builder.connect() as conn:
+            conn.execute(
+                text(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_figure_galleries_image_id"
+                    " ON public.figure_galleries USING btree (image_id)"
+                )
+            )
+    finally:
+        builder.dispose()
+    by_hand = _gallery_image_index(empty_database_url)
+    assert by_hand is not None and by_hand[1:] == (True, GALLERY_IMAGE_INDEXDEF)
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    assert _gallery_image_index(empty_database_url) == by_hand
+
+
+def test_the_gallery_image_index_matches_the_one_built_by_hand(empty_database_url: str) -> None:
+    """Where no one built it, 0009 builds the definition prod has."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    built = _gallery_image_index(empty_database_url)
+    assert built is not None and built[1:] == (True, GALLERY_IMAGE_INDEXDEF)
+
+
+def test_downgrading_the_gallery_image_index_restores_the_copy_lookups_schema(
+    empty_database_url: str, pg_admin_url: str
+) -> None:
+    """0009's downgrade (MASKRATE) drops exactly figure_galleries' image_id index."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    down = _run_alembic("downgrade", "0008_index_copy_lookups", database_url=empty_database_url)
+    assert down.returncode == 0, down.stdout + down.stderr
+
+    before_dbname = f"migtest_0008_{uuid.uuid4().hex[:8]}"
+    admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{before_dbname}"'))
+    admin_engine.dispose()
+    before_url = pg_admin_url.rsplit("/", 1)[0] + f"/{before_dbname}"
+    try:
+        only = _run_alembic("upgrade", "0008_index_copy_lookups", database_url=before_url)
+        assert only.returncode == 0, only.stdout + only.stderr
+        downgraded_engine = create_engine(empty_database_url)
+        before_engine = create_engine(before_url)
+        try:
+            assert _gallery_image_index(empty_database_url) is None
+            assert _schema_snapshot(downgraded_engine) == _schema_snapshot(before_engine)
+        finally:
+            downgraded_engine.dispose()
+            before_engine.dispose()
+    finally:
+        admin_engine = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{before_dbname}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_a_gallery_image_index_a_cut_short_build_left_invalid_is_rebuilt(
+    empty_database_url: str,
+) -> None:
+    """As 0008: a CONCURRENTLY build cut short leaves an INVALID index that
+    IF NOT EXISTS alone would keep; 0009 drops and builds it again."""
+    up = _run_alembic("upgrade", "0008_index_copy_lookups", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
+    builder = create_engine(empty_database_url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as seeder, builder.connect() as conn:
+            seeder.execute(text("LOCK TABLE figure_galleries IN ROW EXCLUSIVE MODE"))
+            conn.execute(text("SET lock_timeout = '1s'"))
+            with pytest.raises(OperationalError, match="lock timeout"):
+                conn.execute(
+                    text(
+                        "CREATE INDEX CONCURRENTLY ix_figure_galleries_image_id"
+                        " ON figure_galleries (image_id)"
+                    )
+                )
+            seeder.rollback()
+    finally:
+        engine.dispose()
+        builder.dispose()
+    invalid = _gallery_image_index(empty_database_url)
+    assert invalid is not None and invalid[1] is False
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    rebuilt = _gallery_image_index(empty_database_url)
+    assert rebuilt is not None and rebuilt[1:] == (True, GALLERY_IMAGE_INDEXDEF)
+
+
+def test_the_gallery_image_index_renders_as_offline_sql_outside_a_transaction(
+    pg_admin_url: str,
+) -> None:
+    """``alembic upgrade --sql`` prints 0009 as the migrate Job would run it:
+    the run so far committed, the build CONCURRENTLY and IF NOT EXISTS with
+    no lock timeout, then a new transaction for the stamp; and its rollback
+    as a CONCURRENTLY drop."""
+    for args, built in (
+        (
+            ("upgrade", "0008_index_copy_lookups:head"),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS"
+            " ix_figure_galleries_image_id ON figure_galleries (image_id)",
+        ),
+        (
+            ("downgrade", "0009_index_gallery_image_id:0008_index_copy_lookups"),
+            "DROP INDEX CONCURRENTLY IF EXISTS ix_figure_galleries_image_id",
+        ),
+    ):
+        out = _run_alembic(*args, "--sql", database_url=pg_admin_url)
+        assert out.returncode == 0, out.stdout + out.stderr
+        sql = "\n".join(line for line in out.stdout.splitlines() if not line.startswith("--"))
+        statements = [s.strip() for s in sql.split(";") if s.strip()]
+        at = statements.index("SET lock_timeout = 0")
+        assert statements[at - 1 : at + 4] == [
+            "COMMIT",
+            "SET lock_timeout = 0",
+            built,
+            "RESET lock_timeout",
+            "BEGIN",
+        ]
+
+
 def test_the_display_seeders_threads_claim_each_original_once_on_postgres(
     empty_database_url: str, tmp_path: Path
 ) -> None:
