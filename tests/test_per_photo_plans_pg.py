@@ -228,8 +228,8 @@ def filled_postgres() -> Iterator[sessionmaker[Session]]:
             .rsplit(":", 1)[-1]
         )
         url = f"postgresql+psycopg2://postgres:postgres@127.0.0.1:{port}/postgres"
-        # the harness's own sessions: the database's limits (0011) bound the
-        # code under test, never the fill or the EXPLAINs
+        # the harness's own sessions: a limit the database sets (U5, later)
+        # bounds the code under test, never the fill or the EXPLAINs
         engine = create_engine(url, pool_size=4, connect_args={"options": UNBOUNDED})
         deadline = time.monotonic() + 60
         while True:

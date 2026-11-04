@@ -902,7 +902,7 @@ def test_the_display_feed_reports_enqueues_and_purges_on_postgres(empty_database
 
 
 # --------------------------------------------------------------------------
-# MEDIADB: 0010 drops two prefix indexes, 0011 bounds the database's sessions
+# MEDIADB: 0010 drops two prefix indexes
 # --------------------------------------------------------------------------
 
 #: The two indexes 0010 drops: each is the leading column of a UNIQUE index
@@ -1075,65 +1075,26 @@ def test_the_prefix_index_drops_render_as_offline_sql_outside_a_transaction(
         assert statements[at + 6] == "BEGIN"
 
 
-def _setting(url: str, name: str) -> str:
-    engine = create_engine(url)
+def test_the_chain_head_sets_no_session_limit_on_the_database(empty_database_url: str) -> None:
+    """fc-infra's migrate Job runs ``alembic upgrade head`` and nothing else
+    (validate-media.sh pins that argv), so every revision in the chain
+    reaches prod with the next routine migration. A database-wide
+    idle-in-transaction or statement limit would end the WSL mask batch's
+    reads, which wait on its GPU queue and its turn inside a transaction (a
+    run so ended can report done with nothing done). The media limits (U5)
+    land with the batch's own transaction fix, which removes this test."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url)
     try:
         with engine.connect() as conn:
-            return str(conn.exec_driver_sql(f"SHOW {name}").scalar_one())
+            settings = conn.execute(
+                text(
+                    "SELECT s.setconfig FROM pg_db_role_setting s"
+                    " JOIN pg_database d ON d.oid = s.setdatabase"
+                    " WHERE d.datname = current_database()"
+                )
+            ).all()
     finally:
         engine.dispose()
-
-
-def test_the_media_databases_sessions_are_bounded_and_its_owners_ddl_is_not(
-    pg_admin_url: str,
-) -> None:
-    """U5's media limits as the migration sets them (CNPG's managed roles
-    have no SET field): every session of the database gets 180 s idle in a
-    transaction and 120 s a statement; the owner that runs the migrations
-    keeps no statement limit (a CONCURRENTLY build waits, and reads a big
-    table twice). Run as prod runs it: by the database's owner, no
-    superuser. Downgraded, both are gone."""
-    suffix = uuid.uuid4().hex[:8]
-    owner, app_role, dbname = f"mig_{suffix}", f"app_{suffix}", f"migtest_limits_{suffix}"
-    admin = create_engine(pg_admin_url, isolation_level="AUTOCOMMIT")
-    with admin.connect() as conn:
-        conn.execute(text(f"CREATE ROLE {owner} LOGIN PASSWORD 'pw'"))
-        conn.execute(text(f"CREATE ROLE {app_role} LOGIN PASSWORD 'pw'"))
-        conn.execute(text(f'CREATE DATABASE "{dbname}" OWNER {owner}'))
-    base = pg_admin_url.rsplit("/", 1)[0].split("@", 1)[1]
-    owner_url = f"postgresql+psycopg2://{owner}:pw@{base}/{dbname}"
-    app_url = f"postgresql+psycopg2://{app_role}:pw@{base}/{dbname}"
-    try:
-        up = _run_alembic("upgrade", "head", database_url=owner_url)
-        assert up.returncode == 0, up.stdout + up.stderr
-        assert _setting(app_url, "idle_in_transaction_session_timeout") == "3min"
-        assert _setting(app_url, "statement_timeout") == "2min"
-        assert _setting(owner_url, "idle_in_transaction_session_timeout") == "3min"
-        assert _setting(owner_url, "statement_timeout") == "0"
-        down = _run_alembic("downgrade", "0010_drop_prefix_indexes", database_url=owner_url)
-        assert down.returncode == 0, down.stdout + down.stderr
-        for url in (app_url, owner_url):
-            assert _setting(url, "idle_in_transaction_session_timeout") == "0"
-            assert _setting(url, "statement_timeout") == "0"
-    finally:
-        with admin.connect() as conn:
-            conn.execute(text(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)'))
-            conn.execute(text(f"DROP ROLE IF EXISTS {app_role}"))
-            conn.execute(text(f"DROP ROLE IF EXISTS {owner}"))
-        admin.dispose()
-
-
-def test_the_session_limits_render_as_offline_sql_for_whichever_database_runs_them(
-    pg_admin_url: str,
-) -> None:
-    """``alembic upgrade --sql`` (no database to ask its name) prints 0011
-    for the database it is run in: current_database(), never a name."""
-    out = _run_alembic(
-        "upgrade", "0010_drop_prefix_indexes:0011_media_session_limits", "--sql",
-        database_url=pg_admin_url,
-    )  # fmt: skip
-    assert out.returncode == 0, out.stdout + out.stderr
-    assert "current_database()" in out.stdout
-    assert "idle_in_transaction_session_timeout" in out.stdout and "'180s'" in out.stdout
-    assert "statement_timeout" in out.stdout and "'120s'" in out.stdout
-    assert "media" not in out.stdout.replace("0011_media_session_limits", "")
+    assert settings == []
