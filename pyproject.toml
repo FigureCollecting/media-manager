@@ -18,6 +18,7 @@ pillow = "^10.4.0"
 pyvips = "^2.2.3"
 ImageHash = "^4.3.1"
 celery = "^5.4.0"
+kombu = ">=5.6.2,<5.7"
 redis = "^5.0.0"
 python-jose = {version = "^3.3.0", extras = ["cryptography"]}
 pydantic-settings = "^2.4.0"
