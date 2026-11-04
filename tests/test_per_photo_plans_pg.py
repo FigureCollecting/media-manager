@@ -22,7 +22,7 @@ MEDIADB (U12a): the PLAN GUARD for the display lane and the replay as well
 purge, the replay's plan and its per-chunk reads -- at prod's planner cost
 (random_page_cost 4) and at U5's (1.1). A whole read is allowed only where
 REGISTRY names it (a per-run read, with why, and until when: an entry past
-its date fails the guard until someone looks again), never in the checker.
+its date warns in every run until someone looks again), never in the checker.
 And the seeder's transactions are short: no session of it sits idle inside
 one across its bucket calls (M-1).
 """
@@ -38,12 +38,15 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -372,8 +375,12 @@ class Allowed:
     #: the tables it may read whole
     tables: frozenset[str]
     why: str
-    #: looked at again by then: past it, the guard fails until someone does
+    #: looked at again by then: past it, every run warns until someone does
     until: dt.date
+
+
+class RegistryOverdue(UserWarning):
+    """A REGISTRY entry past its date: look at its whole read again."""
 
 
 #: Prod scale, Nov 2026: display_originals 233 k rows (143 MB), display_depictions
@@ -932,11 +939,34 @@ def _one_seed(
 
 
 def test_the_registry_is_current() -> None:
-    """Each allowed whole read says why and is looked at again by its date."""
+    """Each allowed whole read says why; past its date it warns."""
     today = dt.date.today()
     for entry in REGISTRY:
         assert entry.why.strip() and entry.tables <= set(MEDIA_TABLES), entry
-        assert entry.until >= today, f"looked at again by {entry.until}: {entry.statement}"
+        if entry.until < today:
+            warnings.warn(
+                f"look again (due {entry.until}): {entry.statement}", RegistryOverdue, stacklevel=1
+            )
+
+
+def test_an_overdue_registry_entry_warns_and_fails_no_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The day after an entry's date: every PR's CI runs this module, so an
+    entry past its date asks for a look by a warning in the run's summary,
+    never by failing a build whatever the build changes (an unregistered
+    whole read still fails the guard)."""
+    later = _LOOK_AGAIN + dt.timedelta(days=1)
+
+    class _Later(dt.date):
+        @classmethod
+        def today(cls) -> dt.date:
+            return later
+
+    monkeypatch.setattr(sys.modules[__name__], "dt", SimpleNamespace(date=_Later))
+    with pytest.warns(UserWarning, match="look again") as warned:
+        test_the_registry_is_current()
+    assert len(warned) == len(REGISTRY)
 
 
 def test_the_seeders_whole_run_reads_probe_at_both_costs(
