@@ -25,7 +25,11 @@
     "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp",
     "hotpCounter", "x-hotpCounter", "hotplate", "hotpink", "hotPath", "hotpath",
     "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "userHotpCounter",
-    "MfaOtpCode", "userTOTPCode", "userHOTPCode", "user2OTPCode", "smsOtp_value"
+    "MfaOtpCode", "userTOTPCode", "userHOTPCode", "user2OTPCode", "smsOtp_value",
+    "MFAOTPCode", "SMSOTPCode", "MFATOTPSeed", "userotpCode", "smsotpValue",
+    "MFAOTPNumber", "SMSHOTPExpiry", "userotpNumber", "usertotpAttempts",
+    "userotpcode", "USEROTPCODE", "smsotpvalue", "MFAOTPCODE",
+    "userotpauthurl", "USERTOTPSEED", "mfahotpcounter", "userOtPCode", "mfaSMSOTPURI"
   ],
   "keep": [
     "username", "note", "id", "http.method", "db.statement",
@@ -39,6 +43,6 @@
     "rootPath", "screenshotPath", "snapshotPolicy", "slotPosition", "pivotPoint", "spotPrice", "robotPose"
   ],
   "limit": [
-    "userotpcode", "USEROTPCODE", "smsotpvalue", "MFAOTPCODE"
+    "userotpattempts", "USEROTPNUMBER", "smsotpexpiry", "userOtPAttempts", "useroTpnumber", "mfaSMSOTPID"
   ]
 }
