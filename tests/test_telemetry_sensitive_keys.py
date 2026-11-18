@@ -251,8 +251,8 @@ def test_nothing_but_a_mid_word_otp_is_released() -> None:
             if BEFORE_WITHOUT_OTP.search(key) or not _every_otp_is_mid_word_with_no_word_edge(key):
                 wrongly_released.append(key)
     # The same two counts are pinned in fc-shared's test: both repos read the same corpus.
-    assert len(corpus) == 54432
-    assert len(set(corpus)) == 29692
+    assert len(corpus) == 55296
+    assert len(set(corpus)) == 30259
     assert released > 1000
     assert widened == []
     assert wrongly_released == []

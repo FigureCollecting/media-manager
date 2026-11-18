@@ -22,6 +22,7 @@
     "userOtp_code", "userOtp.value", "userOtp2", "login.otp.value",
     "x-otpCode", "mfa.otpCode", "v2otpCode",
     "totp", "TOTP", "totp_code", "totpCode", "x-totp", "mfa.totp", "user_totp", "userTotp", "mfa.totpCode",
+    "totpattempts", "mfa.totpnumber", "TOTPEXPIRY",
     "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp",
     "hotpCounter", "x-hotpCounter", "hotplate", "hotpink", "hotPath", "hotpath",
     "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "userHotpCounter",
