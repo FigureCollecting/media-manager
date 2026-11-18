@@ -1,0 +1,41 @@
+{
+  "about": "Keys for the sensitive-key pattern. The same file, byte for byte, is in fc-shared (tests/fixtures/sensitive-keys.json) and media-manager (tests/fixtures/sensitive-keys.json): change both together.",
+  "redact": [
+    "pass", "password", "Password", "PASSWORD", "passwd", "user.password", "userPassword", "db_pass", "forgotPassword",
+    "passphrase", "key_passphrase",
+    "secret", "clientSecret", "client_secret", "client-secret", "totp_secret",
+    "token", "access_token", "refreshToken", "id_token", "x-csrf-token",
+    "apiKey", "api_key", "api-key", "apikey", "x-api-key", "X-API-Key",
+    "accessKey", "access_key", "access-key", "aws_secret_access_key",
+    "privateKey", "private_key", "private-key",
+    "authorization", "Authorization", "http.request.header.authorization", "proxy-authorization",
+    "credential", "credentials", "X-Amz-Credential",
+    "cookie", "Cookie", "set-cookie",
+    "sessionId", "session_id", "session-id", "sessionid",
+    "bearer", "Bearer",
+    "pin", "PIN", "user.pin", "card-pin",
+    "ssn", "SSN", "user.ssn",
+    "mfa", "MFA", "user.mfa", "mfa.method",
+    "otp", "OTP", "Otp",
+    "otp_code", "otp-code", "otp.code", "otpCode", "otpcode", "OTPCode", "otp2", "otp_2",
+    "x-otp", "X-OTP", "mfa.otp", "user_otp", "sms-otp", "userOtp", "userOTP", "emailOtp", "login2otp",
+    "userOtp_code", "userOtp.value", "userOtp2", "login.otp.value",
+    "x-otpCode", "mfa.otpCode", "v2otpCode",
+    "totp", "TOTP", "totp_code", "totpCode", "x-totp", "mfa.totp", "user_totp", "userTotp", "mfa.totpCode",
+    "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp"
+  ],
+  "keep": [
+    "username", "note", "id", "http.method", "db.statement",
+    "pinned", "spinner", "shipping", "opinion", "userPin", "pin_count",
+    "mfaEnabled", "ssnLast4",
+    "laptop", "captopril", "option", "optIn", "top", "stop"
+  ],
+  "released": [
+    "footprint", "footprintMm", "footprint_mm", "claim_footprint", "Footprint", "FOOTPRINT",
+    "footpath", "hotplate", "potpourri", "hotpink", "hotPath", "hotpath",
+    "rootPath", "screenshotPath", "snapshotPolicy", "slotPosition", "pivotPoint", "spotPrice", "robotPose"
+  ],
+  "limit": [
+    "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "hotpCounter", "userHotpCounter"
+  ]
+}

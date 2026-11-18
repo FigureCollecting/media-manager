@@ -54,9 +54,14 @@ TRUNCATED = "[truncated:max-depth]"
 TRUNCATED_ENTRIES = "[truncated:max-entries]"
 UNSERIALIZABLE = "[unserializable]"
 
+# 'otp' counts only at an edge of a word of the key: where it (or totp) starts the key or follows a
+# non-letter (otp_code, otpCode, totpCode, x-otp), or where it ends the key or precedes a non-letter
+# (userOtp, hotp, mfa.otp). With a letter on both sides it is the middle of another word (footprint,
+# rootPath); the pattern ignores case, so it keeps userOtpCode too. As fc-shared's sanitize.ts.
 SENSITIVE_KEY = re.compile(
     r"pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret"
-    r"|authorization|credential|cookie|session[-_]?id|bearer|otp|passphrase|\bpin\b|\bssn\b|\bmfa\b",
+    r"|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])t?otp|otp(?:$|[^a-z])"
+    r"|passphrase|\bpin\b|\bssn\b|\bmfa\b",
     re.IGNORECASE | re.ASCII,
 )
 SECRET_VALUES: tuple[re.Pattern[str], ...] = (
