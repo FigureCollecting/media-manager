@@ -22,7 +22,10 @@
     "userOtp_code", "userOtp.value", "userOtp2", "login.otp.value",
     "x-otpCode", "mfa.otpCode", "v2otpCode",
     "totp", "TOTP", "totp_code", "totpCode", "x-totp", "mfa.totp", "user_totp", "userTotp", "mfa.totpCode",
-    "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp"
+    "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp",
+    "hotpCounter", "x-hotpCounter", "hotplate", "hotpink", "hotPath", "hotpath",
+    "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "userHotpCounter",
+    "MfaOtpCode", "userTOTPCode", "userHOTPCode", "user2OTPCode", "smsOtp_value"
   ],
   "keep": [
     "username", "note", "id", "http.method", "db.statement",
@@ -32,10 +35,10 @@
   ],
   "released": [
     "footprint", "footprintMm", "footprint_mm", "claim_footprint", "Footprint", "FOOTPRINT",
-    "footpath", "hotplate", "potpourri", "hotpink", "hotPath", "hotpath",
+    "footpath", "potpourri", "userFootprint", "USER_FOOTPRINT", "myFOOTPRINT", "IoTPlatform", "ROOTPATH",
     "rootPath", "screenshotPath", "snapshotPolicy", "slotPosition", "pivotPoint", "spotPrice", "robotPose"
   ],
   "limit": [
-    "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "hotpCounter", "userHotpCounter"
+    "userotpcode", "USEROTPCODE", "smsotpvalue", "MFAOTPCODE"
   ]
 }

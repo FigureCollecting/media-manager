@@ -54,14 +54,17 @@ TRUNCATED = "[truncated:max-depth]"
 TRUNCATED_ENTRIES = "[truncated:max-entries]"
 UNSERIALIZABLE = "[unserializable]"
 
-# 'otp' counts only at an edge of a word of the key: where it (or totp) starts the key or follows a
-# non-letter (otp_code, otpCode, totpCode, x-otp), or where it ends the key or precedes a non-letter
-# (userOtp, hotp, mfa.otp). With a letter on both sides it is the middle of another word (footprint,
-# rootPath); the pattern ignores case, so it keeps userOtpCode too. As fc-shared's sanitize.ts.
+# 'otp' counts only at an edge of a word of the key: where it (or totp, hotp) starts the key or
+# follows a non-letter (otp_code, otpCode, totpCode, x-otp), or where it ends the key or precedes a
+# non-letter (userOtp, mfa.otp). With a letter on both sides it is the middle of another word
+# (footprint, rootPath) unless the key's case shows a word starting there: the last, case-sensitive
+# group (userOtpCode, userOTPCode, userHotpCounter). fc-shared's sanitize.ts holds the same two
+# patterns as DEFAULT_SENSITIVE_KEY_PATTERN and DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.
 SENSITIVE_KEY = re.compile(
     r"pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret"
-    r"|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])t?otp|otp(?:$|[^a-z])"
-    r"|passphrase|\bpin\b|\bssn\b|\bmfa\b",
+    r"|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])"
+    r"|passphrase|\bpin\b|\bssn\b|\bmfa\b"
+    r"|(?-i:Otp|Totp|Hotp|[a-z][TH]?OTP)",
     re.IGNORECASE | re.ASCII,
 )
 SECRET_VALUES: tuple[re.Pattern[str], ...] = (
