@@ -27,6 +27,7 @@
     "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "userHotpCounter",
     "MfaOtpCode", "userTOTPCode", "userHOTPCode", "user2OTPCode", "smsOtp_value",
     "MFAOTPCode", "SMSOTPCode", "MFATOTPSeed", "userotpCode", "smsotpValue",
+    "userOtpNumber", "userTotpNumber", "userHotpAttempts", "userOTPID", "userTOTPID", "userHOTPID",
     "MFAOTPNumber", "SMSHOTPExpiry", "userotpNumber", "usertotpAttempts",
     "userotpcode", "USEROTPCODE", "smsotpvalue", "MFAOTPCODE",
     "userotpauthurl", "USERTOTPSEED", "mfahotpcounter", "userOtPCode", "mfaSMSOTPURI"
