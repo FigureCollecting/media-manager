@@ -349,8 +349,8 @@ def test_nothing_but_what_the_otp_rule_releases_is_released() -> None:
         if after and should_print:
             wrongly_redacted.append(key)
     # The same two counts are pinned in fc-shared's test: both repos read the same corpus.
-    assert len(corpus) == 69120
-    assert len(set(corpus)) == 39651
+    assert len(corpus) == 69696
+    assert len(set(corpus)) == 40114
     assert released > 1000
     assert widened == []
     assert wrongly_released == []
