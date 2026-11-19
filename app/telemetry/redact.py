@@ -88,20 +88,20 @@ def _one_of(entries: tuple[str, ...], sep: str, any_case: bool) -> str:
 # otp, totp and hotp redact where they start the key or follow a non-letter (otp, otp_code, otpCode,
 # x-otp), or end the key or precede a non-letter (userOtp, mfa.otp). With a letter on both sides the
 # last, case-sensitive group reads the key's case: an otp word where the case starts a word there
-# (Otp, Totp, Hotp, OtP, OTp anywhere; OTP or TOTP after a lower-case letter: userOtpCode,
-# userOTPCode) or ends one (otp before a capital, OTP before a capitalised word: userotpCode,
-# MFAOTPCode), and in a single-case run (userotps, USEROTPNUMBER, MFAotpcode) unless a guard word
-# runs on from its p (footprint, FOOTPRINT, footpath). A lower-case o with a capital inside reads as
-# two words (rootPath, IoTPlatform, useroTpnumber): no otp word. Either way the key prints when the
-# rest of it is a non-secret word (otp_attempts, USEROTPSENTAT). \Z, not $: $ also matches before a
-# final line break, which JavaScript's $ does not. fc-shared's sanitize.ts holds the same two
-# patterns as DEFAULT_SENSITIVE_KEY_PATTERN and DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.
+# (Otp, OtP, OTp anywhere; OTP after a lower-case letter: userOtpCode, userOTPCode) or ends one
+# (otp before a capital: userotpCode), and anywhere else (userotps, USEROTPNUMBER, MFAOTPCode,
+# userTotpcode) unless a guard word runs on from its p (footprint, FOOTPRINT, footpath). A
+# lower-case o with a capital inside reads as two words (rootPath, IoTPlatform, useroTpnumber): no
+# otp word. Either way the key prints when the rest of it is a non-secret word (otp_attempts,
+# USEROTPSENTAT). \Z, not $: $ also matches before a final line break, which JavaScript's $ does
+# not. fc-shared's sanitize.ts holds the same two patterns as DEFAULT_SENSITIVE_KEY_PATTERN and
+# DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.
 SENSITIVE_KEY = re.compile(
     r"pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret"
     r"|authorization|credential|cookie|session[-_]?id|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))"
     rf"(?![^a-z0-9]*{_one_of(_OTP_NON_SECRET_SUFFIXES, '[^a-z0-9]*', any_case=False)}\Z)"
     r"|passphrase|\bpin\b|\bssn\b|\bmfa\b"
-    r"|(?-i:(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)"
+    r"|(?-i:(?:Otp|[a-z]OTP|otp(?=[A-Z])|O(?:tP|Tp)"
     r"|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))"
     rf"(?!{_one_of(tuple(word[1:] for word in _OTP_GUARD_WORDS), '', any_case=True)}))"
     rf"(?![^A-Za-z0-9]*{_one_of(_OTP_NON_SECRET_SUFFIXES, '[^A-Za-z0-9]*', any_case=True)}\Z))",

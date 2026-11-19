@@ -70,12 +70,11 @@ def _every_otp_prints_by_the_rule(key: str) -> bool:
 
     Each one prints when what follows it is separators and one non-secret
     entry, and nothing else. Otherwise it redacts when a separator or the key's
-    edge is on either side, when its case starts a word (Otp, OtP, OTp; Totp,
-    Hotp; OTP or TOTP after a lower-case letter) or ends one (otp before a
-    capital; OTP before a capitalised word). A lower-case o with a capital
-    inside (rootPath, IoTPlatform) is no otp word. What is left is a
-    single-case run (footprint, USEROTPNUMBER): it redacts unless a guard word
-    runs on from the p.
+    edge is on either side (totp and hotp count from their t or h), when its
+    case starts a word (Otp, OtP, OTp; OTP after a lower-case letter) or ends
+    one (otp before a capital). A lower-case o with a capital inside (rootPath,
+    IoTPlatform) is no otp word. What is left (footprint, USEROTPNUMBER,
+    MFAOTPCode) redacts unless a guard word runs on from the p.
     """
     for found in re.finditer(r"otp", key, re.I):
         at = found.start()
@@ -93,15 +92,10 @@ def _every_otp_prints_by_the_rule(key: str) -> bool:
             continue
         if word in ("Otp", "OtP", "OTp"):
             return False
-        if word == "otp" and (before in "TH" or after.isupper()):
+        if word == "otp" and after.isupper():
             return False
-        if word == "OTP":
-            lead = two_back if before in "TH" else before
-            if lead.isascii() and lead.islower():
-                return False
-            then = key[at + 4 : at + 5]
-            if after.isupper() and then.isascii() and then.islower():
-                return False
+        if word == "OTP" and before.islower():
+            return False
         if not rest.lower().startswith(GUARD_TAILS):
             return False
     return True
@@ -355,8 +349,8 @@ def test_nothing_but_what_the_otp_rule_releases_is_released() -> None:
         if after and should_print:
             wrongly_redacted.append(key)
     # The same two counts are pinned in fc-shared's test: both repos read the same corpus.
-    assert len(corpus) == 67968
-    assert len(set(corpus)) == 39089
+    assert len(corpus) == 69120
+    assert len(set(corpus)) == 39651
     assert released > 1000
     assert widened == []
     assert wrongly_released == []
@@ -386,7 +380,7 @@ def test_keeps_every_other_alternative_and_builds_the_otp_words_from_the_fixture
         in r.SENSITIVE_KEY.pattern
     )
     camel = (
-        "(?-i:(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)"
+        "(?-i:(?:Otp|[a-z]OTP|otp(?=[A-Z])|O(?:tP|Tp)"
         f"|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!{guard}))"
         rf"(?![^A-Za-z0-9]*{non_secret_any_case}\Z))"
     )
