@@ -242,6 +242,19 @@ def test_prints_an_otp_key_followed_by_a_non_secret_word_alone_and_redacts_more(
             assert _sensitive(more)
 
 
+@pytest.mark.parametrize("key", KEYS["unicodePrints"])
+def test_prints_a_non_ascii_letter_as_a_separator_between_otp_and_a_non_secret_word(key: str) -> None:
+    """re.ASCII: without it the long s (U+017F) would read as s and the Kelvin sign (U+212A) as k."""
+    assert not _sensitive(key)
+    assert not r.is_sensitive(key)
+
+
+@pytest.mark.parametrize("key", KEYS["unicodeRedacts"])
+def test_redacts_a_key_whose_non_ascii_letter_does_not_fold_to_an_ascii_one(key: str) -> None:
+    assert _sensitive(key)
+    assert r.is_sensitive(key)
+
+
 def test_reads_only_the_end_of_the_key_as_its_end_not_a_line_break_before_it() -> None:
     # Python's $ also matches before a final line break; JavaScript's does not. \Z keeps the two the same.
     assert _sensitive("otp_attempts\n")
@@ -349,8 +362,8 @@ def test_nothing_but_what_the_otp_rule_releases_is_released() -> None:
         if after and should_print:
             wrongly_redacted.append(key)
     # The same two counts are pinned in fc-shared's test: both repos read the same corpus.
-    assert len(corpus) == 69696
-    assert len(set(corpus)) == 40114
+    assert len(corpus) == 70848
+    assert len(set(corpus)) == 40994
     assert released > 1000
     assert widened == []
     assert wrongly_released == []

@@ -60,7 +60,7 @@ UNSERIALIZABLE = "[unserializable]"
 #: (otpNonSecretSuffixes) pins the list, and fc-shared's sanitize.ts reads the same file.
 _OTP_NON_SECRET_SUFFIXES = (
     *("attempts", "count", "enabled", "required", "verified", "expires", "expiry", "expiresAt"),
-    *("sent", "sentAt", "length", "type", "method", "channel", "status", "lastUsed"),
+    *("sentAt", "length", "type", "method", "channel", "status", "lastUsed"),
 )
 #: Words that run on from the p of an otp inside a single-case word, which is then no otp word:
 #: footprint, footpath, potpourri (fixture otpGuardWords).

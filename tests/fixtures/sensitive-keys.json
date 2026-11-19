@@ -35,7 +35,7 @@
     "userotps", "USEROTPNUMBER", "userotpbase32", "userotpqrcode", "userotpprovisioninguri", "userotpbackupcodes",
     "userotpsharedkey", "mfaSMSOTPID", "MFAotpcode", "userOTpCode", "USERHOTPS",
     "userotpcounter", "otp_attempts_2", "otpAttemptsLeft", "otpCodeSent", "userotpsentto", "SMSOTPcode", "userotpID",
-    "otp_2_attempts", "userOtpExpires2At"
+    "otp_2_attempts", "userOtpExpires2At", "otp_sent", "otpSent", "USEROTPSENT", "otpLastCodeUsed", "otp_expires_code_at"
   ],
   "keep": [
     "username", "note", "id", "http.method", "db.statement",
@@ -50,7 +50,7 @@
   ],
   "otpNonSecret": [
     "otp_attempts", "otpEnabled", "OTP_REQUIRED", "otp.verified", "otpExpiresAt", "otp-expires-at", "otp_expiry",
-    "otp_sent", "otpSentAt", "otpLength", "otpType", "otpMethod", "otpChannel", "otpStatus", "otpLastUsed", "otp_count",
+    "otpSentAt", "otpLength", "otpType", "otpMethod", "otpChannel", "otpStatus", "otpLastUsed", "otp_count",
     "totpattempts", "TOTPEXPIRY", "userHotpAttempts", "usertotpAttempts", "SMSHOTPExpiry",
     "userotpattempts", "smsotpexpiry", "userOtPAttempts", "userOtpEnabled", "user_totp_required", "USEROTPSENTAT",
     "x-hotp-length", "userOTPStatus", "MFAOTPCount", "userOtp_attempts", "smsOTP_EXPIRES_AT"
@@ -60,7 +60,7 @@
   ],
   "otpNonSecretSuffixes": [
     "attempts", "count", "enabled", "required", "verified", "expires", "expiry", "expiresAt",
-    "sent", "sentAt", "length", "type", "method", "channel", "status", "lastUsed"
+    "sentAt", "length", "type", "method", "channel", "status", "lastUsed"
   ],
   "otpGuardWords": [
     "path", "pourri", "print"
@@ -76,6 +76,12 @@
     "data", "payload", "params", "settings", "state", "record", "entry", "creds", "cred", "pwd", "privkey",
     "seckey", "salt", "hmac", "mac", "sig", "nonce", "challenge", "vault", "store", "cache",
     "sms", "message", "msg", "body", "email", "mail", "content", "template",
-    "shared", "sharedkey"
+    "shared", "sharedkey", "sent"
+  ],
+  "unicodePrints": [
+    "otpſattempts", "otp_Kattempts", "otp_код_attempts"
+  ],
+  "unicodeRedacts": [
+    "otp_ſtatus", "otp_ſentat", "OTP_ſENTAT"
   ]
 }
