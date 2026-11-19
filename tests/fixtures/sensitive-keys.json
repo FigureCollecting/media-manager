@@ -35,7 +35,8 @@
     "userotps", "USEROTPNUMBER", "userotpbase32", "userotpqrcode", "userotpprovisioninguri", "userotpbackupcodes",
     "userotpsharedkey", "mfaSMSOTPID", "MFAotpcode", "userOTpCode", "USERHOTPS",
     "userotpcounter", "otp_attempts_2", "otpAttemptsLeft", "otpCodeSent", "userotpsentto", "SMSOTPcode", "userotpID",
-    "otp_2_attempts", "userOtpExpires2At", "otp_sent", "otpSent", "USEROTPSENT", "otpLastCodeUsed", "otp_expires_code_at"
+    "otp_2_attempts", "userOtpExpires2At", "otp_sent", "otpSent", "USEROTPSENT", "otpLastCodeUsed", "otp_expires_code_at",
+    "otp_code_attempts", "OTP-CODE-STATUS", "x-otp-last-code-length"
   ],
   "keep": [
     "username", "note", "id", "http.method", "db.statement",
