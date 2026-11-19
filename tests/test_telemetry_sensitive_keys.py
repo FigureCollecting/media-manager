@@ -1,4 +1,4 @@
-"""LG-S1: 'otp' names a secret only at an edge of a word of the key.
+"""LG-S1: 'otp' names a secret only as a word of the key, and not before a non-secret word.
 
 The key lists are shared with fc-shared, whose DEFAULT_SENSITIVE_KEY_PATTERN
 and DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN (src/utils/sanitize.ts) this module's
@@ -36,6 +36,21 @@ BEFORE = re.compile(_BEFORE_SOURCE, re.IGNORECASE | re.ASCII)
 BEFORE_WITHOUT_OTP = re.compile(_BEFORE_SOURCE.replace("|otp|", "|"), re.IGNORECASE | re.ASCII)
 
 
+def _words_of(entry: str) -> list[str]:
+    """A word list entry's words: expiresAt is expires, then at."""
+    return [word.lower() for word in re.split(r"(?=[A-Z])", entry) if word]
+
+
+#: What may follow an otp word for the key to print: separators, then one
+#: non-secret entry, then the end.
+NON_SECRET_REST = [
+    re.compile(rf"[^a-z0-9]*{'[^a-z0-9]*'.join(_words_of(entry))}", re.IGNORECASE | re.ASCII)
+    for entry in KEYS["otpNonSecretSuffixes"]
+]
+#: The letters after otp when a guard word runs on from its p: footprint, footpath, potpourri.
+GUARD_TAILS = tuple(word[1:] for word in KEYS["otpGuardWords"])
+
+
 def _sensitive(key: str) -> bool:
     return r.SENSITIVE_KEY.search(key) is not None
 
@@ -44,6 +59,84 @@ def _line(msg: str = "", **fields: Any) -> dict[str, Any]:
     lines: list[str] = []
     Logger(service="t", version="1", env={}, sink=lines.append).info(msg, **fields)
     return json.loads(lines[0])  # type: ignore[no-any-return]
+
+
+def _letter(char: str) -> bool:
+    return char.isascii() and char.isalpha()
+
+
+def _every_otp_prints_by_the_rule(key: str) -> bool:
+    """The keys the otp rule lets print, read one otp at a time (any case).
+
+    Each one prints when what follows it is separators and one non-secret
+    entry, and nothing else. Otherwise it redacts when a separator or the key's
+    edge is on either side, when its case starts a word (Otp, OtP, OTp; Totp,
+    Hotp; OTP or TOTP after a lower-case letter) or ends one (otp before a
+    capital; OTP before a capitalised word). A lower-case o with a capital
+    inside (rootPath, IoTPlatform) is no otp word. What is left is a
+    single-case run (footprint, USEROTPNUMBER): it redacts unless a guard word
+    runs on from the p.
+    """
+    for found in re.finditer(r"otp", key, re.I):
+        at = found.start()
+        word = found.group(0)
+        before = key[at - 1] if at > 0 else ""
+        after = key[at + 3 : at + 4]
+        rest = key[at + 3 :]
+        if any(words.fullmatch(rest) for words in NON_SECRET_REST):
+            continue
+        two_back = key[at - 2] if at > 1 else ""
+        starts_word = not _letter(before) or (before in "thTH" and not _letter(two_back))
+        if starts_word or not _letter(after):
+            return False
+        if word[0] == "o" and word != "otp":
+            continue
+        if word in ("Otp", "OtP", "OTp"):
+            return False
+        if word == "otp" and (before in "TH" or after.isupper()):
+            return False
+        if word == "OTP":
+            lead = two_back if before in "TH" else before
+            if lead.isascii() and lead.islower():
+                return False
+            then = key[at + 4 : at + 5]
+            if after.isupper() and then.isascii() and then.islower():
+                return False
+        if not rest.lower().startswith(GUARD_TAILS):
+            return False
+    return True
+
+
+def _tail_keys(tail: str) -> list[str]:
+    """Each casing of an otp key with a tail word after the otp, totp or hotp: userotpqrcode, USEROTPQRCODE ..."""
+    return [
+        key
+        for prefix in ("user", "mfa", "sms", "pending", "last", "new")
+        for core in ("otp", "totp", "hotp")
+        for key in (
+            prefix + core + tail,
+            (prefix + core + tail).upper(),
+            prefix + core.capitalize() + tail.capitalize(),
+            f"{prefix}_{core}_{tail}",
+        )
+    ]
+
+
+def _non_secret_keys(entry: str) -> list[str]:
+    """Each casing of an otp key whose word after otp is one non-secret entry: otp_expires_at, userotpexpiresat ..."""
+    words = _words_of(entry)
+    camel = "".join(word.capitalize() for word in words)
+    return [
+        f"otp_{'_'.join(words)}",
+        f"otp{camel}",
+        f"userOtp{camel}",
+        f"userotp{''.join(words)}",
+        f"USEROTP{''.join(words).upper()}",
+        f"USER_TOTP_{'_'.join(words).upper()}",
+        f"x-hotp-{'-'.join(words)}",
+        f"smsOTP{camel}",
+        f"SMSOTP{camel}",
+    ]
 
 
 def test_keeps_footprint_footprint_mm_laptop_and_captopril() -> None:
@@ -114,7 +207,7 @@ def test_still_redacts_a_key_whose_case_shows_where_the_otp_word_ends() -> None:
     assert all(r.is_sensitive(key) for key in fields)
 
 
-def test_still_redacts_a_single_case_key_that_names_a_secret_straight_after_otp() -> None:
+def test_redacts_a_single_case_otp_key_whatever_word_follows_unless_it_names_no_secret() -> None:
     fields = {
         "userotpcode": "1",
         "USEROTPCODE": "2",
@@ -122,26 +215,45 @@ def test_still_redacts_a_single_case_key_that_names_a_secret_straight_after_otp(
         "MFAOTPCODE": "4",
         "userotpauthurl": "5",
         "userOtPCode": "6",
+        "userotps": "7",
+        "USEROTPNUMBER": "8",
+        "userotpbase32": "9",
+        "userotpqrcode": "10",
+        "userotpprovisioninguri": "11",
+        "userotpbackupcodes": "12",
+        "userotpsharedkey": "13",
     }
     assert r.redact_value(fields) == dict.fromkeys(fields, "[REDACTED]")
     assert all(r.is_sensitive(key) for key in fields)
+    printed = {"userotpattempts": 3, "USEROTPEXPIRY": "x"}
+    assert r.redact_value(printed) == printed
 
 
-#: The words that name a secret straight after otp, in any case and with no
-#: separator (userotpcode, USEROTPSEED).
-SECRET_SUFFIXES = [
-    *("auth", "code", "key", "secret", "seed", "token", "value", "counter"),
-    *("uri", "url", "pin", "digits", "hash", "b32", "raw", "recovery"),
-]
-
-
-@pytest.mark.parametrize("suffix", SECRET_SUFFIXES)
-def test_redacts_otp_and_a_secret_suffix_in_lower_and_in_upper_case_as_before(suffix: str) -> None:
-    for key in (f"userotp{suffix}", f"USEROTP{suffix.upper()}", f"smstotp{suffix}s"):
+@pytest.mark.parametrize("tail", KEYS["otpSecretTails"])
+def test_redacts_otp_totp_and_hotp_followed_by_a_tail_in_four_casings_as_before(tail: str) -> None:
+    for key in _tail_keys(tail):
         assert BEFORE.search(key)
         assert _sensitive(key)
         assert r.is_sensitive(key)
         assert r.redact_value({key: "hunter2"}) == {key: "[REDACTED]"}
+
+
+@pytest.mark.parametrize("entry", KEYS["otpNonSecretSuffixes"])
+def test_prints_an_otp_key_followed_by_a_non_secret_word_alone_and_redacts_more(entry: str) -> None:
+    for key in _non_secret_keys(entry):
+        assert BEFORE.search(key)
+        assert not _sensitive(key)
+        assert r.redact_value({key: "visible"}) == {key: "visible"}
+        for more in (f"{key}s", f"{key}2", f"{key}_code", f"{key}Code"):
+            assert _sensitive(more)
+
+
+def test_reads_only_the_end_of_the_key_as_its_end_not_a_line_break_before_it() -> None:
+    # Python's $ also matches before a final line break; JavaScript's does not. \Z keeps the two the same.
+    assert _sensitive("otp_attempts\n")
+    assert _sensitive("userotpattempts\n")
+    assert _sensitive("userOtpAttempts\n")
+    assert not _sensitive("otp_attempts")
 
 
 def test_masks_a_camel_case_or_acronym_otp_key_in_the_text_of_a_log_line() -> None:
@@ -161,34 +273,14 @@ def test_masks_a_camel_case_or_acronym_otp_key_in_the_text_of_a_log_line() -> No
     assert line["form"] == "userOtpNumber=[REDACTED]&footprint=1"
 
 
-def _every_otp_is_mid_word_with_no_word_edge(key: str) -> bool:
-    """The keys a mid-word otp may be released for, read one occurrence at a
-    time: a letter on both sides; no word that the key's case shows starting
-    there (Otp, Totp, Hotp; OTP, TOTP, HOTP after a lower-case letter or a
-    digit); no word that the key's case shows ending there (otp before a
-    capital; OTP before a capitalised word); and no secret suffix straight
-    after it."""
-    for found in re.finditer(r"otp", key, re.I):
-        at = found.start()
-        before = key[at - 1] if at > 0 else ""
-        after = key[at + 3 : at + 4]
-        if not (before.isascii() and before.isalpha() and after.isascii() and after.isalpha()):
-            return False
-        word = found.group(0)
-        if word == "Otp" or (word == "otp" and before in "TH"):
-            return False
-        if word == "otp" and after.isupper():
-            return False
-        if word == "OTP":
-            lead = (key[at - 2] if at > 1 else "") if before in "TH" else before
-            if lead.isascii() and (lead.islower() or lead.isdigit()):
-                return False
-            then = key[at + 4 : at + 5]
-            if after.isupper() and then.isascii() and then.islower():
-                return False
-        if key[at + 3 :].lower().startswith(tuple(SECRET_SUFFIXES)):
-            return False
-    return True
+def test_masks_a_single_case_otp_key_in_a_log_line_and_prints_a_non_secret_one() -> None:
+    text = _line(
+        "header lines\nuserotpbase32: 765432\nUSEROTPNUMBER: 765433\nuserotpattempts: 3\notpExpiresAt: 9"
+    )["msg"]
+    assert text == (
+        "header lines userotpbase32: [REDACTED] USEROTPNUMBER: [REDACTED]"
+        " userotpattempts: 3 otpExpiresAt: 9"
+    )
 
 
 @pytest.mark.parametrize("key", KEYS["redact"])
@@ -211,12 +303,18 @@ def test_no_longer_redacts(key: str) -> None:
     assert r.redact_value({key: "visible"}) == {key: "visible"}
 
 
+@pytest.mark.parametrize("key", KEYS["otpNonSecret"])
+def test_no_longer_redacts_a_key_whose_word_after_otp_names_no_secret(key: str) -> None:
+    assert BEFORE.search(key)
+    assert not _sensitive(key)
+    assert r.redact_value({key: "visible"}) == {key: "visible"}
+
+
 @pytest.mark.parametrize("key", KEYS["limit"])
 def test_known_limit_no_longer_redacts(key: str) -> None:
-    """otp with a letter on both sides, no secret suffix straight after it and
-    no word edge shown by case: a single-case key (userotpattempts,
-    USEROTPNUMBER), an odd case mix (userOtPAttempts) and a run of acronyms
-    (mfaSMSOTPID). A key in camelCase, or with a separator, redacts."""
+    """A lower-case o with a capital inside the otp (useroTpnumber) reads as two
+    words, as rootPath and IoTPlatform do, so it is no otp word. Any other case
+    form of otp, totp or hotp redacts."""
     assert BEFORE.search(key)
     assert not _sensitive(key)
     assert not r.is_sensitive(key)
@@ -227,45 +325,69 @@ def _acronym(key: str) -> str:
     return re.sub(r"[th]?otp[a-z]?", lambda word: word.group(0).upper(), key, flags=re.I)
 
 
-def test_nothing_but_a_mid_word_otp_is_released() -> None:
+def test_nothing_but_what_the_otp_rule_releases_is_released() -> None:
     """Over every fixture key with a prefix, a suffix and a case change."""
     prefixes = ["", "x-", "user_", "user.", "user", "User", "v2", "2", "MFA"]
     suffixes = ["", "_id", "-id", ".value", "Value", "value", "2", "_2"]
     corpus = [
         recase(prefix + key + suffix)
-        for keys in KEYS.values()
-        for key in keys
+        for group in ("redact", "keep", "released", "otpNonSecret", "limit")
+        for key in KEYS[group]
         for prefix in prefixes
         for suffix in suffixes
         for recase in (str, str.upper, str.lower, _acronym)
     ]
     widened = []
     wrongly_released = []
+    wrongly_redacted = []
     released = 0
     for key in corpus:
         before, after = BEFORE.search(key) is not None, _sensitive(key)
         if after and not before:
             widened.append(key)
+        should_print = (
+            before and not BEFORE_WITHOUT_OTP.search(key) and _every_otp_prints_by_the_rule(key)
+        )
         if before and not after:
             released += 1
-            if BEFORE_WITHOUT_OTP.search(key) or not _every_otp_is_mid_word_with_no_word_edge(key):
+            if not should_print:
                 wrongly_released.append(key)
+        if after and should_print:
+            wrongly_redacted.append(key)
     # The same two counts are pinned in fc-shared's test: both repos read the same corpus.
-    assert len(corpus) == 55296
-    assert len(set(corpus)) == 30259
+    assert len(corpus) == 67968
+    assert len(set(corpus)) == 39089
     assert released > 1000
     assert widened == []
     assert wrongly_released == []
+    assert wrongly_redacted == []
 
 
-def test_keeps_every_other_alternative_and_its_flags() -> None:
+def _any_case(word: str) -> str:
+    return "".join(f"[{letter}{letter.upper()}]" if letter.isalpha() else letter for letter in word)
+
+
+def _one_of(entries: list[str] | tuple[str, ...], sep: str, recase: Any) -> str:
+    return "(?:" + "|".join(sep.join(recase(w) for w in _words_of(e)) for e in entries) + ")"
+
+
+def test_keeps_every_other_alternative_and_builds_the_otp_words_from_the_fixture_lists() -> None:
     before = [alternative for alternative in _BEFORE_SOURCE.split("|") if alternative != "otp"]
     after = r.SENSITIVE_KEY.pattern.split("|")
     assert len(before) == 17
     assert [alternative for alternative in before if alternative not in after] == []
     assert r.SENSITIVE_KEY.flags & (re.IGNORECASE | re.ASCII) == re.IGNORECASE | re.ASCII
-    # The camelCase words are the one case-sensitive group, as fc-shared's separate pattern holds them.
-    camel = "(?-i:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z]))"
+    # fc-shared's two patterns hold the same pieces, and its test pins them too.
+    non_secret = _one_of(KEYS["otpNonSecretSuffixes"], "[^a-z0-9]*", str)
+    non_secret_any_case = _one_of(KEYS["otpNonSecretSuffixes"], "[^A-Za-z0-9]*", _any_case)
+    guard = _one_of(GUARD_TAILS, "", _any_case)
+    assert (
+        rf"|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))(?![^a-z0-9]*{non_secret}\Z)|passphrase|"
+        in r.SENSITIVE_KEY.pattern
+    )
+    camel = (
+        "(?-i:(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)"
+        f"|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))(?!{guard}))"
+        rf"(?![^A-Za-z0-9]*{non_secret_any_case}\Z))"
+    )
     assert r.SENSITIVE_KEY.pattern.endswith("|" + camel)
-    # The secret suffixes are one case-insensitive alternative, in fc-shared's key pattern too.
-    assert f"|otp(?:{'|'.join(SECRET_SUFFIXES)})|" in r.SENSITIVE_KEY.pattern

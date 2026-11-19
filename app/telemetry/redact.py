@@ -54,21 +54,57 @@ TRUNCATED = "[truncated:max-depth]"
 TRUNCATED_ENTRIES = "[truncated:max-entries]"
 UNSERIALIZABLE = "[unserializable]"
 
-# 'otp' counts only at an edge of a word of the key: where it (or totp, hotp) starts the key or
-# follows a non-letter (otp_code, otpCode, totpCode, x-otp), or where it ends the key or precedes a
-# non-letter (userOtp, mfa.otp). With a letter on both sides it is the middle of another word
-# (footprint, rootPath) unless a word that names a secret follows it at once (userotpcode,
-# USEROTPSEED), or the key's case shows a word starting or ending there: the last, case-sensitive
-# group (userOtpCode, userOTPCode, userHotpCounter; userotpCode, MFAOTPCode). Not redacted: otp
-# with a letter on both sides, none of those words after it and no word edge shown by case
-# (userotpattempts, USEROTPNUMBER, mfaSMSOTPID). fc-shared's sanitize.ts holds the same two
+#: Words after an otp (totp, hotp) word that name no secret: a key whose otp word is followed by
+#: separators and one of these, and nothing else, prints (otp_attempts, otpExpiresAt,
+#: userotpsentat); every other otp key redacts. tests/fixtures/sensitive-keys.json
+#: (otpNonSecretSuffixes) pins the list, and fc-shared's sanitize.ts reads the same file.
+_OTP_NON_SECRET_SUFFIXES = (
+    *("attempts", "count", "enabled", "required", "verified", "expires", "expiry", "expiresAt"),
+    *("sent", "sentAt", "length", "type", "method", "channel", "status", "lastUsed"),
+)
+#: Words that run on from the p of an otp inside a single-case word, which is then no otp word:
+#: footprint, footpath, potpourri (fixture otpGuardWords).
+_OTP_GUARD_WORDS = ("path", "pourri", "print")
+
+
+def _any_case(word: str) -> str:
+    """A word in either case, letter by letter, for the case-sensitive group: at -> [aA][tT]."""
+    return "".join(f"[{letter}{letter.upper()}]" for letter in word)
+
+
+def _one_of(entries: tuple[str, ...], sep: str, any_case: bool) -> str:
+    """One of the entries; an entry's words (expiresAt: expires, at) may be split by sep."""
+    recase = _any_case if any_case else str
+    return (
+        "(?:"
+        + "|".join(
+            sep.join(recase(word.lower()) for word in re.split(r"(?=[A-Z])", entry))
+            for entry in entries
+        )
+        + ")"
+    )
+
+
+# otp, totp and hotp redact where they start the key or follow a non-letter (otp, otp_code, otpCode,
+# x-otp), or end the key or precede a non-letter (userOtp, mfa.otp). With a letter on both sides the
+# last, case-sensitive group reads the key's case: an otp word where the case starts a word there
+# (Otp, Totp, Hotp, OtP, OTp anywhere; OTP or TOTP after a lower-case letter: userOtpCode,
+# userOTPCode) or ends one (otp before a capital, OTP before a capitalised word: userotpCode,
+# MFAOTPCode), and in a single-case run (userotps, USEROTPNUMBER, MFAotpcode) unless a guard word
+# runs on from its p (footprint, FOOTPRINT, footpath). A lower-case o with a capital inside reads as
+# two words (rootPath, IoTPlatform, useroTpnumber): no otp word. Either way the key prints when the
+# rest of it is a non-secret word (otp_attempts, USEROTPSENTAT). \Z, not $: $ also matches before a
+# final line break, which JavaScript's $ does not. fc-shared's sanitize.ts holds the same two
 # patterns as DEFAULT_SENSITIVE_KEY_PATTERN and DEFAULT_SENSITIVE_CAMEL_KEY_PATTERN.
 SENSITIVE_KEY = re.compile(
     r"pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret"
-    r"|authorization|credential|cookie|session[-_]?id|bearer|(?:^|[^a-z])[ht]?otp|otp(?:$|[^a-z])"
-    r"|otp(?:auth|code|key|secret|seed|token|value|counter|uri|url|pin|digits|hash|b32|raw|recovery)"
+    r"|authorization|credential|cookie|session[-_]?id|bearer|(?:(?:^|[^a-z])[ht]?otp|otp(?=$|[^a-z]))"
+    rf"(?![^a-z0-9]*{_one_of(_OTP_NON_SECRET_SUFFIXES, '[^a-z0-9]*', any_case=False)}\Z)"
     r"|passphrase|\bpin\b|\bssn\b|\bmfa\b"
-    r"|(?-i:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z]))",
+    r"|(?-i:(?:Otp|Totp|Hotp|[a-z][TH]?OTP|otp(?=[A-Z])|OTP(?=[A-Z][a-z])|O(?:tP|Tp)"
+    r"|(?:[A-Za-z]otp(?=[a-z])|[A-Z]OTP(?=[A-Za-z]))"
+    rf"(?!{_one_of(tuple(word[1:] for word in _OTP_GUARD_WORDS), '', any_case=True)}))"
+    rf"(?![^A-Za-z0-9]*{_one_of(_OTP_NON_SECRET_SUFFIXES, '[^A-Za-z0-9]*', any_case=True)}\Z))",
     re.IGNORECASE | re.ASCII,
 )
 SECRET_VALUES: tuple[re.Pattern[str], ...] = (

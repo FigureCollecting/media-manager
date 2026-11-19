@@ -1,5 +1,5 @@
 {
-  "about": "Keys for the sensitive-key pattern. The same file, byte for byte, is in fc-shared (tests/fixtures/sensitive-keys.json) and media-manager (tests/fixtures/sensitive-keys.json): change both together.",
+  "about": "Keys and words for the sensitive-key pattern. The same file, byte for byte, is in fc-shared (tests/fixtures/sensitive-keys.json) and media-manager (tests/fixtures/sensitive-keys.json): change both together. otpNonSecretSuffixes and otpGuardWords are the two word lists the patterns are built from; otpSecretTails are words that must redact after otp.",
   "redact": [
     "pass", "password", "Password", "PASSWORD", "passwd", "user.password", "userPassword", "db_pass", "forgotPassword",
     "passphrase", "key_passphrase",
@@ -22,16 +22,19 @@
     "userOtp_code", "userOtp.value", "userOtp2", "login.otp.value",
     "x-otpCode", "mfa.otpCode", "v2otpCode",
     "totp", "TOTP", "totp_code", "totpCode", "x-totp", "mfa.totp", "user_totp", "userTotp", "mfa.totpCode",
-    "totpattempts", "mfa.totpnumber", "TOTPEXPIRY",
+    "totpnumber", "totpath", "mfa.totpnumber", "TOTPDATA",
     "hotp", "HOTP", "hotp_counter", "hotp-counter", "x-hotp", "userHotp", "mfa.hotp",
     "hotpCounter", "x-hotpCounter", "hotplate", "hotpink", "hotPath", "hotpath",
     "userOtpCode", "userOTPCode", "userTotpCode", "smsOtpValue", "userHotpCounter",
     "MfaOtpCode", "userTOTPCode", "userHOTPCode", "user2OTPCode", "smsOtp_value",
     "MFAOTPCode", "SMSOTPCode", "MFATOTPSeed", "userotpCode", "smsotpValue",
-    "userOtpNumber", "userTotpNumber", "userHotpAttempts", "userOTPID", "userTOTPID", "userHOTPID",
-    "MFAOTPNumber", "SMSHOTPExpiry", "userotpNumber", "usertotpAttempts",
+    "userOtpNumber", "userTotpNumber", "userHotpNumber", "userOTPID", "userTOTPID", "userHOTPID",
+    "MFAOTPNumber", "SMSHOTPState", "userotpNumber", "usertotpNumber",
     "userotpcode", "USEROTPCODE", "smsotpvalue", "MFAOTPCODE",
-    "userotpauthurl", "USERTOTPSEED", "mfahotpcounter", "userOtPCode", "mfaSMSOTPURI"
+    "userotpauthurl", "USERTOTPSEED", "mfahotpcounter", "userOtPCode", "mfaSMSOTPURI",
+    "userotps", "USEROTPNUMBER", "userotpbase32", "userotpqrcode", "userotpprovisioninguri", "userotpbackupcodes",
+    "userotpsharedkey", "mfaSMSOTPID", "MFAotpcode", "userOTpCode", "USERHOTPS",
+    "userotpcounter", "otp_attempts_2", "otpAttemptsLeft", "otpCodeSent", "userotpsentto"
   ],
   "keep": [
     "username", "note", "id", "http.method", "db.statement",
@@ -44,7 +47,34 @@
     "footpath", "potpourri", "userFootprint", "USER_FOOTPRINT", "myFOOTPRINT", "IoTPlatform", "ROOTPATH",
     "rootPath", "screenshotPath", "snapshotPolicy", "slotPosition", "pivotPoint", "spotPrice", "robotPose"
   ],
+  "otpNonSecret": [
+    "otp_attempts", "otpEnabled", "OTP_REQUIRED", "otp.verified", "otpExpiresAt", "otp-expires-at", "otp_expiry",
+    "otp_sent", "otpSentAt", "otpLength", "otpType", "otpMethod", "otpChannel", "otpStatus", "otpLastUsed", "otp_count",
+    "totpattempts", "TOTPEXPIRY", "userHotpAttempts", "usertotpAttempts", "SMSHOTPExpiry",
+    "userotpattempts", "smsotpexpiry", "userOtPAttempts", "userOtpEnabled", "user_totp_required", "USEROTPSENTAT",
+    "x-hotp-length", "userOTPStatus", "MFAOTPCount"
+  ],
   "limit": [
-    "userotpattempts", "USEROTPNUMBER", "smsotpexpiry", "userOtPAttempts", "useroTpnumber", "mfaSMSOTPID"
+    "useroTpnumber", "useroTPCode", "smsotPcode"
+  ],
+  "otpNonSecretSuffixes": [
+    "attempts", "count", "enabled", "required", "verified", "expires", "expiry", "expiresAt",
+    "sent", "sentAt", "length", "type", "method", "channel", "status", "lastUsed"
+  ],
+  "otpGuardWords": [
+    "path", "pourri", "print"
+  ],
+  "otpSecretTails": [
+    "auth", "code", "key", "secret", "seed", "token", "value", "counter",
+    "uri", "url", "pin", "digits", "hash", "b32", "raw", "recovery",
+    "s", "number", "num", "no", "digit", "val", "response", "input", "entered", "typed", "guess", "answer",
+    "submitted", "provided", "received", "attempt", "candidate", "plain", "plaintext", "cleartext", "str",
+    "string", "text",
+    "base32", "b64", "base64", "hex", "bytes", "qr", "qrcode", "qrimage", "provisioninguri", "provisioning",
+    "enrollment", "enroll", "backupcodes", "backupcode", "backup", "scratchcodes", "scratch", "material", "config",
+    "data", "payload", "params", "settings", "state", "record", "entry", "creds", "cred", "pwd", "privkey",
+    "seckey", "salt", "hmac", "mac", "sig", "nonce", "challenge", "vault", "store", "cache",
+    "sms", "message", "msg", "body", "email", "mail", "content", "template",
+    "shared", "sharedkey"
   ]
 }
