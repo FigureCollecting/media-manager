@@ -363,6 +363,33 @@ class TestPhotoRungs:
             assert b"secret" not in tier.data and b"ICCP" not in tier.data
             assert not {"exif", "icc_profile", "xmp", "Comment"} & set(_open(tier).info)
 
+    @pytest.mark.parametrize(
+        ("width", "height", "top_edges"),
+        [(2100, 1400, {2048}), (1100, 733, {1100}), (3000, 600, {2048})],
+    )
+    def test_the_top_rung_is_q88_and_every_other_rung_q82(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        width: int,
+        height: int,
+        top_edges: set[int],
+    ) -> None:
+        """The 2,048 rung cut from a LARGER parent is the top rung, as is a
+        parent's own size below it; a drift here changes every such rung under
+        mm-tier-v1 (rule 4: that is a new pipeline version)."""
+        qualities: dict[int, int] = {}
+        real = tiers._webp
+
+        def spy(image: Image.Image, **options: object) -> bytes:
+            qualities[max(image.size)] = int(options["quality"])  # type: ignore[call-overload]
+            return real(image, **options)
+
+        monkeypatch.setattr(tiers, "_webp", spy)
+        mint_photo_tiers(_jpeg(_scene(width, height)))
+        assert set(qualities) == set(ladder_for(width, height))
+        assert {edge for edge, q in qualities.items() if q == 88} == top_edges
+        assert {q for edge, q in qualities.items() if edge not in top_edges} == {82}
+
 
 class TestNoRotation:
     """Uniform scale of the whole frame only: every corner stays where it was."""
@@ -888,6 +915,37 @@ class TestGiantParents:
                 gate=DecodedBytes(1_000_000),
             )
         assert refused.value.code == "parent_too_large"
+
+    def test_a_refusal_on_the_gate_decodes_no_pixel_of_a_photo_or_a_mask(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate is taken BEFORE the decode: a parent too big for it is
+        refused from its header, never decoded first (an OOM in a small pod)."""
+        decoded: list[tuple[int, int]] = []
+        real = tiers._decode
+
+        def spy(image: Image.Image) -> None:
+            decoded.append(image.size)
+            real(image)
+
+        monkeypatch.setattr(tiers, "_decode", spy)
+        rgba = np.dstack([_scene(1600, 1200), _alpha(1600, 1200)])
+        for parent in (_png(_scene(1600, 1200)), _jpeg(_scene(1600, 1200)), _png(rgba)):
+            with pytest.raises(TierRefusal) as refused:
+                mint_photo_tiers(parent, gate=DecodedBytes(1_000_000))
+            assert refused.value.code == "parent_too_large"
+        with pytest.raises(TierRefusal) as refused:
+            mint_mask_tiers(
+                encode_mask_png(_alpha(1600, 1200)),
+                width=1600,
+                height=1200,
+                gate=DecodedBytes(1_000_000),
+            )
+        assert refused.value.code == "parent_too_large"
+        assert decoded == []
+        # the spy sees a decode when the gate has room, so an empty list means none was made
+        mint_mask_tiers(encode_mask_png(_alpha(60, 40)), width=60, height=40)
+        assert decoded == [(60, 40)]
 
     def test_the_gate_counts_the_working_copy_of_each_kind(self) -> None:
         """As Pillow holds them: 4 bytes a pixel for RGB, RGBA and LA alike

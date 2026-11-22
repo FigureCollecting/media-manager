@@ -1097,8 +1097,16 @@ class TestTierServable:
         assert tier_servable(db_session, minted["clean@256"]) is not None
 
     def test_a_tier_of_anything_but_a_clean_copy_or_a_mask_is_not_served(
-        self, db_session: Session, minted: dict[str, str]
+        self,
+        db_session: Session,
+        minted: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """servable() is made to accept the parent, so only tier_servable's own
+        kind check can refuse it (alone, servable() would refuse a "matted"
+        row for want of cut-out lineage)."""
+        monkeypatch.setattr("app.publication.servable", lambda *args, **kwargs: True)
+        assert tier_servable(db_session, minted["mask@256"]) is not None  # the stub accepts
         parent = db_session.get(PublicObject, minted["mask"])
         assert parent is not None
         parent.kind = "matted"

@@ -18,10 +18,12 @@ a re-run applies it; a reader never holds it up.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import string
 import subprocess
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,15 +34,18 @@ import pytest
 from app.models import ImageMask, PublicObject, PublicTier, TierParent
 from app.object_store import LocalObjectStore
 from app.publication import tier_servable
+from app.workers import tiers
 from app.workers.mask import MASK_PIPELINE_VERSION, encode_mask_png
 from app.workers.mask_seed import register_public_object
 from app.workers.tiers import (
     TIER_PIPELINE_VERSION,
+    ladder_for,
     mint_parent,
     refused_parents,
     register_public_tier,
     tier_key,
 )
+from PIL import Image
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -209,9 +214,11 @@ def test_registering_a_tier_probes_the_three_registries(pg: sessionmaker[Session
     }
 
 
-def _real_pair(db: Session, store: LocalObjectStore, label: str) -> tuple[str, str]:
+def _real_pair(
+    db: Session, store: LocalObjectStore, label: str, picture: bytes | None = None
+) -> tuple[str, str]:
     """A real clean copy and a real published mask of it, as rows and bytes."""
-    clean = plans._seed(db, store, plans._png(label), label)
+    clean = plans._seed(db, store, picture or plans._png(label), label)
     alpha = np.zeros((clean.height, clean.width), dtype=np.uint8)
     alpha[8:40, 8:30] = 255
     mask = encode_mask_png(alpha)
@@ -528,5 +535,115 @@ def test_postgres_holds_the_tier_shape_and_the_ledger_states(
             db.commit()
             assert db.execute(select(PublicTier)).all() == []
             assert db.execute(select(TierParent)).all() == []
+    finally:
+        engine.dispose()
+
+
+class _CountingStore(LocalObjectStore):
+    """A store that counts the parent reads (``get``) it is asked for."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.reads = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> bytes:
+        with self._lock:
+            self.reads += 1
+        return super().get(key)
+
+
+def _a_big_picture(width: int, height: int) -> bytes:
+    """A picture of its own, noisy enough that every rung differs, that is
+    still cheap to make."""
+    rng = np.random.default_rng(width * 10_000 + height)
+    arr = rng.integers(0, 256, (height // 20, width // 20, 3), dtype=np.uint8)
+    picture = Image.fromarray(arr).resize((width, height), Image.Resampling.NEAREST)
+    out = io.BytesIO()
+    picture.save(out, format="PNG")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("parent_at", [0, 1], ids=["clean copy", "mask"])
+def test_two_workers_minting_one_parent_at_once_leave_one_set_of_rows_and_one_loser(
+    empty_database_url: str,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_at: int,
+) -> None:
+    """Both workers read the empty registry and ledger, then a barrier holds
+    each at its first register until the other is there, so both insert the
+    same keys. The first insert wins; the second fails on the primary key with
+    an IntegrityError and settles nothing (the caller rolls it back). The rows
+    are exactly the ladder, once, with one ledger row; the stored bytes are the
+    rows'; and the loser's retry settles from the ledger without reading the
+    store (the contract U5's parallel lane relies on)."""
+    up = _run_alembic("upgrade", "head", database_url=empty_database_url)
+    assert up.returncode == 0, up.stdout + up.stderr
+    engine = create_engine(empty_database_url, pool_size=6)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    store = _CountingStore(tmp_path / "media")
+    try:
+        with factory() as db:
+            pair = _real_pair(db, store, "tier-race", _a_big_picture(1300, 900))
+            db.commit()
+        parent = pair[parent_at]
+
+        barrier = threading.Barrier(2, timeout=30)
+        arrived: set[int] = set()
+        real_register = tiers.register_public_tier
+
+        def gated(db: Session, **fields: Any) -> PublicTier:
+            me = threading.get_ident()
+            if me not in arrived:
+                arrived.add(me)
+                barrier.wait()  # both are past their ledger and registry reads
+            return real_register(db, **fields)
+
+        monkeypatch.setattr(tiers, "register_public_tier", gated)
+        outcomes: dict[str, object] = {}
+
+        def worker(name: str) -> None:
+            with factory() as db:
+                try:
+                    outcomes[name] = mint_parent(db, store, parent)
+                    db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    db.rollback()
+                    outcomes[name] = exc
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in ("w1", "w2")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        assert not any(thread.is_alive() for thread in threads)
+        monkeypatch.setattr(tiers, "register_public_tier", real_register)
+
+        losers = [v for v in outcomes.values() if isinstance(v, Exception)]
+        winners = [v for v in outcomes.values() if not isinstance(v, Exception)]
+        assert len(losers) == 1 and len(winners) == 1, outcomes
+        assert isinstance(losers[0], IntegrityError)
+        assert "public_tiers_pkey" in str(losers[0])
+        want = list(ladder_for(1300, 900))
+        assert (winners[0].state, winners[0].minted) == ("done", len(want))  # type: ignore[union-attr]
+
+        with factory() as db:
+            rows = list(
+                db.execute(select(PublicTier).where(PublicTier.parent_sha256 == parent)).scalars()
+            )
+            ledger = list(
+                db.execute(select(TierParent).where(TierParent.parent_sha256 == parent)).scalars()
+            )
+            assert sorted(row.long_edge_px for row in rows) == want  # none twice, none missing
+            assert [(t.state, t.max_edge_px, t.attempts) for t in ledger] == [("done", 2048, 1)]
+            for row in rows:
+                assert hashlib.sha256(store.get(row.storage_key)).hexdigest() == row.sha256
+
+            store.reads = 0
+            again = mint_parent(db, store, parent)
+            db.commit()
+            assert (again.state, again.minted, store.reads) == ("done", 0, 0)
+            assert [t.long_edge_px for t in again.tiers] == want
     finally:
         engine.dispose()
