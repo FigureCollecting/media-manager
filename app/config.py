@@ -77,6 +77,15 @@ class Settings(BaseSettings):
     # fails to load. A revoked "mfc" still refuses every MFC mask.
     mask_mfc_official_gallery: bool = True
 
+    # IMGREND: whether the public origin serves tiers (display-sized
+    # renditions, app.publication.tier_servable) at /d/<the tier's sha>. Off
+    # by default: the origin then never reads public_tiers, so a build with
+    # tiers can roll before migration 0011 and the origin role's SELECT grant
+    # exist (reading without them would turn every miss into a 500), and
+    # turning it off again withholds every tier at once. Env
+    # MEDIA_TIERS_SERVED.
+    media_tiers_served: bool = False
+
     # Rate limiting
     rate_limit_per_minute: int = 120
 
