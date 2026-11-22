@@ -39,7 +39,7 @@ from app.workers.tiers import (
     mint_photo_tiers,
     rung_size,
 )
-from PIL import Image
+from PIL import Image, ImageFile
 from PIL.PngImagePlugin import PngInfo
 from scipy.ndimage import gaussian_filter
 
@@ -378,13 +378,16 @@ class TestPhotoRungs:
         parent's own size below it; a drift here changes every such rung under
         mm-tier-v1 (rule 4: that is a new pipeline version)."""
         qualities: dict[int, int] = {}
-        real = tiers._webp
+        Image.init()  # registers every plugin's save handler
+        real = Image.SAVE["WEBP"]
 
-        def spy(image: Image.Image, **options: object) -> bytes:
-            qualities[max(image.size)] = int(options["quality"])  # type: ignore[call-overload]
-            return real(image, **options)
+        def spy(im: Image.Image, fp: object, filename: object) -> None:
+            qualities[max(im.size)] = int(im.encoderinfo["quality"])
+            real(im, fp, filename)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(tiers, "_webp", spy)
+        # the encoder Pillow itself calls, so a wrapper that drops or rewrites
+        # the asked quality is seen too
+        monkeypatch.setitem(Image.SAVE, "WEBP", spy)
         mint_photo_tiers(_jpeg(_scene(width, height)))
         assert set(qualities) == set(ladder_for(width, height))
         assert {edge for edge, q in qualities.items() if q == 88} == top_edges
@@ -920,15 +923,17 @@ class TestGiantParents:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The gate is taken BEFORE the decode: a parent too big for it is
-        refused from its header, never decoded first (an OOM in a small pod)."""
+        refused from its header, never decoded first (an OOM in a small pod).
+        The spy is on Pillow's real pixel load, so ANY decode ahead of the gate
+        (the wrapper, a convert, a getchannel) is seen, not only tiers._decode."""
         decoded: list[tuple[int, int]] = []
-        real = tiers._decode
+        real = ImageFile.ImageFile.load
 
-        def spy(image: Image.Image) -> None:
-            decoded.append(image.size)
-            real(image)
+        def spy(self: ImageFile.ImageFile, *args: object) -> object:
+            decoded.append(self.size)
+            return real(self, *args)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(tiers, "_decode", spy)
+        monkeypatch.setattr(ImageFile.ImageFile, "load", spy)
         rgba = np.dstack([_scene(1600, 1200), _alpha(1600, 1200)])
         for parent in (_png(_scene(1600, 1200)), _jpeg(_scene(1600, 1200)), _png(rgba)):
             with pytest.raises(TierRefusal) as refused:
@@ -945,7 +950,7 @@ class TestGiantParents:
         assert decoded == []
         # the spy sees a decode when the gate has room, so an empty list means none was made
         mint_mask_tiers(encode_mask_png(_alpha(60, 40)), width=60, height=40)
-        assert decoded == [(60, 40)]
+        assert decoded and set(decoded) == {(60, 40)}
 
     def test_the_gate_counts_the_working_copy_of_each_kind(self) -> None:
         """As Pillow holds them: 4 bytes a pixel for RGB, RGBA and LA alike
