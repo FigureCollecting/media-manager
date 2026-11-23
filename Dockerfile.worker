@@ -22,7 +22,8 @@
 # default; "auto" falls back to a lean CPU session and says so).
 #
 # Tag verified to exist via the Docker Hub v2 API (nvidia/cuda tags,
-# name=cudnn-runtime-ubuntu24.04): 13.4.3 is the latest 13.x (2026-10-17).
+# name=cudnn-runtime-ubuntu24.04): 13.4.3 is the newest 13.4.x (2026-10-17); 13.5.0 exists but the
+# host driver is CUDA 13.4, so the base stays on 13.4.
 # The host driver must support CUDA 13.4 (the WSL box: driver 617.42, CUDA
 # UMD 13.4).
 # Poetry runs only in this throwaway stage, so it and its dependencies

@@ -48,12 +48,13 @@ def test_onnxruntime_gpu_is_the_release_the_batch_was_measured_on() -> None:
 
 def test_the_base_is_the_cuda_13_cudnn_9_runtime_it_was_measured_on() -> None:
     """onnxruntime-gpu 1.27+ is built against CUDA 13.0 and cuDNN 9 and runs on
-    any later CUDA 13 minor; nvidia/cuda 13.4.2 is the latest 13.x runtime."""
+    any later CUDA 13 minor; the base pins 13.4.3, the newest 13.4.x runtime (13.5.0 exists; the host
+    driver supports CUDA 13.4)."""
     m = re.search(
         r"^FROM nvidia/cuda:(\d+)\.(\d+)\.(\d+)-cudnn-runtime-ubuntu24\.04\b", DOCKERFILE, re.M
     )
     assert m is not None
-    assert (int(m[1]), int(m[2]), int(m[3])) == (13, 4, 2)
+    assert (int(m[1]), int(m[2]), int(m[3])) == (13, 4, 3)
 
 
 def test_the_image_never_selects_a_device() -> None:
