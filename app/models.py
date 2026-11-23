@@ -450,6 +450,89 @@ class ImageMask(Base):
     )
 
 
+class PublicTier(Base):
+    """IMGREND: a display-sized rendition (a "tier") of a clean copy or of a
+    mask, served at ``/d/<its own sha256>`` exactly while its parent is
+    (app.publication.tier_servable). Its identity is the contract's
+    (media.v1 ReportTiers): the parent's bytes, the minting pipeline's
+    version and the long edge -- the FIRST tier registered for one is kept.
+
+    A table of its own, never a kind of ``public_objects``: the WSL mask
+    batch runs pinned code against that table, and the origin reads it on
+    every request. ``sha256`` is NOT unique: two parents whose pictures
+    scale down to the same bytes each own a row naming them (one address,
+    one stored object), and the tier is served while either parent is.
+    """
+
+    __tablename__ = "public_tiers"
+
+    parent_sha256: Mapped[str] = mapped_column(
+        ForeignKey("public_objects.sha256", ondelete="CASCADE"), primary_key=True
+    )
+    pipeline_version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    long_edge_px: Mapped[int] = mapped_column(Integer, primary_key=True)
+    #: The tier's own bytes: its address. Indexed: the origin finds it by this.
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The parent's kind when the tier was registered: a mask's tiers are masks.
+    parent_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    mime: Mapped[str] = mapped_column(String(100), nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("parent_kind in ('sanitized','mask')", name="ck_public_tier_parent_kind"),
+        CheckConstraint("mime = 'image/webp'", name="ck_public_tier_mime"),
+        CheckConstraint("bytes > 0", name="ck_public_tier_bytes"),
+        #: The contract's shape: the long edge is 1 to 4,096 px and IS the
+        #: longer side (the other at least one pixel).
+        CheckConstraint(
+            "long_edge_px between 1 and 4096"
+            " and width between 1 and long_edge_px and height between 1 and long_edge_px"
+            " and (width = long_edge_px or height = long_edge_px)",
+            name="ck_public_tier_edge",
+        ),
+        Index("ix_public_tiers_sha256", "sha256"),
+    )
+
+
+class TierParent(Base):
+    """IMGREND: the minting ledger, one row per parent and pipeline version.
+    ``done`` rows have every rung up to ``max_edge_px`` registered (a phase
+    that minted only the small rungs says so, and a later phase goes on from
+    there); a ``refused`` parent (its own fault: ``reason`` is the stable
+    code) is not read again every sweep and is listed
+    (app.workers.tiers.refused_parents); a ``failed`` one is tried again."""
+
+    __tablename__ = "tier_parents"
+
+    parent_sha256: Mapped[str] = mapped_column(
+        ForeignKey("public_objects.sha256", ondelete="CASCADE"), primary_key=True
+    )
+    pipeline_version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64))
+    #: Every rung of the parent's ladder up to this edge is registered (0: none).
+    max_edge_px: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("state in ('done','refused','failed')", name="ck_tier_parent_state"),
+        #: The refused (and failed) parents of a version, paged by sha.
+        Index("ix_tier_parents_state", "pipeline_version", "state", "parent_sha256"),
+    )
+
+
 class SpineReportRun(Base):
     """One run of the media.v1 replay (``python -m app.cli.mask_report``),
     the ledger that makes it resumable. ``cursor_sha256`` is the last

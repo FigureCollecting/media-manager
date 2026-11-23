@@ -127,6 +127,9 @@ MEDIA_TABLES = (
     "figure_galleries",
     "display_originals",
     "display_depictions",
+    # IMGREND (tests/test_tier_plans_pg.py runs this guard over the tier lookups)
+    "public_tiers",
+    "tier_parents",
 )
 
 #: The display queue holds every image's original, 1 in 40 pending (1 in 80

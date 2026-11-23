@@ -12,9 +12,12 @@ This app mounts exactly ``/healthz`` and ``/d/{sha256}``; anything else,
 including any other method on ``/d/``, is a bodiless 404.
 
 THE ADDRESS IS THE CAPABILITY. Only rows of ``public_objects`` are served --
-our clean derivatives and our masks -- and an original's bytes are never
-registered, so an original, a held mask or any other stored object has no
-address here. The one overlap is an original whose bytes ARE one of our
+our clean derivatives and our masks -- and, once MEDIA_TIERS_SERVED is set,
+rows of ``public_tiers`` (IMGREND: their display-sized renditions, each at
+its own sha, looked up only after a miss in ``public_objects`` and served
+exactly while its parent is: app.publication.tier_servable). An original's
+bytes are never registered, so an original, a held mask or any other stored
+object has no address here. The one overlap is an original whose bytes ARE one of our
 objects -- a clean copy captured again, before or after it was minted, or
 a mask or cut-out captured after it was registered (before, the
 registration refuses those bytes): it is linked behind the object by those
@@ -62,9 +65,9 @@ from sqlalchemy.orm import Session
 from . import telemetry
 from .config import Settings, get_settings
 from .db import get_db
-from .models import PublicObject
+from .models import PublicObject, PublicTier
 from .object_store import ObjectStore, S3ObjectStore
-from .publication import servable, store_revocations
+from .publication import servable, store_revocations, tier_servable
 from .telemetry.db import name_connections
 from .telemetry.http import AccessLogMiddleware
 
@@ -156,19 +159,27 @@ def derivative(
     store: ObjectStore = Depends(get_object_store),  # noqa: B008
     settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> Response:
+    found: PublicObject | PublicTier | None
     try:
-        obj = db.get(PublicObject, sha256)
-        live = obj is not None and servable(
-            db,
-            obj,
-            settings.mask_store_grants,
-            store_revocations(db, settings.mask_store_revoked),
-        )
+        found = db.get(PublicObject, sha256)
+        if found is not None:
+            live = servable(
+                db,
+                found,
+                settings.mask_store_grants,
+                store_revocations(db, settings.mask_store_revoked),
+            )
+            found = found if live else None
+        elif settings.media_tiers_served:
+            found = tier_servable(
+                db, sha256, settings.mask_store_grants, configured=settings.mask_store_revoked
+            )
     except Exception as exc:
         logger.error("derivative_unjudged", extra={"sha256": sha256, "error": type(exc).__name__})
         return _bare(500)
-    if obj is None or not live:
+    if found is None:
         return _bare(404)
+    obj = found
     try:
         data = store.get(obj.storage_key)
     except Exception as exc:
