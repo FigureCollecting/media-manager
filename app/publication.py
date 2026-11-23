@@ -65,6 +65,7 @@ from .models import (
     MaskStoreRevocation,
     PublicObject,
     PublicObjectImage,
+    PublicTier,
 )
 from .models import Image as ImageModel
 from .workers.mask_policy import (
@@ -226,3 +227,61 @@ def servable(
     # carry a mask, judged over every image behind it.
     source = cut_from(db, obj.sha256)
     return source is not None and mask_refusal(db, source, store_grants, revoked) is None
+
+
+def tier_servable(
+    db: Session,
+    sha256: str,
+    store_grants: StoreGrants | None = None,
+    revoked: Revoked | None = None,
+    *,
+    configured: Iterable[str] | None = None,
+) -> PublicTier | None:
+    """The registered tier (IMGREND: a display-sized rendition) to serve at
+    ``sha256`` now, or None.
+
+    A TIER HAS NO STATUS OF ITS OWN: it is served exactly while its parent --
+    the clean copy or the mask it was scaled from -- is (``servable``, judged
+    here on every request), so a soft delete, a withdrawn mask, an ineligible
+    origin or a revoked store takes every rung offline with the parent, at
+    once. A tier whose parent row is gone is not served. Bytes two parents
+    share (two pictures that scale down to the same tier) are served while
+    either parent is, as a mask shared by two clean copies is.
+
+    And, as for a mask: not while an image whose bytes ARE the tier (our
+    rung captured again as someone's original) is soft-deleted.
+
+    ``revoked`` defaults to ``store_revocations(db, configured)``, read only
+    once a tier is found: a miss costs one index probe."""
+    rows = (
+        db.execute(
+            select(PublicTier)
+            .where(PublicTier.sha256 == sha256)
+            .order_by(
+                PublicTier.parent_sha256, PublicTier.pipeline_version, PublicTier.long_edge_px
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return None
+    dead = db.execute(
+        select(ImageModel.id).where(ImageModel.sha256 == sha256, ImageModel.deleted_at.is_not(None))
+    ).first()
+    if dead is not None:
+        return None
+    if revoked is None:
+        revoked = store_revocations(db, configured)
+    judged: dict[str, bool] = {}
+    for row in rows:
+        if row.parent_sha256 not in judged:
+            parent = db.get(PublicObject, row.parent_sha256)
+            judged[row.parent_sha256] = (
+                parent is not None
+                and parent.kind in ("sanitized", "mask")
+                and servable(db, parent, store_grants, revoked)
+            )
+        if judged[row.parent_sha256]:
+            return row
+    return None
