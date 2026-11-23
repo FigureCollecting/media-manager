@@ -22,10 +22,20 @@
 # default; "auto" falls back to a lean CPU session and says so).
 #
 # Tag verified to exist via the Docker Hub v2 API (nvidia/cuda tags,
-# name=cudnn-runtime-ubuntu24.04): 13.4.2 is the latest 13.x (2026-09-29).
+# name=cudnn-runtime-ubuntu24.04): 13.4.3 is the newest 13.4.x (2026-10-17); 13.5.0 exists but the
+# host driver is CUDA 13.4, so the base stays on 13.4.
 # The host driver must support CUDA 13.4 (the WSL box: driver 617.42, CUDA
 # UMD 13.4).
-FROM nvidia/cuda:13.4.2-cudnn-runtime-ubuntu24.04 AS base
+# Poetry runs only in this throwaway stage, so it and its dependencies
+# (dulwich, filelock, virtualenv) never ship in the runtime image.
+FROM python:3.12.16-slim AS req-export
+WORKDIR /src
+COPY pyproject.toml poetry.lock README.md /src/
+RUN pip install --no-cache-dir poetry==2.5.2 poetry-plugin-export==1.10.2 && \
+    poetry check --lock && \
+    poetry export -f requirements.txt --only main -o /tmp/requirements.txt --without-hashes
+
+FROM nvidia/cuda:13.4.3-cudnn-runtime-ubuntu24.04 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -48,17 +58,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips42t64 \
     curl \
     ca-certificates \
+    && apt-get install -y --no-install-recommends --only-upgrade apt libapt-pkg6.0t64 \
     && rm -rf /var/lib/apt/lists/* \
     && python3.12 -m venv /opt/venv
 
 WORKDIR /app
 
-COPY pyproject.toml poetry.lock README.md /app/
-
-RUN pip install --no-cache-dir poetry==1.8.3 && \
-    poetry check --lock && \
-    poetry export -f requirements.txt --only main -o /tmp/requirements.txt --without-hashes && \
-    pip install --no-cache-dir -r /tmp/requirements.txt
+COPY --from=req-export /tmp/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # onnxruntime-gpu is intentionally NOT a pyproject.toml dependency: it's a
 # deploy-only, GPU-only package (see app/workers/matting.py module
