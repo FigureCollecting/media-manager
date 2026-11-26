@@ -59,3 +59,18 @@ def test_the_base_is_the_cuda_13_cudnn_9_runtime_it_was_measured_on() -> None:
 
 def test_the_image_never_selects_a_device() -> None:
     assert not re.search(r"^\s*(ENV|ARG)\b.*\bMATTING_DEVICE=", DOCKERFILE, re.MULTILINE)
+
+
+def _only_upgrade_packages(dockerfile: str) -> set[str]:
+    return {
+        pkg for m in re.finditer(r"--only-upgrade\s+([^&\\]+)", dockerfile) for pkg in m[1].split()
+    }
+
+
+def test_the_worker_image_upgrades_libzstd1_past_the_unfixed_base_copy() -> None:
+    assert "libzstd1" in _only_upgrade_packages(DOCKERFILE)
+
+
+def test_the_api_image_upgrades_libzstd1_past_the_unfixed_base_copy() -> None:
+    api = (Path(__file__).resolve().parent.parent / "Dockerfile.api").read_text()
+    assert "libzstd1" in _only_upgrade_packages(api)
