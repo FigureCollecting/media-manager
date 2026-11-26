@@ -58,7 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips42t64 \
     curl \
     ca-certificates \
-    && apt-get install -y --no-install-recommends --only-upgrade apt libapt-pkg6.0t64 \
+    && apt-get install -y --no-install-recommends --only-upgrade apt libapt-pkg6.0t64 libzstd1 \
     && rm -rf /var/lib/apt/lists/* \
     && python3.12 -m venv /opt/venv
 
